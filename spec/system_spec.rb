@@ -409,6 +409,151 @@ RSpec.describe System do
     end
   end
 
+  describe '#merge!' do
+    def values(sys, *keys)
+      sys.build!
+      keys.map { |k| sys[k] }
+    end
+
+    it 'declares and registers the other system components, as open copies' do
+      calls = []
+      other = System.new
+      other.declare('output', String) { 'out' }
+      other.declare('logger', String)
+      other.component!('logger', ['output']) do
+        build { |o| "logger(#{o})" }
+        start { |v, _c| calls << [:start, v] }
+      end
+      other.start!
+
+      sys = System.new
+      sys.declare('app', String)
+      sys.config!('app', ['logger']) { |l| "app(#{l})" }
+      expect(sys.merge!(other)).to be(sys)
+
+      expect(sys.declarations.keys).to eq(%w[app output logger])
+      expect(sys.components.values.map(&:status)).to all(eq(:open))
+      expect(sys.components['logger']).not_to be(other.components['logger'])
+      expect(sys.components['logger']).to have_attributes(deps: ['output'], mode: :singleton, value: nil, pid: nil, hooks: %i[build start])
+      expect(other.components['logger'].status).to eq(:started) # the other system is untouched
+
+      sys.start!
+      expect(sys['app']).to eq('app(logger(out))')
+      expect(calls).to eq([[:start, 'logger(out)'], [:start, 'logger(out)']]) # once in each system
+    end
+
+    it "can't merge into a locked system" do
+      sys = System.new
+      sys.prepare!
+
+      expect { sys.merge!(System.new) }.to raise_error(System::LockedSystemError)
+    end
+
+    it 'raises on conflicting types, before merging anything' do
+      sys = System.new
+      sys.declare('logger', String)
+      other = System.new
+      other.declare('new_one') { 1 }
+      other.declare('logger', Integer)
+
+      expect { sys.merge!(other) }.to raise_error(System::DeclarationConflictError, /logger is declared with different types/)
+      expect(sys.declarations.keys).to eq(['logger'])
+    end
+
+    it 'accepts equivalent types' do
+      sys = System.new
+      sys.declare('db', Plumb::Types::Interface[:exec, :query])
+      other = System.new
+      other.declare('db', Plumb::Types::Interface[:query, :exec])
+
+      expect { sys.merge!(other) }.not_to raise_error
+    end
+
+    describe 'defaults' do
+      it "keeps the other's default when both have one" do
+        sys = System.new.declare('a', String) { 'left' }
+        sys.merge!(System.new.declare('a', String) { 'right' })
+
+        expect(values(sys, 'a')).to eq(['right'])
+      end
+
+      it "uses the other's default when this one has none" do
+        sys = System.new.declare('a', String)
+        sys.merge!(System.new.declare('a', String) { 'right' })
+
+        expect(values(sys, 'a')).to eq(['right'])
+      end
+
+      it "keeps this default when the other has none" do
+        sys = System.new.declare('a', String) { 'left' }
+        sys.merge!(System.new.declare('a', String))
+
+        expect(values(sys, 'a')).to eq(['left'])
+        expect(sys.declarations['a']).to be_default
+      end
+
+      it 'leaves the component unregistered when neither has a default' do
+        sys = System.new.declare('a', String)
+        sys.merge!(System.new.declare('a', String))
+
+        expect(sys.components).not_to have_key('a')
+      end
+    end
+
+    describe 'registered components' do
+      it "replaces this system's components with the other's explicit ones" do
+        sys = System.new.declare('a', String) { 'left default' }.declare('b', String)
+        sys.config!('b') { 'left explicit' }
+        other = System.new.declare('a', String).declare('b', String)
+        other.config!('a') { 'right explicit a' }
+        other.config!('b') { 'right explicit b' }
+        sys.merge!(other)
+
+        expect(values(sys, 'a', 'b')).to eq(['right explicit a', 'right explicit b'])
+      end
+
+      it "keeps this system's explicit components over the other's defaults" do
+        sys = System.new.declare('a', String)
+        sys.config!('a') { 'left explicit' }
+        sys.merge!(System.new.declare('a', String) { 'right default' })
+
+        expect(values(sys, 'a')).to eq(['left explicit'])
+        expect(sys.declarations['a'].default.call).to eq('right default') # still the merged default
+      end
+    end
+
+    it 'publishes declared events for new keys, and registered events for registrations' do
+      sys = System.new.declare('a', String) { 'left' }.declare('b', String)
+      sys.config!('b') { 'left' }
+      events = []
+      sys.notifier.subscribe(System::Events::ComponentEvent) { |e| events << "#{e.type} #{e.key}" }
+
+      other = System.new.declare('a', String) { 'right' }.declare('b', String) { 'right' }.declare('c') { 1 }
+      sys.merge!(other)
+
+      expect(events).to eq(['components.registered a', 'components.declared c', 'components.registered c'])
+    end
+
+    it 'is a no-op when merging itself, and only merges systems' do
+      sys = System.new.declare('a') { 1 }
+
+      expect { sys.merge!(sys) }.not_to(change { sys.components['a'] })
+      expect { sys.merge!(Object.new) }.to raise_error(ArgumentError, /not a System/)
+    end
+  end
+
+  describe System::Declaration do
+    it 'merges declarations of the same key, preferring the other default' do
+      left = described_class.new('a', Plumb::Types::String, -> { 'left' })
+      right = described_class.new('a', Plumb::Types::String, nil)
+
+      expect(left.merge(right).default).to be(left.default)
+      expect(right.merge(left).default).to be(left.default)
+      expect(left.merge(right)).to be_frozen
+      expect { left.merge(described_class.new('b', Plumb::Types::String, nil)) }.to raise_error(ArgumentError)
+    end
+  end
+
   describe '#inject' do
     # a local, rather than let, so that Class.new blocks can see it
     def new_system

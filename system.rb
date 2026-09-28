@@ -8,6 +8,7 @@ class System
 
   SystemError = Class.new(StandardError)
   DeclarationOverrideError = Class.new(SystemError)
+  DeclarationConflictError = Class.new(SystemError)
   LockedSystemError = Class.new(SystemError)
   UndeclaredComponentError = Class.new(SystemError)
   MissingDependencyError = Class.new(SystemError)
@@ -19,7 +20,26 @@ class System
   # Lifecycle statuses, in order. Shared by the system and its components.
   STATUSES = %i[open prepared built started toredown].freeze
 
-  Declaration = Data.define(:key, :type)
+  # A declared component key, its type, and an optional default (a build block)
+  class Declaration < Data.define(:key, :type, :default)
+    def default? = !default.nil?
+
+    # Merge another declaration of the same key, as in System#merge!
+    # Types must be equivalent. The other's default wins, if it has one.
+    def merge(other)
+      raise ArgumentError, "can't merge #{other.key} into #{key}" unless key == other.key
+      unless same_type?(other.type)
+        raise DeclarationConflictError, "#{key} is declared with different types: #{type.inspect} and #{other.type.inspect}"
+      end
+
+      with(default: other.default || default)
+    end
+
+    # Equivalent types, ex. Interface[:a, :b] and Interface[:b, :a]
+    private def same_type?(other_type)
+      type == other_type || (type.subtype_of?(other_type) && other_type.subtype_of?(type))
+    end
+  end
 
   # Returned by System#graph. #components are hashes describing each declared component.
   class Graph < Data.define(:status, :components)
@@ -206,10 +226,12 @@ class System
     #   start:   the built value, and the context passed to System#start!
     #   teardown: the built value
     # Dynamic components don't memoize a value, so their start and teardown hooks get nil.
-    def initialize(key, deps, mode: :singleton, &block)
+    # default: whether this component was registered from its declaration's default
+    def initialize(key, deps, mode: :singleton, default: false, &block)
       @key = key
       @deps = deps
       @mode = mode
+      @default = default
       @status = :open
       @value = nil
       @pid = nil
@@ -228,6 +250,19 @@ class System
         end
         # Freeze hook registration, but not lifecycle state
         [@prepare_blocks, @build_blocks, @start_blocks, @teardown_blocks].each(&:freeze)
+      end
+    end
+
+    def default? = @default
+
+    # An open copy of this component, with the same hooks but none of its lifecycle state
+    def copy
+      Component.new(key, deps, mode:, default: default?) do |c|
+        # self here is the original component
+        @prepare_blocks.each { |b| c.prepare(b) }
+        @build_blocks.each { |b| c.build(b) }
+        @start_blocks.each { |b| c.start(b) }
+        @teardown_blocks.each { |b| c.teardown(b) }
       end
     end
 
@@ -391,9 +426,9 @@ class System
       type = Plumb::Composable.wrap(type)
       raise DeclarationOverrideError, "#{key} is already declared" if declared?(key)
 
-      @declarations[key] = Declaration.new(key, type)
-      emit(Events::ComponentDeclared, key:, pid: nil, thread_id: nil, fiber_id: nil, type_name: type_name(type))
-      config!(key, &default) if default
+      declaration = @declarations[key] = Declaration.new(key, type, default)
+      emit_declared(declaration)
+      register_default(declaration) if default
       self
     end
   end
@@ -436,6 +471,47 @@ class System
   end
 
   def locked? = status != :open
+
+  # Merge another system's declarations and components into this one, which must be open.
+  # The other system can be in any state: its components are copied, and start again as :open.
+  # For each of the other system's declarations:
+  # * New keys are declared. Existing keys must have equivalent types, or DeclarationConflictError is raised
+  #   (before anything is merged).
+  # * Defaults: the other's default wins if it has one, otherwise this system's default is kept.
+  # * Components: an explicitly registered component in the other system replaces this system's,
+  #   an explicitly registered component in this system is kept over the other's default,
+  #   and otherwise the merged default is registered.
+  def merge!(other)
+    raise ArgumentError, "can't merge #{other.inspect}, it's not a System" unless other.is_a?(System)
+    return self if other.equal?(self)
+
+    their_declarations, their_components = other.snapshot
+
+    @lock.synchronize do
+      raise LockedSystemError, "can't merge into a locked system" if locked?
+
+      # Resolve all declarations first, so conflicts raise before anything changes
+      merged = their_declarations.to_h do |key, theirs|
+        [key, @declarations[key]&.merge(theirs) || theirs]
+      end
+
+      merged.each do |key, declaration|
+        previous = @declarations[key]
+        @declarations[key] = declaration
+        emit_declared(declaration) unless previous
+
+        theirs = their_components[key]
+        ours = @components[key]
+        if theirs && !theirs.default?
+          add_component(key, theirs.deps) { theirs.copy }
+        elsif (ours.nil? || ours.default?) && declaration.default? && !declaration.default.equal?(previous&.default)
+          register_default(declaration)
+        end
+      end
+
+      self
+    end
+  end
 
   # Build an Injector for the given component keys.
   # Keys map to kwargs named after their last segment ('sourced.store' => :store),
@@ -732,6 +808,25 @@ class System
 
   private def build_key(key)
     key.to_s.freeze
+  end
+
+  # Declarations and components, for another system to merge
+  protected def snapshot
+    @lock.synchronize { [@declarations.dup, @components.dup] }
+  end
+
+  private def emit_declared(declaration)
+    emit(Events::ComponentDeclared, key: declaration.key, pid: nil, thread_id: nil, fiber_id: nil,
+                                    type_name: type_name(declaration.type))
+  end
+
+  # Register a declaration's default as a singleton config
+  private def register_default(declaration)
+    add_component(declaration.key, []) do |key, deps|
+      Component.new(key, deps, mode: :singleton, default: true) do |c|
+        c.build(&declaration.default)
+      end
+    end
   end
 
   # Registering a key that already has a component overrides it (ex. an extension replacing an app default).
