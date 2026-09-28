@@ -310,10 +310,12 @@ RSpec.describe System do
       sys.config('logger', ['logger.output']) { |o| o }
 
       graph = sys.graph
-      expect(graph[:status]).to eq(:open)
-      expect(graph[:components].map { |c| c[:key] }).to eq(%w[app logger logger.output db])
+      expect(graph).to be_a(System::Graph)
+      expect(graph.status).to eq(:open)
+      expect(graph.to_h).to eq(status: :open, components: graph.components)
+      expect(graph.components.map { |c| c[:key] }).to eq(%w[app logger logger.output db])
 
-      expect(graph[:components][1]).to eq(
+      expect(graph.components[1]).to eq(
         key: 'logger',
         type: logger_type,
         type_name: 'Interface[info]',
@@ -327,8 +329,8 @@ RSpec.describe System do
         thread_id: nil,
         fiber_id: nil
       )
-      expect(graph[:components][2]).to include(deps: [], dependents: %w[app logger])
-      expect(graph[:components][3]).to include(
+      expect(graph.components[2]).to include(deps: [], dependents: %w[app logger])
+      expect(graph.components[3]).to include(
         key: 'db',
         type_name: '(Nil | Interface[append])',
         registered: false,
@@ -348,8 +350,8 @@ RSpec.describe System do
       sys.start!
 
       graph = sys.graph
-      expect(graph[:status]).to eq(:started)
-      expect(graph[:components].map { |c| [c[:key], c[:status]] }).to eq([['logger', :started], ['app', :started]])
+      expect(graph.status).to eq(:started)
+      expect(graph.components.map { |c| [c[:key], c[:status]] }).to eq([['logger', :started], ['app', :started]])
     end
   end
 
@@ -730,7 +732,7 @@ RSpec.describe System do
 
         runtime = [Process.pid, thread_id, fiber_id]
         expect(runtime_of(sys.components['a'])).to eq(runtime)
-        expect(sys.graph[:components].first).to include(pid: Process.pid, thread_id:, fiber_id:)
+        expect(sys.graph.components.first).to include(pid: Process.pid, thread_id:, fiber_id:)
 
         start_events = events.select { |e| e.type.start_with?('components.start') }
         expect(start_events.map(&:type)).to eq(%w[components.starting components.started])

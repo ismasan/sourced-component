@@ -21,6 +21,9 @@ class System
 
   Declaration = Data.define(:key, :type)
 
+  # Returned by System#graph. #components are hashes describing each declared component.
+  Graph = Data.define(:status, :components)
+
   # Lifecycle events published to the system's notifier. Each event class has a #type string
   # which can be used to subscribe to it, ex. notifier.subscribe('components.built') { |event| ... }
   module Events
@@ -419,7 +422,7 @@ class System
     header = "#<#{self.class} status=#{status} components=#{@components.size}/#{@declarations.size}"
     return "#{header}>" if @declarations.empty?
 
-    lines = graph[:components].map do |node|
+    lines = graph.components.map do |node|
       details = @components[node[:key]]&.details || '(not registered)'
       "  #{node[:key]} : #{node[:type_name]} #{details}"
     end
@@ -427,8 +430,11 @@ class System
     [header, *lines, '>'].join("\n")
   end
 
-  # A data structure describing the system and all declared components,
+  # A System::Graph describing the system and all declared components,
   # in dependency order once the system is prepared (declaration order before that).
+  #   graph.status     # => :built
+  #   graph.components # => [{ key: 'logger', ... }, ...]
+  #   graph.to_h
   #   {
   #     status: :built,
   #     components: [
@@ -477,7 +483,7 @@ class System
       }
     end
 
-    { status:, components: }
+    Graph.new(status:, components:)
   end
 
   # Components in dependency order (dependencies first). Available after #prepare!
