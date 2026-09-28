@@ -22,7 +22,53 @@ class System
   Declaration = Data.define(:key, :type)
 
   # Returned by System#graph. #components are hashes describing each declared component.
-  Graph = Data.define(:status, :components)
+  class Graph < Data.define(:status, :components)
+    # Mermaid classes for component statuses, plus declared-but-unregistered and undeclared (missing) keys
+    MERMAID_CLASSES = {
+      open: 'fill:#f4f4f5,stroke:#71717a',
+      prepared: 'fill:#e0f2fe,stroke:#0284c7',
+      built: 'fill:#ede9fe,stroke:#7c3aed',
+      started: 'fill:#dcfce7,stroke:#16a34a',
+      toredown: 'fill:#e4e4e7,stroke:#52525b,color:#52525b',
+      unregistered: 'fill:#fef9c3,stroke:#ca8a04,stroke-dasharray:4 3',
+      missing: 'fill:#fee2e2,stroke:#dc2626,stroke-dasharray:4 3'
+    }.freeze
+
+    # A Mermaid flowchart of the dependency graph.
+    # Edges point from each dependency to its dependents (build and start order).
+    # Singletons are rectangles, dynamic components are rounded, and nodes are styled by status.
+    # Unregistered components and dependencies on undeclared keys are included, with dashed borders.
+    def to_mermaid
+      ids = {}
+      id_for = ->(key) { ids[key] ||= "c#{ids.size}" }
+      lines = ['flowchart LR']
+
+      components.each do |node|
+        details = node[:registered] ? "#{node[:mode]}, #{node[:status]}" : 'not registered'
+        label = "#{mermaid_escape(node[:key])}<br/>#{mermaid_escape(node[:type_name])}<br/><i>#{details}</i>"
+        open, close = node[:mode] == :dynamic ? ['(["', '"])'] : ['["', '"]']
+        css_class = node[:registered] ? node[:status] : :unregistered
+        lines << "  #{id_for.(node[:key])}#{open}#{label}#{close}:::#{css_class}"
+      end
+
+      declared = components.map { |node| node[:key] }
+      missing = components.flat_map { |node| node[:deps] }.uniq - declared
+      missing.each do |key|
+        lines << "  #{id_for.(key)}[\"#{mermaid_escape(key)}<br/><i>not declared</i>\"]:::missing"
+      end
+
+      components.each do |node|
+        node[:deps].each { |dep| lines << "  #{id_for.(dep)} --> #{id_for.(node[:key])}" }
+      end
+
+      MERMAID_CLASSES.each { |name, style| lines << "  classDef #{name} #{style}" }
+      lines.join("\n")
+    end
+
+    private def mermaid_escape(text)
+      text.to_s.gsub('&', '#amp;').gsub('"', '#quot;').gsub('<', '#lt;').gsub('>', '#gt;')
+    end
+  end
 
   # Lifecycle events published to the system's notifier. Each event class has a #type string
   # which can be used to subscribe to it, ex. notifier.subscribe('components.built') { |event| ... }

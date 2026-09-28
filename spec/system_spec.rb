@@ -355,6 +355,60 @@ RSpec.describe System do
     end
   end
 
+  describe 'Graph#to_mermaid' do
+    it 'draws components, dependency edges, modes and registration' do
+      sys = System.new
+      sys.declare('output') { STDOUT }
+      sys.declare('logger', Plumb::Types::Interface[:info])
+      sys.declare('db', Plumb::Types::Interface[:exec].nullable)
+      sys.declare('request_id', String)
+      sys.declare('app')
+      sys.config('logger', ['output']) { |o| o }
+      sys.config('request_id') { 'x' }
+      sys.config!('app', %w[logger db request_id nope]) { 1 }
+
+      expect(sys.graph.to_mermaid).to eq(<<~MERMAID.chomp)
+        flowchart LR
+          c0["output<br/>Any<br/><i>singleton, open</i>"]:::open
+          c1(["logger<br/>Interface[info]<br/><i>dynamic, open</i>"]):::open
+          c2["db<br/>(Nil | Interface[exec])<br/><i>not registered</i>"]:::unregistered
+          c3(["request_id<br/>String<br/><i>dynamic, open</i>"]):::open
+          c4["app<br/>Any<br/><i>singleton, open</i>"]:::open
+          c5["nope<br/><i>not declared</i>"]:::missing
+          c0 --> c1
+          c1 --> c4
+          c2 --> c4
+          c3 --> c4
+          c5 --> c4
+        #{System::Graph::MERMAID_CLASSES.map { |name, style| "  classDef #{name} #{style}" }.join("\n")}
+      MERMAID
+    end
+
+    it 'styles nodes by status, in dependency order' do
+      sys = System.new
+      sys.declare('app')
+      sys.declare('logger') { 1 }
+      sys.config!('app', ['logger']) { |l| l }
+      sys.start!
+
+      nodes = sys.graph.to_mermaid.lines.grep(/:::/).map(&:strip)
+      expect(nodes).to eq([
+        'c0["logger<br/>Any<br/><i>singleton, started</i>"]:::started',
+        'c1["app<br/>Any<br/><i>singleton, started</i>"]:::started'
+      ])
+    end
+
+    it 'escapes labels' do
+      graph = System::Graph.new(status: :open, components: [
+        { key: 'a"b', type_name: 'Hash<String> & more', registered: false, mode: nil, status: nil, deps: [] }
+      ])
+
+      expect(graph.to_mermaid.lines[1].strip).to eq(
+        'c0["a#quot;b<br/>Hash#lt;String#gt; #amp; more<br/><i>not registered</i>"]:::unregistered'
+      )
+    end
+  end
+
   describe '#inject' do
     # a local, rather than let, so that Class.new blocks can see it
     def new_system
