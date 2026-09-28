@@ -26,9 +26,9 @@ class System
     # Hooks are called with:
     #   prepare: no arguments
     #   build:   the resolved values of #deps, in order. The last build hook's return value is the component's value
-    #   start:   the context passed to System#start!
-    #   teardown: no arguments
-    # Hooks defined in an instance_eval block have the component as self, so they can use #value.
+    #   start:   the built value, and the context passed to System#start!
+    #   teardown: the built value
+    # Dynamic components don't memoize a value, so their start and teardown hooks get nil.
     def initialize(key, deps, mode: :singleton, &block)
       @key = key
       @deps = deps
@@ -107,13 +107,13 @@ class System
     end
 
     def start!(context)
-      transition(:started) { @start_blocks.each { |b| b.call(context) } }
+      transition(:started) { @start_blocks.each { |b| b.call(value, context) } }
     end
 
     def teardown!
       return self unless status == :started
 
-      transition(:toredown) { @teardown_blocks.each(&:call) }
+      transition(:toredown) { @teardown_blocks.each { |b| b.call(value) } }
     end
 
     # Run build hooks and return the last result (nil if there are no build hooks)
@@ -251,7 +251,7 @@ class System
   end
 
   # call #start hooks on all components. Idempotent.
-  # context is passed to each component's #start(context)
+  # each component's #start hooks are called with (value, context)
   # useful for components that want to start threads or fibers in a context (ex. parent fiber)
   def start!(context = Thread.current)
     build! # idempotent

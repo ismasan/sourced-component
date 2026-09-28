@@ -46,14 +46,14 @@ RSpec.describe System do
     sys.component!('c', %w[b]) do
       prepare { calls << [:prepare, :c] }
       build { |b| calls << [:build, :c]; "c(#{b})" }
-      start { |ctx| calls << [:start, :c, ctx] }
-      teardown { calls << [:teardown, :c] }
+      start { |_value, ctx| calls << [:start, :c, ctx] }
+      teardown { |_value| calls << [:teardown, :c] }
     end
     sys.component!('b', %w[a]) do
       prepare { calls << [:prepare, :b] }
       build { |a| calls << [:build, :b]; "b(#{a})" }
-      start { |ctx| calls << [:start, :b, ctx] }
-      teardown { calls << [:teardown, :b] }
+      start { |_value, ctx| calls << [:start, :b, ctx] }
+      teardown { |_value| calls << [:teardown, :b] }
     end
     sys.config!('a') { calls << [:build, :a]; 'a' }
 
@@ -126,17 +126,24 @@ RSpec.describe System do
     expect(sys.status).to eq(:built)
   end
 
-  it 'lets hooks access the component value' do
-    started = nil
+  it 'passes the built value to start and teardown hooks' do
+    calls = []
     sys = System.new
     sys.declare('a')
+    sys.declare('b')
     sys.component!('a') do
       build { 'value' }
-      start { |_ctx| started = value }
+      start { |value, ctx| calls << [:start, value, ctx] }
+      teardown { |value| calls << [:teardown, value] }
     end
-    sys.start!
+    sys.component('b') do
+      build { 'dynamic' }
+      start { |value, ctx| calls << [:start_dynamic, value, ctx] }
+    end
+    sys.start!(:ctx)
+    sys.teardown!
 
-    expect(started).to eq('value')
+    expect(calls).to eq([[:start, 'value', :ctx], [:start_dynamic, nil, :ctx], [:teardown, 'value']])
   end
 
   it 'expresses optional components with nullable types' do
@@ -188,7 +195,7 @@ RSpec.describe System do
       sys.declare('logger', Plumb::Types::String) { 'default logger' }
 
       sys.component!('logger', ['level']) do
-        start { |_ctx| calls << :started }
+        start { |_value, _ctx| calls << :started }
         build { |level| "logger at #{level}" }
       end
       sys.start!
