@@ -419,7 +419,7 @@ class System
     header = "#<#{self.class} status=#{status} components=#{@components.size}/#{@declarations.size}"
     return "#{header}>" if @declarations.empty?
 
-    lines = tree[:components].map do |node|
+    lines = graph[:components].map do |node|
       details = @components[node[:key]]&.details || '(not registered)'
       "  #{node[:key]} : #{node[:type_name]} #{details}"
     end
@@ -446,11 +446,11 @@ class System
   #       ...
   #     ]
   #   }
-  def tree
-    @lock.synchronize { build_tree }
+  def graph
+    @lock.synchronize { build_graph }
   end
 
-  private def build_tree
+  private def build_graph
     keys = @order ? @order | @declarations.keys : @declarations.keys
     dependents = Hash.new { |h, k| h[k] = [] }
     keys.each do |key|

@@ -298,7 +298,7 @@ RSpec.describe System do
     end
   end
 
-  describe '#tree' do
+  describe '#graph' do
     it 'describes all declared components, their statuses, dependencies and types' do
       logger_type = Plumb::Types::Interface[:info]
       sys = System.new
@@ -309,11 +309,11 @@ RSpec.describe System do
       sys.component!('app', %w[logger logger.output]) { start { |_v, _c| } }
       sys.config('logger', ['logger.output']) { |o| o }
 
-      tree = sys.tree
-      expect(tree[:status]).to eq(:open)
-      expect(tree[:components].map { |c| c[:key] }).to eq(%w[app logger logger.output db])
+      graph = sys.graph
+      expect(graph[:status]).to eq(:open)
+      expect(graph[:components].map { |c| c[:key] }).to eq(%w[app logger logger.output db])
 
-      expect(tree[:components][1]).to eq(
+      expect(graph[:components][1]).to eq(
         key: 'logger',
         type: logger_type,
         type_name: 'Interface[info]',
@@ -327,8 +327,8 @@ RSpec.describe System do
         thread_id: nil,
         fiber_id: nil
       )
-      expect(tree[:components][2]).to include(deps: [], dependents: %w[app logger])
-      expect(tree[:components][3]).to include(
+      expect(graph[:components][2]).to include(deps: [], dependents: %w[app logger])
+      expect(graph[:components][3]).to include(
         key: 'db',
         type_name: '(Nil | Interface[append])',
         registered: false,
@@ -347,9 +347,9 @@ RSpec.describe System do
       sys.config!('app', ['logger']) { |l| l }
       sys.start!
 
-      tree = sys.tree
-      expect(tree[:status]).to eq(:started)
-      expect(tree[:components].map { |c| [c[:key], c[:status]] }).to eq([['logger', :started], ['app', :started]])
+      graph = sys.graph
+      expect(graph[:status]).to eq(:started)
+      expect(graph[:components].map { |c| [c[:key], c[:status]] }).to eq([['logger', :started], ['app', :started]])
     end
   end
 
@@ -730,7 +730,7 @@ RSpec.describe System do
 
         runtime = [Process.pid, thread_id, fiber_id]
         expect(runtime_of(sys.components['a'])).to eq(runtime)
-        expect(sys.tree[:components].first).to include(pid: Process.pid, thread_id:, fiber_id:)
+        expect(sys.graph[:components].first).to include(pid: Process.pid, thread_id:, fiber_id:)
 
         start_events = events.select { |e| e.type.start_with?('components.start') }
         expect(start_events.map(&:type)).to eq(%w[components.starting components.started])
