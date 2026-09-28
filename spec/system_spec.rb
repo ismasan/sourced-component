@@ -298,6 +298,154 @@ RSpec.describe System do
     end
   end
 
+  describe '#tree' do
+    it 'describes all declared components, their statuses, dependencies and types' do
+      logger_type = Plumb::Types::Interface[:info]
+      sys = System.new
+      sys.declare('app')
+      sys.declare('logger', logger_type)
+      sys.declare('logger.output') { STDOUT }
+      sys.declare('db', Plumb::Types::Interface[:append].nullable)
+      sys.component!('app', %w[logger logger.output]) { start { |_v, _c| } }
+      sys.config('logger', ['logger.output']) { |o| o }
+
+      tree = sys.tree
+      expect(tree[:status]).to eq(:open)
+      expect(tree[:components].map { |c| c[:key] }).to eq(%w[app logger logger.output db])
+
+      expect(tree[:components][1]).to eq(
+        key: 'logger',
+        type: logger_type,
+        type_name: 'Interface[info]',
+        registered: true,
+        mode: :dynamic,
+        status: :open,
+        deps: ['logger.output'],
+        dependents: ['app'],
+        hooks: [:build]
+      )
+      expect(tree[:components][2]).to include(deps: [], dependents: %w[app logger])
+      expect(tree[:components][3]).to include(
+        key: 'db',
+        type_name: '(Nil | Interface[append])',
+        registered: false,
+        mode: nil,
+        status: nil,
+        deps: [],
+        dependents: [],
+        hooks: []
+      )
+    end
+
+    it 'lists components in dependency order, with their statuses, once prepared' do
+      sys = System.new
+      sys.declare('app')
+      sys.declare('logger') { 'logger' }
+      sys.config!('app', ['logger']) { |l| l }
+      sys.start!
+
+      tree = sys.tree
+      expect(tree[:status]).to eq(:started)
+      expect(tree[:components].map { |c| [c[:key], c[:status]] }).to eq([['logger', :started], ['app', :started]])
+    end
+  end
+
+  describe '#inject' do
+    # a local, rather than let, so that Class.new blocks can see it
+    def new_system
+      System.new.tap do |s|
+        s.declare('logger') { 'the logger' }
+        s.declare('sourced.store') { 'the store' }
+        s.declare('counter', Plumb::Types::Integer)
+        s.config('counter') { @count = (@count || 0) + 1 }
+      end
+    end
+
+    it 'injects components as kwargs with readers, defaulting to system values' do
+      sys = new_system
+      sys.build!
+      klass = Class.new { include sys.inject('logger') }
+
+      expect(klass.new.logger).to eq('the logger')
+      expect(klass.new(logger: 'custom').logger).to eq('custom')
+      expect(klass.new(logger: nil).logger).to be_nil
+    end
+
+    it 'names kwargs after the last segment of dotted keys, and takes multiple keys' do
+      sys = new_system
+      sys.build!
+      klass = Class.new { include sys.inject('logger', 'sourced.store') }
+      obj = klass.new(store: 'custom store')
+
+      expect(obj.logger).to eq('the logger')
+      expect(obj.store).to eq('custom store')
+    end
+
+    it 'aliases keys to custom kwargs with a hash' do
+      sys = new_system
+      sys.build!
+      klass = Class.new { include sys.inject('logger', 'sourced.store' => 'st') }
+
+      expect(klass.new.st).to eq('the store')
+      expect(klass.new(st: 'custom').st).to eq('custom')
+      expect(klass.new).not_to respond_to(:store)
+    end
+
+    it 'composes multiple injections with the class own #initialize' do
+      sys = new_system
+      sys.build!
+      klass = Class.new do
+        include sys.inject('logger')
+        include sys.inject('sourced.store')
+        attr_reader :args
+
+        def initialize(name, age: 1)
+          @args = [name, age]
+        end
+      end
+      obj = klass.new('joe', age: 40, store: 'custom')
+
+      expect(obj.args).to eq(['joe', 40])
+      expect(obj.logger).to eq('the logger')
+      expect(obj.store).to eq('custom')
+    end
+
+    it 'is inherited by subclasses' do
+      sys = new_system
+      sys.build!
+      parent = Class.new { include sys.inject('logger') }
+      child = Class.new(parent) { include sys.inject('sourced.store') }
+      obj = child.new(logger: 'custom')
+
+      expect(obj.logger).to eq('custom')
+      expect(obj.store).to eq('the store')
+    end
+
+    it 'resolves values on instantiation, so classes can be defined before the system is built' do
+      sys = new_system
+      klass = Class.new { include sys.inject('counter') }
+      expect { klass.new }.to raise_error(System::NotBuiltError)
+
+      sys.build!
+      expect(klass.new.counter).to eq(1)
+      expect(klass.new.counter).to eq(2)
+    end
+
+    it 'raises on undeclared components' do
+      sys = new_system
+      expect { sys.inject('nope') }.to raise_error(System::UndeclaredComponentError)
+    end
+
+    it 'raises on duplicate names' do
+      sys = new_system
+      sys.declare('other.logger')
+      expect { sys.inject('logger', 'other.logger') }.to raise_error(ArgumentError, /duplicate injected names: logger/)
+
+      klass = Class.new { include sys.inject('logger') }
+      expect { klass.include(sys.inject('other.logger')) }.to raise_error(ArgumentError, /already injects logger/)
+    end
+  end
+
   describe 'errors' do
     it 'raises on undeclared components' do
       expect { System.new.config!('nope') { 1 } }.to raise_error(System::UndeclaredComponentError)

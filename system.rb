@@ -131,6 +131,40 @@ class System
     end
   end
 
+  # A module that injects system components into a class as keyword arguments to #initialize,
+  # defaulting to the component's value when the object is instantiated.
+  #   include Sys.inject('logger', 'sourced.store' => 'st')
+  # Each include prepends its own #initialize, which takes its kwargs and passes the rest on to super,
+  # so multiple injections (and the class' own #initialize) compose.
+  class Injector < Module
+    attr_reader :names
+
+    # names: { 'component.key' => :kwarg_name }
+    def initialize(system, names)
+      super()
+      @names = names
+
+      initializer = Module.new do
+        define_method(:initialize) do |*args, **kwargs, &block|
+          names.each do |key, name|
+            instance_variable_set(:"@#{name}", kwargs.key?(name) ? kwargs.delete(name) : system[key])
+          end
+          super(*args, **kwargs, &block)
+        end
+      end
+
+      define_singleton_method(:included) do |base|
+        taken = (base.ancestors.grep(Injector) - [self]).flat_map { |i| i.names.values } & names.values
+        raise ArgumentError, "#{base} already injects #{taken.join(', ')}" if taken.any?
+
+        base.prepend(initializer)
+        base.send(:attr_reader, *names.values)
+      end
+    end
+
+    def inspect = "#<#{self.class} #{names.map { |key, name| "#{key} => #{name}" }.join(', ')}>"
+  end
+
   attr_reader :declarations, :components, :status
 
   def initialize
@@ -194,6 +228,27 @@ class System
 
   def locked? = status != :open
 
+  # Build an Injector for the given component keys.
+  # Keys map to kwargs named after their last segment ('sourced.store' => :store),
+  # and a Hash maps keys to custom kwarg names ('sourced.store' => 'st').
+  #   include Sys.inject('logger', 'sourced.store' => 'st')
+  def inject(*keys)
+    names = keys.each_with_object({}) do |arg, map|
+      pairs = arg.is_a?(Hash) ? arg : { arg => build_key(arg).split('.').last }
+      pairs.each do |key, name|
+        key = build_key(key)
+        raise UndeclaredComponentError, "#{key} component is not declared in this system" unless declared?(key)
+
+        map[key] = name.to_sym
+      end
+    end
+
+    duplicates = names.values.tally.select { |_, count| count > 1 }.keys
+    raise ArgumentError, "duplicate injected names: #{duplicates.join(', ')}" if duplicates.any?
+
+    Injector.new(self, names)
+  end
+
   # #<System status=built components=2/3
   #   logger.output : Any (singleton, built) hooks=[build]
   #   logger : Interface[info, debug] (singleton, built) deps=[logger.output] hooks=[prepare, build]
@@ -204,13 +259,58 @@ class System
     header = "#<#{self.class} status=#{status} components=#{@components.size}/#{@declarations.size}"
     return "#{header}>" if @declarations.empty?
 
-    keys = @order ? @order | @declarations.keys : @declarations.keys
-    lines = keys.map do |key|
-      type = @declarations[key].type.inspect.gsub('Plumb::Types::', '')
-      "  #{key} : #{type} #{@components[key]&.details || '(not registered)'}"
+    lines = tree[:components].map do |node|
+      details = @components[node[:key]]&.details || '(not registered)'
+      "  #{node[:key]} : #{node[:type_name]} #{details}"
     end
 
     [header, *lines, '>'].join("\n")
+  end
+
+  # A data structure describing the system and all declared components,
+  # in dependency order once the system is prepared (declaration order before that).
+  #   {
+  #     status: :built,
+  #     components: [
+  #       {
+  #         key: 'logger',
+  #         type: <Plumb type>,
+  #         type_name: 'Interface[info, debug]',
+  #         registered: true,
+  #         mode: :singleton,          # nil if not registered
+  #         status: :built,            # nil if not registered
+  #         deps: ['logger.output'],   # components this one depends on
+  #         dependents: ['app'],       # components that depend on this one
+  #         hooks: [:prepare, :build]
+  #       },
+  #       ...
+  #     ]
+  #   }
+  def tree
+    keys = @order ? @order | @declarations.keys : @declarations.keys
+    dependents = Hash.new { |h, k| h[k] = [] }
+    keys.each do |key|
+      @components[key]&.deps&.each { |dep| dependents[dep] << key }
+    end
+
+    components = keys.map do |key|
+      type = @declarations[key].type
+      component = @components[key]
+
+      {
+        key:,
+        type:,
+        type_name: type.inspect.gsub('Plumb::Types::', ''),
+        registered: !component.nil?,
+        mode: component&.mode,
+        status: component&.status,
+        deps: component ? component.deps : [],
+        dependents: dependents[key],
+        hooks: component ? component.hooks : []
+      }
+    end
+
+    { status:, components: }
   end
 
   # Components in dependency order (dependencies first). Available after #prepare!
