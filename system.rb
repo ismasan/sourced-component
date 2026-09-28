@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'monitor'
 require 'tsort'
 require 'plumb'
 
@@ -167,11 +168,17 @@ class System
 
   attr_reader :declarations, :components, :status
 
+  # Registration and lifecycle methods are synchronized with a Monitor, so a single system
+  # can be booted from multiple threads or fibers: concurrent callers wait for the first one to finish,
+  # and then no-op. The Monitor is reentrant (#start! calls #build!, hooks may call the system)
+  # and owned per fiber, so it works with fiber schedulers (ex. Async).
+  # Reading values with #[] (and injected defaults) needs no lock, as they're immutable once built.
   def initialize
     @declarations = {}
     @components = {}
     @status = :open
     @order = nil
+    @lock = Monitor.new
   end
 
   # Declare a component that MUST be registered before #prepare!
@@ -180,13 +187,17 @@ class System
   # which can then be overridden with a different component (ex. with its own deps and lifecycle hooks).
   #   sys.declare('logger', Logger) { Logger.new(STDOUT) }
   def declare(key, type = Plumb::Types::Any, &default)
-    key = build_key(key)
-    type = Plumb::Composable.wrap(type)
-    raise DeclarationOverrideError, "#{key} is already declared" if declared?(key)
+    @lock.synchronize do
+      raise LockedSystemError, "can't declare components in a locked system" if locked?
 
-    @declarations[key] = Declaration.new(key, type)
-    config!(key, &default) if default
-    self
+      key = build_key(key)
+      type = Plumb::Composable.wrap(type)
+      raise DeclarationOverrideError, "#{key} is already declared" if declared?(key)
+
+      @declarations[key] = Declaration.new(key, type)
+      config!(key, &default) if default
+      self
+    end
   end
 
   def declared?(key)
@@ -287,6 +298,10 @@ class System
   #     ]
   #   }
   def tree
+    @lock.synchronize { build_tree }
+  end
+
+  private def build_tree
     keys = @order ? @order | @declarations.keys : @declarations.keys
     dependents = Hash.new { |h, k| h[k] = [] }
     keys.each do |key|
@@ -326,13 +341,15 @@ class System
   # update status to :prepared
   # prepare! should be idempotent
   def prepare!
-    return self if past?(:prepared)
+    @lock.synchronize do
+      return self if past?(:prepared)
 
-    check_registered_components!
-    @order = resolve_order
-    ordered_components.each(&:prepare!)
-    @status = :prepared
-    self
+      check_registered_components!
+      @order = resolve_order
+      ordered_components.each(&:prepare!)
+      @status = :prepared
+      self
+    end
   end
 
   # prepare system if not already prepared (idempotent)
@@ -340,36 +357,55 @@ class System
   # pass the value through the matching declaration's type (type.parse(value))
   # build! is also idempotent
   def build!
-    prepare! # idempotent call
-    return self if past?(:built)
+    @lock.synchronize do
+      prepare! # idempotent call
+      return self if past?(:built)
 
-    ordered_components.each do |component|
-      component.build!(dep_values(component), @declarations[component.key].type)
+      ordered_components.each do |component|
+        component.build!(dep_values(component), @declarations[component.key].type)
+      end
+      @status = :built
+      self
     end
-    @status = :built
-    self
   end
 
   # call #start hooks on all components. Idempotent.
   # each component's #start hooks are called with (value, context)
   # useful for components that want to start threads or fibers in a context (ex. parent fiber)
+  # Start hooks run while holding the system lock, so they should spawn long-running work and return, not block.
+  # If a start hook raises, components already started are torn down (in reverse order),
+  # the system is left :toredown, and the original exception is re-raised.
   def start!(context = Thread.current)
-    build! # idempotent
-    return self if past?(:started)
+    @lock.synchronize do
+      build! # idempotent
+      return self if past?(:started)
 
-    ordered_components.each { |c| c.start!(context) }
-    @status = :started
-    self
+      begin
+        ordered_components.each { |c| c.start!(context) }
+      rescue Exception # any error (incl. Interrupt) must tear down what was started. Always re-raised.
+        teardown_components
+        @status = :toredown
+        raise
+      end
+
+      @status = :started
+      self
+    end
   end
 
   # call #teardown hooks on all components, in reverse dependency order
   # no-op if system is not started
+  # All components are torn down even if some teardown hooks raise. The first error is then re-raised.
   def teardown!
-    return self unless status == :started
+    @lock.synchronize do
+      return self unless status == :started
 
-    ordered_components.reverse_each(&:teardown!)
-    @status = :toredown
-    self
+      errors = teardown_components
+      @status = :toredown
+      raise errors.first if errors.any?
+
+      self
+    end
   end
 
   # Fetch a component's value. Singletons return their memoized value,
@@ -389,6 +425,16 @@ class System
       component.value
     else
       @declarations[key].type.parse(component.call(dep_values(component)))
+    end
+  end
+
+  # Tear down started components in reverse dependency order, carrying on past errors.
+  # Returns the errors raised by teardown hooks.
+  private def teardown_components
+    ordered_components.reverse.each_with_object([]) do |component, errors|
+      component.teardown!
+    rescue StandardError => e
+      errors << e
     end
   end
 
@@ -430,12 +476,14 @@ class System
   # Registering a key that already has a component overrides it (ex. an extension replacing an app default).
   # The declaration is left untouched, so the new component must still satisfy the declared type.
   private def add_component(key, deps, &)
-    raise LockedSystemError, "can't add components to a locked system" if locked?
+    @lock.synchronize do
+      raise LockedSystemError, "can't add components to a locked system" if locked?
 
-    key = build_key(key)
-    raise UndeclaredComponentError, "#{key} component is not declared in this system" unless declared?(key)
+      key = build_key(key)
+      raise UndeclaredComponentError, "#{key} component is not declared in this system" unless declared?(key)
 
-    @components[key] = yield(key, deps.map { |d| build_key(d) })
-    self
+      @components[key] = yield(key, deps.map { |d| build_key(d) })
+      self
+    end
   end
 end

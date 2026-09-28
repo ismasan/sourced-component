@@ -446,6 +446,122 @@ RSpec.describe System do
     end
   end
 
+  describe 'concurrency' do
+    def counting_system(calls)
+      System.new.tap do |sys|
+        sys.declare('db')
+        sys.component!('db') do
+          build { calls << :build; sleep 0.01; Object.new }
+          start { |_v, _c| calls << :start; sleep 0.01 }
+        end
+      end
+    end
+
+    it 'runs lifecycle hooks once when booted from multiple threads' do
+      calls = Queue.new
+      sys = counting_system(calls)
+      values = 5.times.map { Thread.new { sys.start!; sys['db'] } }.map(&:value)
+
+      expect(calls.size.times.map { calls.pop }).to eq(%i[build start])
+      expect(values.uniq.size).to eq(1)
+      expect(sys.status).to eq(:started)
+    end
+
+    it 'runs lifecycle hooks once when booted from multiple fibers' do
+      require 'async'
+
+      calls = []
+      sys = counting_system(calls)
+      values = Sync do |task|
+        5.times.map { task.async { sys.start!; sys['db'] } }.map(&:wait)
+      end
+
+      expect(calls).to eq(%i[build start])
+      expect(values.uniq.size).to eq(1)
+    end
+
+    it 'is reentrant, so hooks can call the system' do
+      sys = System.new
+      sys.declare('a')
+      sys.component!('a') { start { |_v, _c| sys.build! } }
+
+      expect { sys.start! }.not_to raise_error
+      expect(sys.status).to eq(:started)
+    end
+
+    it "can't declare components once locked" do
+      sys = System.new
+      sys.prepare!
+
+      expect { sys.declare('a') }.to raise_error(System::LockedSystemError)
+    end
+  end
+
+  describe 'start! failures' do
+    def failing_system(calls, teardown_error: nil)
+      System.new.tap do |sys|
+        %w[a b c d].each { |k| sys.declare(k) }
+        sys.component!('a') do
+          start { |_v, _c| calls << [:start, :a] }
+          teardown { |_v| calls << [:teardown, :a] }
+        end
+        sys.component!('b', ['a']) do
+          start { |_v, _c| calls << [:start, :b] }
+          teardown { |_v| calls << [:teardown, :b]; raise teardown_error if teardown_error }
+        end
+        sys.component!('c', ['b']) do
+          start { |_v, _c| calls << [:start, :c]; raise ArgumentError, 'boom' }
+          teardown { |_v| calls << [:teardown, :c] }
+        end
+        sys.component!('d', ['c']) do
+          start { |_v, _c| calls << [:start, :d] }
+        end
+      end
+    end
+
+    it 'tears down already started components in reverse order, and re-raises' do
+      calls = []
+      sys = failing_system(calls)
+
+      expect { sys.start! }.to raise_error(ArgumentError, 'boom')
+      expect(calls).to eq([[:start, :a], [:start, :b], [:start, :c], [:teardown, :b], [:teardown, :a]])
+      expect(sys.status).to eq(:toredown)
+      expect(sys.components.transform_values(&:status)).to eq(
+        'a' => :toredown, 'b' => :toredown, 'c' => :built, 'd' => :built
+      )
+    end
+
+    it 're-raises the original error even if teardown hooks fail' do
+      calls = []
+      sys = failing_system(calls, teardown_error: RuntimeError.new('teardown failed'))
+
+      expect { sys.start! }.to raise_error(ArgumentError, 'boom')
+      expect(calls.last).to eq([:teardown, :a])
+    end
+
+    it 'is a no-op if started again after failing' do
+      calls = []
+      sys = failing_system(calls)
+      expect { sys.start! }.to raise_error(ArgumentError)
+
+      expect { sys.start! }.not_to(change { calls.dup })
+    end
+  end
+
+  it 'tears down all components even if some teardown hooks fail, then raises the first error' do
+    calls = []
+    sys = System.new
+    %w[a b c].each { |k| sys.declare(k) }
+    sys.component!('a') { teardown { |_v| calls << :a } }
+    sys.component!('b', ['a']) { teardown { |_v| calls << :b; raise 'b failed' } }
+    sys.component!('c', ['b']) { teardown { |_v| calls << :c; raise 'c failed' } }
+    sys.start!
+
+    expect { sys.teardown! }.to raise_error(RuntimeError, 'c failed')
+    expect(calls).to eq(%i[c b a])
+    expect(sys.status).to eq(:toredown)
+  end
+
   describe 'errors' do
     it 'raises on undeclared components' do
       expect { System.new.config!('nope') { 1 } }.to raise_error(System::UndeclaredComponentError)
