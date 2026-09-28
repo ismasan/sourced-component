@@ -322,7 +322,10 @@ RSpec.describe System do
         status: :open,
         deps: ['logger.output'],
         dependents: ['app'],
-        hooks: [:build]
+        hooks: [:build],
+        pid: nil,
+        thread_id: nil,
+        fiber_id: nil
       )
       expect(tree[:components][2]).to include(deps: [], dependents: %w[app logger])
       expect(tree[:components][3]).to include(
@@ -703,6 +706,88 @@ RSpec.describe System do
       expect { sys.prepare! }.to raise_error(System::UnregisteredComponentError)
       expect(summary(events).last(2)).to eq(['system.preparing', 'system.failed'])
       expect(events.last).to have_attributes(stage: :prepare, error: be_a(System::UnregisteredComponentError))
+    end
+
+    describe 'runtime stamps' do
+      def runtime_of(event) = [event.pid, event.thread_id, event.fiber_id]
+
+      it 'stamps components with the process, thread and fiber they were started in' do
+        sys = System.new
+        events = record(sys)
+        sys.declare('a') { 1 }
+        sys.build!
+
+        expect(events.map { |e| runtime_of(e) if e.respond_to?(:pid) }.compact.uniq).to eq([[nil, nil, nil]])
+
+        thread_id = fiber_id = nil
+        Thread.new do
+          thread_id = Thread.current.object_id
+          Fiber.new do
+            fiber_id = Fiber.current.object_id
+            sys.start!
+          end.resume
+        end.join
+
+        runtime = [Process.pid, thread_id, fiber_id]
+        expect(runtime_of(sys.components['a'])).to eq(runtime)
+        expect(sys.tree[:components].first).to include(pid: Process.pid, thread_id:, fiber_id:)
+
+        start_events = events.select { |e| e.type.start_with?('components.start') }
+        expect(start_events.map(&:type)).to eq(%w[components.starting components.started])
+        expect(start_events.map { |e| runtime_of(e) }).to all(eq(runtime))
+      end
+
+      it 'keeps the start stamps on teardown events, wherever teardown is called from' do
+        sys = System.new
+        sys.declare('a') { 1 }
+        sys.component!('a') { teardown { |_v| } }
+        Thread.new { sys.start! }.join
+        started_in = sys.components['a'].thread_id
+        events = record(sys)
+        sys.teardown!
+
+        teardown_events = events.select { |e| e.respond_to?(:thread_id) }
+        expect(teardown_events.map(&:type)).to eq(%w[components.tearing_down components.toredown])
+        expect(teardown_events.map(&:thread_id)).to all(eq(started_in))
+        expect(started_in).not_to eq(Thread.current.object_id)
+      end
+
+      it 'includes stamps in start failures' do
+        sys = System.new
+        events = record(sys)
+        sys.declare('a')
+        sys.component!('a') { start { |_v, _c| raise 'nope' } }
+
+        expect { sys.start! }.to raise_error(RuntimeError)
+        failed = events.find { |e| e.type == 'components.failed' }
+        expect(runtime_of(failed)).to eq([Process.pid, Thread.current.object_id, Fiber.current.object_id])
+      end
+
+      it 'stamps the pid of a forked process' do
+        skip 'fork not supported' unless Process.respond_to?(:fork)
+
+        sys = System.new
+        sys.declare('a') { 1 }
+        sys.build! # built in the parent, started in the child
+
+        reader, writer = IO.pipe
+        child = fork do
+          reader.close
+          events = record(sys)
+          sys.start!
+          writer.write(Marshal.dump([Process.pid, sys.components['a'].pid, events.grep(System::Events::ComponentEvent).map(&:pid).uniq]))
+          writer.close
+          exit!(0)
+        end
+        writer.close
+        child_pid, stamped_pid, event_pids = Marshal.load(reader.read)
+        Process.wait(child)
+
+        expect(stamped_pid).to eq(child_pid)
+        expect(event_pids).to eq([child_pid])
+        expect(child_pid).not_to eq(Process.pid)
+        expect(sys.components['a'].pid).to be_nil # the parent's copy was never started
+      end
     end
 
     describe System::Notifier do

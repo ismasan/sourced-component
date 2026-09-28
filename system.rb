@@ -48,8 +48,13 @@ class System
 
     class SystemEvent < Event; end
 
+    # Component events carry where the component was started (see Component#stamp!).
+    # They're nil until the component starts.
     class ComponentEvent < Event
       attribute :key, String
+      attribute :pid, Plumb::Types::Integer.nullable
+      attribute :thread_id, Plumb::Types::Integer.nullable
+      attribute :fiber_id, Plumb::Types::Integer.nullable
     end
 
     Completed = proc { attribute :duration, Float }
@@ -144,7 +149,7 @@ class System
   }.freeze
 
   class Component
-    attr_reader :key, :deps, :mode, :status, :value
+    attr_reader :key, :deps, :mode, :status, :value, :pid, :thread_id, :fiber_id
 
     # Hooks are called with:
     #   prepare: no arguments
@@ -158,6 +163,9 @@ class System
       @mode = mode
       @status = :open
       @value = nil
+      @pid = nil
+      @thread_id = nil
+      @fiber_id = nil
       @prepare_blocks = []
       @build_blocks = []
       @start_blocks = []
@@ -242,6 +250,17 @@ class System
       @build_blocks.reduce(nil) { |_, b| b.call(*dep_values) }
     end
 
+    # Record the process, thread and fiber this component is being started in.
+    # Components can be started in a forked process, another thread or fiber, or all of the above.
+    def stamp!
+      @pid = Process.pid
+      @thread_id = Thread.current.object_id
+      @fiber_id = Fiber.current.object_id
+      self
+    end
+
+    def runtime = { pid:, thread_id:, fiber_id: }
+
     # Whether moving to new_status would run hooks. Only started components can be torn down.
     def pending?(new_status)
       return status == :started if new_status == :toredown
@@ -324,7 +343,7 @@ class System
       raise DeclarationOverrideError, "#{key} is already declared" if declared?(key)
 
       @declarations[key] = Declaration.new(key, type)
-      emit(Events::ComponentDeclared, key:, type_name: type_name(type))
+      emit(Events::ComponentDeclared, key:, pid: nil, thread_id: nil, fiber_id: nil, type_name: type_name(type))
       config!(key, &default) if default
       self
     end
@@ -451,7 +470,10 @@ class System
         status: component&.status,
         deps: component ? component.deps : [],
         dependents: dependents[key],
-        hooks: component ? component.hooks : []
+        hooks: component ? component.hooks : [],
+        pid: component&.pid,
+        thread_id: component&.thread_id,
+        fiber_id: component&.fiber_id
       }
     end
 
@@ -599,17 +621,19 @@ class System
     return yield unless component.pending?(STAGES.fetch(stage))
     return yield if stage == :build && component.dynamic?
 
-    key = component.key
+    # Stamped before components.starting, so start events (and all after) say where the component runs
+    component.stamp! if stage == :start
+
     before, after = COMPONENT_EVENTS.fetch(stage)
-    emit(before, key:)
+    emit(before, key: component.key, **component.runtime)
     started_at = now
     begin
       yield
     rescue Exception => e # re-raised
-      emit(Events::ComponentFailed, key:, stage:, error: e)
+      emit(Events::ComponentFailed, key: component.key, **component.runtime, stage:, error: e)
       raise
     end
-    emit(after, key:, duration: now - started_at)
+    emit(after, key: component.key, **component.runtime, duration: now - started_at)
   end
 
   private def emit(event_class, **attrs)
@@ -669,7 +693,7 @@ class System
 
       override = @components.key?(key)
       component = @components[key] = yield(key, deps.map { |d| build_key(d) })
-      emit(Events::ComponentRegistered, key:, mode: component.mode, deps: component.deps, override:)
+      emit(Events::ComponentRegistered, key:, **component.runtime, mode: component.mode, deps: component.deps, override:)
       self
     end
   end
