@@ -562,6 +562,205 @@ RSpec.describe System do
     expect(sys.status).to eq(:toredown)
   end
 
+  describe 'lifecycle events' do
+    def record(sys)
+      [].tap do |events|
+        sys.notifier.subscribe(System::Events::Event) { |e| events << e }
+      end
+    end
+
+    def summary(events)
+      events.map { |e| e.respond_to?(:key) ? "#{e.type} #{e.key}" : e.type }
+    end
+
+    it 'publishes events for every lifecycle step' do
+      sys = System.new
+      events = record(sys)
+      sys.declare('output') { STDOUT }
+      sys.declare('logger', String)
+      sys.config!('logger', ['output']) { |o| o.class.name }
+      sys.config!('logger', ['output']) { |_o| 'overridden' }
+      sys.start!
+      sys.teardown!
+
+      expect(summary(events)).to eq([
+        'components.declared output', 'components.registered output',
+        'components.declared logger', 'components.registered logger', 'components.registered logger',
+        'system.preparing',
+        'components.preparing output', 'components.prepared output',
+        'components.preparing logger', 'components.prepared logger',
+        'system.prepared',
+        'system.building',
+        'components.building output', 'components.built output',
+        'components.building logger', 'components.built logger',
+        'system.built',
+        'system.starting',
+        'components.starting output', 'components.started output',
+        'components.starting logger', 'components.started logger',
+        'system.started',
+        'system.tearing_down',
+        'components.tearing_down logger', 'components.toredown logger',
+        'components.tearing_down output', 'components.toredown output',
+        'system.toredown'
+      ])
+      expect(events).to all(be_valid)
+      expect(events).to all(have_attributes(timestamp: be_a(Time)))
+    end
+
+    it 'includes event details' do
+      sys = System.new
+      events = record(sys)
+      sys.declare('output', Plumb::Types::Interface[:puts]) { STDOUT }
+      sys.declare('logger')
+      sys.config!('logger', ['output']) { 1 }
+      sys.config('logger', ['output']) { 2 }
+      sys.build!
+
+      declared = events.find { |e| e.type == 'components.declared' }
+      expect(declared).to have_attributes(key: 'output', type_name: 'Interface[puts]')
+
+      registered = events.select { |e| e.type == 'components.registered' && e.key == 'logger' }
+      expect(registered.map { |e| [e.mode, e.deps, e.override] }).to eq([
+        [:singleton, ['output'], false],
+        [:dynamic, ['output'], true]
+      ])
+
+      completed = events.select { |e| e.type.end_with?('ed') && e.respond_to?(:duration) }
+      expect(completed).not_to be_empty
+      expect(completed.map(&:duration)).to all(be >= 0)
+    end
+
+    it 'only publishes build events for singleton components' do
+      sys = System.new
+      events = record(sys)
+      sys.declare('singleton') { 1 }
+      sys.declare('dynamic')
+      sys.config('dynamic') { 2 }
+      sys.start!
+      sys['dynamic']
+
+      types = summary(events)
+      expect(types).to include('components.built singleton', 'components.started dynamic', 'components.prepared dynamic')
+      expect(types.grep(/build.* dynamic/)).to be_empty
+    end
+
+    it "doesn't publish events for steps that don't run" do
+      sys = System.new
+      sys.declare('a') { 1 }
+      sys.start!
+      events = record(sys)
+      sys.prepare!
+      sys.build!
+      sys.start!
+
+      expect(events).to be_empty
+    end
+
+    it 'publishes failures, including start rollbacks' do
+      sys = System.new
+      events = record(sys)
+      sys.declare('a') { 1 }
+      sys.declare('b')
+      sys.component!('b', ['a']) { start { |_v, _c| raise ArgumentError, 'boom' } }
+
+      expect { sys.start! }.to raise_error(ArgumentError)
+      expect(summary(events).drop_while { |t| t != 'system.starting' }).to eq([
+        'system.starting',
+        'components.starting a', 'components.started a',
+        'components.starting b', 'components.failed b',
+        'components.tearing_down a', 'components.toredown a',
+        'system.failed'
+      ])
+
+      component_failed, system_failed = events.select { |e| e.type.end_with?('failed') }
+      expect(component_failed).to have_attributes(key: 'b', stage: :start, error: be_a(ArgumentError))
+      expect(system_failed).to have_attributes(stage: :start, error: be_a(ArgumentError))
+    end
+
+    it 'publishes teardown failures, and carries on tearing down' do
+      sys = System.new
+      sys.declare('a') { 1 }
+      sys.declare('b')
+      sys.component!('b', ['a']) { teardown { |_v| raise 'nope' } }
+      sys.start!
+      events = record(sys)
+
+      expect { sys.teardown! }.to raise_error(RuntimeError, 'nope')
+      expect(summary(events)).to eq([
+        'system.tearing_down',
+        'components.tearing_down b', 'components.failed b',
+        'components.tearing_down a', 'components.toredown a',
+        'system.failed'
+      ])
+      expect(events.last).to have_attributes(stage: :teardown)
+    end
+
+    it 'publishes system failures without a component' do
+      sys = System.new
+      events = record(sys)
+      sys.declare('a')
+
+      expect { sys.prepare! }.to raise_error(System::UnregisteredComponentError)
+      expect(summary(events).last(2)).to eq(['system.preparing', 'system.failed'])
+      expect(events.last).to have_attributes(stage: :prepare, error: be_a(System::UnregisteredComponentError))
+    end
+
+    describe System::Notifier do
+      subject(:notifier) { System::Notifier.new }
+
+      let(:built) { System::Events::ComponentBuilt.new(timestamp: Time.now, key: 'a', duration: 0.1) }
+      let(:started) { System::Events::ComponentStarted.new(timestamp: Time.now, key: 'a', duration: 0.1) }
+      let(:system_started) { System::Events::SystemStarted.new(timestamp: Time.now, duration: 0.1) }
+
+      it 'subscribes to event types, classes and their subclasses' do
+        received = Hash.new { |h, k| h[k] = [] }
+        notifier.subscribe('components.built') { |e| received[:type] << e }
+        notifier.subscribe(:'components.built') { |e| received[:symbol] << e }
+        notifier.subscribe(System::Events::ComponentStarted) { |e| received[:class] << e }
+        notifier.subscribe(System::Events::ComponentEvent) { |e| received[:component] << e }
+        notifier.subscribe(System::Events::Event) { |e| received[:all] << e }
+
+        [built, started, system_started].each { |e| notifier.publish(e) }
+
+        expect(received).to eq(
+          type: [built],
+          symbol: [built],
+          class: [started],
+          component: [built, started],
+          all: [built, started, system_started]
+        )
+      end
+
+      it 'raises on unknown event types' do
+        expect { notifier.subscribe('components.buitl') {} }.to raise_error(ArgumentError, /unknown event type/)
+      end
+
+      it 'requires a handler' do
+        expect { notifier.subscribe('components.built') }.to raise_error(ArgumentError, /handler block is required/)
+      end
+    end
+
+    it 'accepts a custom notifier' do
+      notifier = Class.new do
+        attr_reader :events
+        def initialize = @events = []
+        def publish(event) = @events << event
+        def subscribe(*) = self
+      end.new
+
+      sys = System.new(notifier:)
+      sys.declare('a') { 1 }
+      sys.build!
+
+      expect(sys.notifier).to be(notifier)
+      expect(notifier.events.map(&:type)).to include('system.built', 'components.built')
+    end
+
+    it 'validates custom notifiers' do
+      expect { System.new(notifier: Object.new) }.to raise_error(Plumb::ParseError)
+    end
+  end
+
   describe 'errors' do
     it 'raises on undeclared components' do
       expect { System.new.config!('nope') { 1 } }.to raise_error(System::UndeclaredComponentError)

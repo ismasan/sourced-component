@@ -21,6 +21,128 @@ class System
 
   Declaration = Data.define(:key, :type)
 
+  # Lifecycle events published to the system's notifier. Each event class has a #type string
+  # which can be used to subscribe to it, ex. notifier.subscribe('components.built') { |event| ... }
+  module Events
+    REGISTRY = {}
+
+    class Event < Plumb::Types::Data
+      attribute :timestamp, Time
+
+      class << self
+        attr_reader :type
+
+        # Define and register an event subclass with a type string
+        def define(type, &block)
+          raise ArgumentError, "event type #{type} is already defined" if REGISTRY.key?(type)
+
+          REGISTRY[type] = Class.new(self) do
+            @type = type
+            class_eval(&block) if block
+          end
+        end
+      end
+
+      def type = self.class.type
+    end
+
+    class SystemEvent < Event; end
+
+    class ComponentEvent < Event
+      attribute :key, String
+    end
+
+    Completed = proc { attribute :duration, Float }
+    Failed = proc do
+      attribute :stage, Symbol
+      attribute :error, Exception
+    end
+
+    SystemPreparing = SystemEvent.define('system.preparing')
+    SystemPrepared = SystemEvent.define('system.prepared', &Completed)
+    SystemBuilding = SystemEvent.define('system.building')
+    SystemBuilt = SystemEvent.define('system.built', &Completed)
+    SystemStarting = SystemEvent.define('system.starting')
+    SystemStarted = SystemEvent.define('system.started', &Completed)
+    SystemTearingDown = SystemEvent.define('system.tearing_down')
+    SystemToredown = SystemEvent.define('system.toredown', &Completed)
+    SystemFailed = SystemEvent.define('system.failed', &Failed)
+
+    ComponentDeclared = ComponentEvent.define('components.declared') do
+      attribute :type_name, String
+    end
+    ComponentRegistered = ComponentEvent.define('components.registered') do
+      attribute :mode, Symbol
+      attribute :deps, Plumb::Types::Array[String]
+      attribute :override, Plumb::Types::Boolean
+    end
+    ComponentPreparing = ComponentEvent.define('components.preparing')
+    ComponentPrepared = ComponentEvent.define('components.prepared', &Completed)
+    ComponentBuilding = ComponentEvent.define('components.building')
+    ComponentBuilt = ComponentEvent.define('components.built', &Completed)
+    ComponentStarting = ComponentEvent.define('components.starting')
+    ComponentStarted = ComponentEvent.define('components.started', &Completed)
+    ComponentTearingDown = ComponentEvent.define('components.tearing_down')
+    ComponentToredown = ComponentEvent.define('components.toredown', &Completed)
+    ComponentFailed = ComponentEvent.define('components.failed', &Failed)
+  end
+
+  # The default notifier. Custom notifiers must implement the same #publish and #subscribe interface.
+  # Handlers are called synchronously, in the order they subscribed, by the thread or fiber running the lifecycle step.
+  # Errors raised by handlers propagate to the caller.
+  class Notifier
+    def initialize
+      @subscriptions = [].freeze
+      @lock = Mutex.new
+    end
+
+    # Subscribe to an event type string (ex. 'components.built'),
+    # or an event class, which also matches its subclasses (ex. Events::ComponentEvent for all component events)
+    def subscribe(event_class_or_type, &handler)
+      raise ArgumentError, 'a handler block is required' unless handler
+
+      matcher = case event_class_or_type
+                when Class
+                  ->(event) { event.is_a?(event_class_or_type) }
+                when String, Symbol
+                  type = event_class_or_type.to_s
+                  raise ArgumentError, "unknown event type #{type}" unless Events::REGISTRY.key?(type)
+
+                  ->(event) { event.type == type }
+                else
+                  raise ArgumentError, "can't subscribe to #{event_class_or_type.inspect}"
+                end
+
+      # copy-on-write, so publishing never needs the lock
+      @lock.synchronize { @subscriptions = [*@subscriptions, [matcher, handler]].freeze }
+      self
+    end
+
+    def publish(event)
+      @subscriptions.each { |matcher, handler| handler.call(event) if matcher.call(event) }
+      self
+    end
+  end
+
+  NotifierInterface = Plumb::Types::Interface[:publish, :subscribe]
+
+  # Lifecycle stages, and the status each one moves to
+  STAGES = { prepare: :prepared, build: :built, start: :started, teardown: :toredown }.freeze
+
+  SYSTEM_EVENTS = {
+    prepare: [Events::SystemPreparing, Events::SystemPrepared],
+    build: [Events::SystemBuilding, Events::SystemBuilt],
+    start: [Events::SystemStarting, Events::SystemStarted],
+    teardown: [Events::SystemTearingDown, Events::SystemToredown]
+  }.freeze
+
+  COMPONENT_EVENTS = {
+    prepare: [Events::ComponentPreparing, Events::ComponentPrepared],
+    build: [Events::ComponentBuilding, Events::ComponentBuilt],
+    start: [Events::ComponentStarting, Events::ComponentStarted],
+    teardown: [Events::ComponentTearingDown, Events::ComponentToredown]
+  }.freeze
+
   class Component
     attr_reader :key, :deps, :mode, :status, :value
 
@@ -112,8 +234,6 @@ class System
     end
 
     def teardown!
-      return self unless status == :started
-
       transition(:toredown) { @teardown_blocks.each { |b| b.call(value) } }
     end
 
@@ -122,9 +242,16 @@ class System
       @build_blocks.reduce(nil) { |_, b| b.call(*dep_values) }
     end
 
+    # Whether moving to new_status would run hooks. Only started components can be torn down.
+    def pending?(new_status)
+      return status == :started if new_status == :toredown
+
+      STATUSES.index(status) < STATUSES.index(new_status)
+    end
+
     # Run the block and move to the new status, unless already there or past it.
     private def transition(new_status)
-      return self if STATUSES.index(status) >= STATUSES.index(new_status)
+      return self unless pending?(new_status)
 
       yield
       @status = new_status
@@ -166,19 +293,21 @@ class System
     def inspect = "#<#{self.class} #{names.map { |key, name| "#{key} => #{name}" }.join(', ')}>"
   end
 
-  attr_reader :declarations, :components, :status
+  attr_reader :declarations, :components, :status, :notifier
 
   # Registration and lifecycle methods are synchronized with a Monitor, so a single system
   # can be booted from multiple threads or fibers: concurrent callers wait for the first one to finish,
   # and then no-op. The Monitor is reentrant (#start! calls #build!, hooks may call the system)
   # and owned per fiber, so it works with fiber schedulers (ex. Async).
   # Reading values with #[] (and injected defaults) needs no lock, as they're immutable once built.
-  def initialize
+  # notifier: receives lifecycle events. See System::Notifier and System::Events
+  def initialize(notifier: Notifier.new)
     @declarations = {}
     @components = {}
     @status = :open
     @order = nil
     @lock = Monitor.new
+    @notifier = NotifierInterface.parse(notifier)
   end
 
   # Declare a component that MUST be registered before #prepare!
@@ -195,6 +324,7 @@ class System
       raise DeclarationOverrideError, "#{key} is already declared" if declared?(key)
 
       @declarations[key] = Declaration.new(key, type)
+      emit(Events::ComponentDeclared, key:, type_name: type_name(type))
       config!(key, &default) if default
       self
     end
@@ -315,7 +445,7 @@ class System
       {
         key:,
         type:,
-        type_name: type.inspect.gsub('Plumb::Types::', ''),
+        type_name: type_name(type),
         registered: !component.nil?,
         mode: component&.mode,
         status: component&.status,
@@ -344,10 +474,14 @@ class System
     @lock.synchronize do
       return self if past?(:prepared)
 
-      check_registered_components!
-      @order = resolve_order
-      ordered_components.each(&:prepare!)
-      @status = :prepared
+      instrument_system(:prepare) do
+        check_registered_components!
+        @order = resolve_order
+        ordered_components.each do |component|
+          instrument_component(component, :prepare) { component.prepare! }
+        end
+        @status = :prepared
+      end
       self
     end
   end
@@ -361,10 +495,14 @@ class System
       prepare! # idempotent call
       return self if past?(:built)
 
-      ordered_components.each do |component|
-        component.build!(dep_values(component), @declarations[component.key].type)
+      instrument_system(:build) do
+        ordered_components.each do |component|
+          instrument_component(component, :build) do
+            component.build!(dep_values(component), @declarations[component.key].type)
+          end
+        end
+        @status = :built
       end
-      @status = :built
       self
     end
   end
@@ -380,15 +518,16 @@ class System
       build! # idempotent
       return self if past?(:started)
 
-      begin
-        ordered_components.each { |c| c.start!(context) }
+      instrument_system(:start) do
+        ordered_components.each do |component|
+          instrument_component(component, :start) { component.start!(context) }
+        end
+        @status = :started
       rescue Exception # any error (incl. Interrupt) must tear down what was started. Always re-raised.
         teardown_components
         @status = :toredown
         raise
       end
-
-      @status = :started
       self
     end
   end
@@ -400,10 +539,11 @@ class System
     @lock.synchronize do
       return self unless status == :started
 
-      errors = teardown_components
-      @status = :toredown
-      raise errors.first if errors.any?
-
+      instrument_system(:teardown) do
+        errors = teardown_components
+        @status = :toredown
+        raise errors.first if errors.any?
+      end
       self
     end
   end
@@ -432,11 +572,56 @@ class System
   # Returns the errors raised by teardown hooks.
   private def teardown_components
     ordered_components.reverse.each_with_object([]) do |component, errors|
-      component.teardown!
+      instrument_component(component, :teardown) { component.teardown! }
     rescue StandardError => e
       errors << e
     end
   end
+
+  # Publish system.<stage>ing, run the block, and publish system.<stage>ed with its duration,
+  # or system.failed if it raises.
+  private def instrument_system(stage)
+    before, after = SYSTEM_EVENTS.fetch(stage)
+    emit(before)
+    started_at = now
+    begin
+      yield
+    rescue Exception => e # re-raised
+      emit(Events::SystemFailed, stage:, error: e)
+      raise
+    end
+    emit(after, duration: now - started_at)
+  end
+
+  # Same as #instrument_system for a component, but only if the stage would run hooks.
+  # Dynamic components aren't built by the system, so they don't publish build events.
+  private def instrument_component(component, stage)
+    return yield unless component.pending?(STAGES.fetch(stage))
+    return yield if stage == :build && component.dynamic?
+
+    key = component.key
+    before, after = COMPONENT_EVENTS.fetch(stage)
+    emit(before, key:)
+    started_at = now
+    begin
+      yield
+    rescue Exception => e # re-raised
+      emit(Events::ComponentFailed, key:, stage:, error: e)
+      raise
+    end
+    emit(after, key:, duration: now - started_at)
+  end
+
+  private def emit(event_class, **attrs)
+    event = event_class.new(timestamp: Time.now, **attrs)
+    raise ArgumentError, "invalid #{event_class.type} event: #{event.errors}" unless event.valid?
+
+    @notifier.publish(event)
+  end
+
+  private def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  private def type_name(type) = type.inspect.gsub('Plumb::Types::', '')
 
   private def past?(new_status)
     STATUSES.index(status) >= STATUSES.index(new_status)
@@ -482,7 +667,9 @@ class System
       key = build_key(key)
       raise UndeclaredComponentError, "#{key} component is not declared in this system" unless declared?(key)
 
-      @components[key] = yield(key, deps.map { |d| build_key(d) })
+      override = @components.key?(key)
+      component = @components[key] = yield(key, deps.map { |d| build_key(d) })
+      emit(Events::ComponentRegistered, key:, mode: component.mode, deps: component.deps, override:)
       self
     end
   end
