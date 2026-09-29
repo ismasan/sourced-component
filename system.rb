@@ -95,8 +95,13 @@ class System
   module Events
     REGISTRY = {}
 
+    # All events carry the process, thread and fiber they were published from.
+    # (Where a component was started is recorded on the component itself. See Component#stamp!)
     class Event < Plumb::Types::Data
       attribute :timestamp, Time
+      attribute :pid, Integer
+      attribute :thread_id, Integer
+      attribute :fiber_id, Integer
 
       class << self
         attr_reader :type
@@ -117,13 +122,8 @@ class System
 
     class SystemEvent < Event; end
 
-    # Component events carry where the component was started (see Component#stamp!).
-    # They're nil until the component starts.
     class ComponentEvent < Event
       attribute :key, String
-      attribute :pid, Plumb::Types::Integer.nullable
-      attribute :thread_id, Plumb::Types::Integer.nullable
-      attribute :fiber_id, Plumb::Types::Integer.nullable
     end
 
     Completed = proc { attribute :duration, Float }
@@ -749,23 +749,29 @@ class System
     return yield unless component.pending?(STAGES.fetch(stage))
     return yield if stage == :build && component.dynamic?
 
-    # Stamped before components.starting, so start events (and all after) say where the component runs
+    # Record where the component runs
     component.stamp! if stage == :start
 
     before, after = COMPONENT_EVENTS.fetch(stage)
-    emit(before, key: component.key, **component.runtime)
+    emit(before, key: component.key)
     started_at = now
     begin
       yield
     rescue Exception => e # re-raised
-      emit(Events::ComponentFailed, key: component.key, **component.runtime, stage:, error: e)
+      emit(Events::ComponentFailed, key: component.key, stage:, error: e)
       raise
     end
-    emit(after, key: component.key, **component.runtime, duration: now - started_at)
+    emit(after, key: component.key, duration: now - started_at)
   end
 
   private def emit(event_class, **attrs)
-    event = event_class.new(timestamp: Time.now, **attrs)
+    event = event_class.new(
+      timestamp: Time.now,
+      pid: Process.pid,
+      thread_id: Thread.current.object_id,
+      fiber_id: Fiber.current.object_id,
+      **attrs
+    )
     raise ArgumentError, "invalid #{event_class.type} event: #{event.errors}" unless event.valid?
 
     @notifier.publish(event)
@@ -816,8 +822,7 @@ class System
   end
 
   private def emit_declared(declaration)
-    emit(Events::ComponentDeclared, key: declaration.key, pid: nil, thread_id: nil, fiber_id: nil,
-                                    type_name: type_name(declaration.type))
+    emit(Events::ComponentDeclared, key: declaration.key, type_name: type_name(declaration.type))
   end
 
   # Register a declaration's default as a singleton config
@@ -840,7 +845,7 @@ class System
 
       override = @components.key?(key)
       component = @components[key] = yield(key, deps.map { |d| build_key(d) })
-      emit(Events::ComponentRegistered, key:, **component.runtime, mode: component.mode, deps: component.deps, override:)
+      emit(Events::ComponentRegistered, key:, mode: component.mode, deps: component.deps, override:)
       self
     end
   end

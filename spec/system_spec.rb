@@ -909,62 +909,76 @@ RSpec.describe System do
       expect(events.last).to have_attributes(stage: :prepare, error: be_a(System::UnregisteredComponentError))
     end
 
-    describe 'runtime stamps' do
+    describe 'runtime ids' do
       def runtime_of(event) = [event.pid, event.thread_id, event.fiber_id]
+      def here = [Process.pid, Thread.current.object_id, Fiber.current.object_id]
 
-      it 'stamps components with the process, thread and fiber they were started in' do
+      # Run a block in a new thread and fiber, returning their runtime ids
+      def in_thread_and_fiber
+        ids = nil
+        Thread.new do
+          Fiber.new do
+            ids = here
+            yield
+          end.resume
+        end.join
+        ids
+      end
+
+      it 'publishes every event with the process, thread and fiber it was published from' do
         sys = System.new
         events = record(sys)
         sys.declare('a') { 1 }
         sys.build!
 
-        expect(events.map { |e| runtime_of(e) if e.respond_to?(:pid) }.compact.uniq).to eq([[nil, nil, nil]])
+        expect(events.map(&:type)).to include('components.declared', 'components.registered', 'system.built')
+        expect(events.map { |e| runtime_of(e) }.uniq).to eq([here])
 
-        thread_id = fiber_id = nil
-        Thread.new do
-          thread_id = Thread.current.object_id
-          Fiber.new do
-            fiber_id = Fiber.current.object_id
-            sys.start!
-          end.resume
-        end.join
+        events.clear
+        elsewhere = in_thread_and_fiber { sys.start! }
 
-        runtime = [Process.pid, thread_id, fiber_id]
-        expect(runtime_of(sys.components['a'])).to eq(runtime)
-        expect(sys.graph.components.first).to include(pid: Process.pid, thread_id:, fiber_id:)
-
-        start_events = events.select { |e| e.type.start_with?('components.start') }
-        expect(start_events.map(&:type)).to eq(%w[components.starting components.started])
-        expect(start_events.map { |e| runtime_of(e) }).to all(eq(runtime))
+        expect(elsewhere).not_to eq(here)
+        expect(events.map(&:type)).to include('system.starting', 'components.started', 'system.started')
+        expect(events.map { |e| runtime_of(e) }.uniq).to eq([elsewhere])
       end
 
-      it 'keeps the start stamps on teardown events, wherever teardown is called from' do
+      it 'stamps components with the process, thread and fiber they were started in' do
+        sys = System.new
+        sys.declare('a') { 1 }
+        expect(sys.components['a'].runtime).to eq(pid: nil, thread_id: nil, fiber_id: nil)
+
+        pid, thread_id, fiber_id = in_thread_and_fiber { sys.start! }
+
+        expect(sys.components['a'].runtime).to eq(pid:, thread_id:, fiber_id:)
+        expect(sys.graph.components.first).to include(pid:, thread_id:, fiber_id:)
+      end
+
+      it 'publishes teardown events from where teardown runs, while the component keeps its start stamp' do
         sys = System.new
         sys.declare('a') { 1 }
         sys.component!('a') { teardown { |_v| } }
-        Thread.new { sys.start! }.join
-        started_in = sys.components['a'].thread_id
+        started_in = in_thread_and_fiber { sys.start! }
         events = record(sys)
         sys.teardown!
 
-        teardown_events = events.select { |e| e.respond_to?(:thread_id) }
-        expect(teardown_events.map(&:type)).to eq(%w[components.tearing_down components.toredown])
-        expect(teardown_events.map(&:thread_id)).to all(eq(started_in))
-        expect(started_in).not_to eq(Thread.current.object_id)
+        expect(events.map(&:type)).to eq(%w[system.tearing_down components.tearing_down components.toredown system.toredown])
+        expect(events.map { |e| runtime_of(e) }.uniq).to eq([here])
+        expect(runtime_of(sys.components['a'])).to eq(started_in)
       end
 
-      it 'includes stamps in start failures' do
+      it 'includes runtime ids in failures' do
         sys = System.new
         events = record(sys)
         sys.declare('a')
         sys.component!('a') { start { |_v, _c| raise 'nope' } }
 
         expect { sys.start! }.to raise_error(RuntimeError)
-        failed = events.find { |e| e.type == 'components.failed' }
-        expect(runtime_of(failed)).to eq([Process.pid, Thread.current.object_id, Fiber.current.object_id])
+        failures = events.select { |e| e.type.end_with?('failed') }
+        expect(failures.map(&:type)).to eq(%w[components.failed system.failed])
+        expect(failures.map { |e| runtime_of(e) }).to all(eq(here))
       end
 
-      it 'stamps the pid of a forked process' do
+      it 'uses the pid of a forked process' do
         skip 'fork not supported' unless Process.respond_to?(:fork)
 
         sys = System.new
@@ -976,7 +990,7 @@ RSpec.describe System do
           reader.close
           events = record(sys)
           sys.start!
-          writer.write(Marshal.dump([Process.pid, sys.components['a'].pid, events.grep(System::Events::ComponentEvent).map(&:pid).uniq]))
+          writer.write(Marshal.dump([Process.pid, sys.components['a'].pid, events.map(&:pid).uniq]))
           writer.close
           exit!(0)
         end
@@ -984,9 +998,9 @@ RSpec.describe System do
         child_pid, stamped_pid, event_pids = Marshal.load(reader.read)
         Process.wait(child)
 
+        expect(child_pid).not_to eq(Process.pid)
         expect(stamped_pid).to eq(child_pid)
         expect(event_pids).to eq([child_pid])
-        expect(child_pid).not_to eq(Process.pid)
         expect(sys.components['a'].pid).to be_nil # the parent's copy was never started
       end
     end
@@ -994,9 +1008,10 @@ RSpec.describe System do
     describe System::Notifier do
       subject(:notifier) { System::Notifier.new }
 
-      let(:built) { System::Events::ComponentBuilt.new(timestamp: Time.now, key: 'a', duration: 0.1) }
-      let(:started) { System::Events::ComponentStarted.new(timestamp: Time.now, key: 'a', duration: 0.1) }
-      let(:system_started) { System::Events::SystemStarted.new(timestamp: Time.now, duration: 0.1) }
+      let(:common) { { timestamp: Time.now, pid: 1, thread_id: 2, fiber_id: 3, duration: 0.1 } }
+      let(:built) { System::Events::ComponentBuilt.new(key: 'a', **common) }
+      let(:started) { System::Events::ComponentStarted.new(key: 'a', **common) }
+      let(:system_started) { System::Events::SystemStarted.new(**common) }
 
       it 'subscribes to event types, classes and their subclasses' do
         received = Hash.new { |h, k| h[k] = [] }
