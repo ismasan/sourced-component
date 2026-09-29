@@ -262,7 +262,7 @@ RSpec.describe System do
       end
 
       expect(sys.components['logger'].inspect).to eq(
-        '#<System::Component logger (singleton, open) deps=[output] hooks=[prepare, build]>'
+        '#<System::Component logger (singleton, open) deps=[output]>'
       )
     end
 
@@ -275,8 +275,8 @@ RSpec.describe System do
 
       expect(sys.inspect).to eq(<<~TXT.chomp)
         #<System status=open components=2/3
-          logger : Interface[info] (dynamic, open) deps=[output] hooks=[build]
-          output : Any (singleton, open) hooks=[build]
+          logger : Interface[info] (dynamic, open) deps=[output]
+          output : Any (singleton, open)
           db : (Nil | Interface[append]) (not registered)
         >
       TXT
@@ -286,9 +286,9 @@ RSpec.describe System do
 
       expect(sys.inspect).to eq(<<~TXT.chomp)
         #<System status=prepared components=3/3
-          output : Any (singleton, prepared) hooks=[build]
-          logger : Interface[info] (dynamic, prepared) deps=[output] hooks=[build]
-          db : (Nil | Interface[append]) (singleton, prepared) hooks=[build]
+          output : Any (singleton, prepared)
+          logger : Interface[info] (dynamic, prepared) deps=[output]
+          db : (Nil | Interface[append]) (singleton, prepared)
         >
       TXT
     end
@@ -315,7 +315,7 @@ RSpec.describe System do
       expect(graph.to_h).to eq(status: :open, components: graph.components)
       expect(graph.components.map { |c| c[:key] }).to eq(%w[app logger logger.output db])
 
-      expect(graph.components[1]).to eq(
+      expect(graph.components[1]).to match(
         key: 'logger',
         type: logger_type,
         type_name: 'Interface[info]',
@@ -324,7 +324,7 @@ RSpec.describe System do
         status: :open,
         deps: ['logger.output'],
         dependents: ['app'],
-        hooks: [:build],
+        provider: be_a(System::BlockProvider),
         pid: nil,
         thread_id: nil,
         fiber_id: nil
@@ -338,7 +338,7 @@ RSpec.describe System do
         status: nil,
         deps: [],
         dependents: [],
-        hooks: []
+        provider: nil
       )
     end
 
@@ -409,6 +409,194 @@ RSpec.describe System do
     end
   end
 
+  describe 'component providers' do
+    # A provider that is also its own builder, and records the declarations it's set up with
+    let(:prefixer) do
+      Class.new do
+        attr_reader :declarations
+
+        def initialize = @declarations = []
+        def dependencies = ['prefix']
+
+        def setup(declaration)
+          @declarations << declaration
+          self
+        end
+
+        def build(prefix) = "#{prefix}-value"
+      end.new
+    end
+
+    # A provider that returns a separate builder, implementing every hook
+    let(:full_provider) do
+      builder_class = Class.new do
+        attr_reader :calls
+
+        def initialize = @calls = []
+        def prepare = @calls << [:prepare]
+        def build(dep) = (@calls << [:build, dep]) && "built(#{dep})"
+        def start(value, context) = @calls << [:start, value, context]
+        def teardown(value) = @calls << [:teardown, value]
+      end
+
+      Class.new do
+        define_method(:dependencies) { ['dep'] }
+        define_method(:setup) { |_declaration| builder_class.new }
+      end.new
+    end
+
+    it 'sets up providers at registration, with the declaration, and builds with their dependencies' do
+      sys = System.new
+      sys.declare('prefix') { 'p' }
+      sys.declare('thing', String)
+      sys.component!('thing', prefixer)
+
+      expect(prefixer.declarations.map { |d| [d.key, d.type] }).to eq([['thing', Plumb::Types::String]])
+      expect(sys.components['thing'].deps).to eq(['prefix'])
+
+      sys.build!
+      expect(sys['thing']).to eq('p-value')
+      expect(prefixer.declarations.size).to eq(1)
+    end
+
+    it 'type-checks provider values' do
+      sys = System.new
+      sys.declare('prefix') { 'p' }
+      sys.declare('thing', Integer)
+      sys.component!('thing', prefixer)
+
+      expect { sys.build! }.to raise_error(Plumb::ParseError)
+    end
+
+    it 'calls every hook the builder implements, with their arguments' do
+      sys = System.new
+      sys.declare('dep') { 'd' }
+      sys.declare('thing', String)
+      sys.component!('thing', full_provider)
+      sys.start!(:ctx)
+      sys.teardown!
+
+      expect(sys.components['thing'].builder.calls).to eq([
+        [:prepare], [:build, 'd'], [:start, 'built(d)', :ctx], [:teardown, 'built(d)']
+      ])
+    end
+
+    it 'completes builders with no-ops for missing hooks, without shadowing the hooks they implement' do
+      torn_down = []
+      builder = Object.new
+      builder.define_singleton_method(:build) { 'value' }
+      builder.define_singleton_method(:teardown) { |value| torn_down << value }
+      provider = Struct.new(:builder) do
+        def dependencies = []
+        def setup(_declaration) = builder
+        def inspect = '#<TestProvider>'
+      end.new(builder)
+
+      sys = System.new
+      sys.declare('thing')
+      sys.component!('thing', provider)
+      component = sys.components['thing']
+
+      expect(component.builder).to respond_to(:prepare, :start)
+      expect(component.builder.__getobj__).to be(builder)
+      expect(component.inspect).to eq('#<System::Component thing (singleton, open) provider=#<TestProvider>>')
+      expect(sys.graph.components.first).to include(provider:)
+
+      sys.start!
+      sys.teardown!
+      expect(torn_down).to eq(['value'])
+    end
+
+    it 'builds dynamic provider components on every read' do
+      count = 0
+      builder = Object.new
+      builder.define_singleton_method(:build) { count += 1 }
+      provider = Object.new
+      provider.define_singleton_method(:dependencies) { [] }
+      provider.define_singleton_method(:setup) { |_d| builder }
+
+      sys = System.new
+      sys.declare('counter', Integer)
+      sys.component('counter', provider)
+      sys.build!
+
+      expect([sys['counter'], sys['counter']]).to eq([1, 2])
+    end
+
+    it 'sets up providers again when merged, with the receiving declaration' do
+      other = System.new
+      other.declare('prefix') { 'p' }
+      other.declare('thing', String)
+      other.component!('thing', prefixer)
+
+      sys = System.new
+      sys.declare('thing', String) { 'default' }
+      sys.merge!(other)
+
+      expect(prefixer.declarations.size).to eq(2)
+      expect(prefixer.declarations.last).to be(sys.declarations['thing'])
+      expect(values_of(sys, 'thing')).to eq(['p-value'])
+    end
+
+    it 'supports reusable, configurable providers' do
+      env_var = Class.new do
+        # name: the ENV variable. Defaults to the component key, ex. 'worker.interval' => WORKER_INTERVAL
+        def initialize(name = nil, env: ENV)
+          @name = name
+          @env = env
+        end
+
+        def dependencies = []
+
+        def setup(declaration)
+          @name ||= declaration.key.upcase.tr('.', '_')
+          self
+        end
+
+        def build = @env.fetch(@name) # coerced by the declared type
+      end
+
+      sys = System.new
+      sys.declare('worker.interval', Plumb::Types::Lax::Integer)
+      sys.declare('db.url', String)
+      sys.component!('worker.interval', env_var.new(env: { 'WORKER_INTERVAL' => '30' }))
+      sys.component!('db.url', env_var.new('DATABASE_URL', env: { 'DATABASE_URL' => 'postgres://db' }))
+
+      expect(values_of(sys, 'worker.interval', 'db.url')).to eq([30, 'postgres://db'])
+    end
+
+    describe 'errors' do
+      let(:sys) { System.new.declare('thing') }
+
+      it 'raises on invalid providers and builders' do
+        expect { sys.component!('thing', Object.new) }.to raise_error(Plumb::ParseError)
+
+        no_build = Object.new
+        no_build.define_singleton_method(:dependencies) { [] }
+        no_build.define_singleton_method(:setup) { |_d| Object.new }
+        expect { sys.component!('thing', no_build) }.to raise_error(Plumb::ParseError)
+        expect(sys.components).to be_empty
+      end
+
+      it 'raises when given a provider and a block' do
+        expect { sys.component!('thing', prefixer) { build { 1 } } }.to raise_error(ArgumentError, /not both/)
+      end
+
+      it 'raises on undeclared keys and locked systems, without setting up the provider' do
+        expect { sys.component!('nope', prefixer) }.to raise_error(System::UndeclaredComponentError)
+        sys.config!('thing') { 1 }
+        sys.prepare!
+        expect { sys.component!('thing', prefixer) }.to raise_error(System::LockedSystemError)
+        expect(prefixer.declarations).to be_empty
+      end
+    end
+
+    def values_of(sys, *keys)
+      sys.build!
+      keys.map { |k| sys[k] }
+    end
+  end
+
   describe '#merge!' do
     def values(sys, *keys)
       sys.build!
@@ -434,7 +622,7 @@ RSpec.describe System do
       expect(sys.declarations.keys).to eq(%w[app output logger])
       expect(sys.components.values.map(&:status)).to all(eq(:open))
       expect(sys.components['logger']).not_to be(other.components['logger'])
-      expect(sys.components['logger']).to have_attributes(deps: ['output'], mode: :singleton, value: nil, pid: nil, hooks: %i[build start])
+      expect(sys.components['logger']).to have_attributes(deps: ['output'], mode: :singleton, value: nil, pid: nil)
       expect(other.components['logger'].status).to eq(:started) # the other system is untouched
 
       sys.start!

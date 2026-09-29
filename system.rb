@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'delegate'
 require 'monitor'
 require 'tsort'
 require 'plumb'
@@ -16,6 +17,10 @@ class System
   CircularDependencyError = Class.new(SystemError)
   NotBuiltError = Class.new(SystemError)
   CallableInterface = Plumb::Types::Interface[:call]
+  # Component providers: .dependencies -> Array<String>, .setup(declaration) -> builder
+  ProviderInterface = Plumb::Types::Interface[:dependencies, :setup]
+  # Component builders must implement #build(*deps). #prepare, #start(value, context) and #teardown(value) are optional
+  BuilderInterface = Plumb::Types::Interface[:build]
 
   # Lifecycle statuses, in order. Shared by the system and its components.
   STATUSES = %i[open prepared built started toredown].freeze
@@ -217,100 +222,115 @@ class System
     teardown: [Events::ComponentTearingDown, Events::ComponentToredown]
   }.freeze
 
-  class Component
-    attr_reader :key, :deps, :mode, :status, :value, :pid, :thread_id, :fiber_id
+  # The built-in provider behind the component DSL, #config and declaration defaults:
+  #   sys.component!('db', ['db.url']) do
+  #     prepare { require 'db' }
+  #     build { |url| DB.new(url) }
+  #     start { |db, context| db.connect }
+  #     teardown { |db| db.disconnect }
+  #   end
+  class BlockProvider
+    HOOKS = %i[prepare build start teardown].freeze
 
-    # Hooks are called with:
-    #   prepare: no arguments
-    #   build:   the resolved values of #deps, in order. The last build hook's return value is the component's value
-    #   start:   the built value, and the context passed to System#start!
-    #   teardown: the built value
-    # Dynamic components don't memoize a value, so their start and teardown hooks get nil.
+    # Records hooks from a component block
+    class DSL
+      attr_reader :hooks
+
+      def initialize
+        @hooks = HOOKS.to_h { |name| [name, []] }
+      end
+
+      HOOKS.each do |name|
+        define_method(name) do |callable = nil, &block|
+          @hooks[name] << CallableInterface.parse(callable || block)
+          self
+        end
+      end
+    end
+
+    attr_reader :dependencies
+
+    def initialize(dependencies = [], &block)
+      @dependencies = dependencies
+      dsl = DSL.new
+      if block
+        block.arity > 0 ? block.call(dsl) : dsl.instance_eval(&block)
+      end
+      @hooks = dsl.hooks.transform_values(&:freeze).freeze
+    end
+
+    # Hooks are stateless, so every system can get its own builder cheaply
+    def setup(_declaration) = BlockBuilder.new(@hooks)
+  end
+
+  # Runs the hooks recorded by a BlockProvider. Stages without hooks are no-ops.
+  class BlockBuilder
+    def initialize(hooks) = @hooks = hooks
+
+    def prepare = @hooks[:prepare].each(&:call)
+
+    # Run build blocks and return the last result (nil if there are none)
+    def build(*deps) = @hooks[:build].reduce(nil) { |_, b| b.call(*deps) }
+
+    def start(value, context) = @hooks[:start].each { |b| b.call(value, context) }
+    def teardown(value) = @hooks[:teardown].each { |b| b.call(value) }
+  end
+
+  # Decorates a builder with no-op versions of the optional hooks it doesn't implement,
+  # so components can call every lifecycle method unconditionally.
+  # The no-ops are singleton methods, so they never shadow the builder's own hooks, which are delegated.
+  class CompleteBuilder < SimpleDelegator
+    def self.wrap(builder) = new(BuilderInterface.parse(builder))
+
+    def initialize(builder)
+      super
+      define_singleton_method(:prepare) {} unless builder.respond_to?(:prepare)
+      define_singleton_method(:start) { |_value, _context| } unless builder.respond_to?(:start)
+      define_singleton_method(:teardown) { |_value| } unless builder.respond_to?(:teardown)
+    end
+  end
+
+  class Component
+    attr_reader :key, :deps, :mode, :provider, :builder, :status, :value, :pid, :thread_id, :fiber_id
+
+    # A component's lifecycle calls its builder (see CompleteBuilder):
+    #   prepare:  builder.prepare
+    #   build:    builder.build(*dep_values). The result is the component's value
+    #   start:    builder.start(value, context), with the context passed to System#start!
+    #   teardown: builder.teardown(value)
+    # Dynamic components don't memoize a value, so their start and teardown get nil.
     # default: whether this component was registered from its declaration's default
-    def initialize(key, deps, mode: :singleton, default: false, &block)
+    def initialize(key, deps:, mode:, provider:, builder:, default: false)
       @key = key
       @deps = deps
       @mode = mode
+      @provider = provider
+      @builder = builder
       @default = default
       @status = :open
       @value = nil
       @pid = nil
       @thread_id = nil
       @fiber_id = nil
-      @prepare_blocks = []
-      @build_blocks = []
-      @start_blocks = []
-      @teardown_blocks = []
-
-      if block_given?
-        if block.arity > 0
-          block.call(self)
-        else
-          self.instance_eval(&block)
-        end
-        # Freeze hook registration, but not lifecycle state
-        [@prepare_blocks, @build_blocks, @start_blocks, @teardown_blocks].each(&:freeze)
-      end
     end
 
     def default? = @default
 
-    # An open copy of this component, with the same hooks but none of its lifecycle state
-    def copy
-      Component.new(key, deps, mode:, default: default?) do |c|
-        # self here is the original component
-        @prepare_blocks.each { |b| c.prepare(b) }
-        @build_blocks.each { |b| c.build(b) }
-        @start_blocks.each { |b| c.start(b) }
-        @teardown_blocks.each { |b| c.teardown(b) }
-      end
-    end
-
     def singleton? = mode == :singleton
     def dynamic? = mode == :dynamic
 
-    # Names of the lifecycle hooks this component defines
-    def hooks
-      {
-        prepare: @prepare_blocks,
-        build: @build_blocks,
-        start: @start_blocks,
-        teardown: @teardown_blocks
-      }.reject { |_, blocks| blocks.empty? }.keys
-    end
-
-    # ex. (singleton, built) deps=[logger.output] hooks=[prepare, build]
+    # ex. (singleton, built) deps=[logger.output]
     def details
       parts = ["(#{mode}, #{status})"]
       parts << "deps=[#{deps.join(', ')}]" if deps.any?
-      parts << "hooks=[#{hooks.join(', ')}]" if hooks.any?
+      parts << "provider=#{provider.inspect}" unless provider.is_a?(BlockProvider)
       parts.join(' ')
     end
 
     def inspect = "#<#{self.class} #{key} #{details}>"
 
-    def prepare(callable = nil, &block)
-      @prepare_blocks << CallableInterface.parse(callable || block)
-      self
-    end
-
-    def build(callable = nil, &block)
-      @build_blocks << CallableInterface.parse(callable || block)
-      self
-    end
-
-    def start(callable = nil, &block)
-      @start_blocks << CallableInterface.parse(callable || block)
-      self
-    end
-
-    def teardown(callable = nil, &block)
-      @teardown_blocks << CallableInterface.parse(callable || block)
-      self
-    end
-
     def prepare!
-      transition(:prepared) { @prepare_blocks.each(&:call) }
+      transition(:prepared) { builder.prepare }
     end
 
     # Singletons memoize their value, parsed through the declared type.
@@ -322,17 +342,14 @@ class System
     end
 
     def start!(context)
-      transition(:started) { @start_blocks.each { |b| b.call(value, context) } }
+      transition(:started) { builder.start(value, context) }
     end
 
     def teardown!
-      transition(:toredown) { @teardown_blocks.each { |b| b.call(value) } }
+      transition(:toredown) { builder.teardown(value) }
     end
 
-    # Run build hooks and return the last result (nil if there are no build hooks)
-    def call(dep_values)
-      @build_blocks.reduce(nil) { |_, b| b.call(*dep_values) }
-    end
+    def call(dep_values) = builder.build(*dep_values)
 
     # Record the process, thread and fiber this component is being started in.
     # Components can be started in a forked process, another thread or fiber, or all of the above.
@@ -440,34 +457,24 @@ class System
   # A singleton config that is built and memoized on System.build!
   # A 'config' is just a component with a custom build hook, and all other hooks as no-ops
   def config!(key, deps = [], &block)
-    add_component(key, deps) do |key, deps|
-      Component.new(key, deps, mode: :singleton) do |c|
-        c.build(&block)
-      end
-    end
+    register(key, BlockProvider.new(deps) { |c| c.build(&block) }, mode: :singleton)
   end
 
   # A config that is built on each call
   def config(key, deps = [], &block)
-    add_component(key, deps) do |key, deps|
-      Component.new(key, deps, mode: :dynamic) do |c|
-        c.build(&block)
-      end
-    end
+    register(key, BlockProvider.new(deps) { |c| c.build(&block) }, mode: :dynamic)
   end
 
-  # A full singleton component with lifecycle hooks
-  def component!(key, deps = [], &block)
-    add_component(key, deps) do |key, deps|
-      Component.new(key, deps, mode: :singleton, &block)
-    end
+  # A singleton component, from dependencies and a block of lifecycle hooks, or a component provider
+  #   sys.component!('db', ['db.url']) { build { |url| DB.new(url) } }
+  #   sys.component!('users.settings', EnvSettingsProvider)
+  def component!(key, deps_or_provider = [], &block)
+    register(key, provider_for(deps_or_provider, &block), mode: :singleton)
   end
 
-  # A full dynamic component with lifecycle hooks
-  def component(key, deps = [], &block)
-    add_component(key, deps) do |key, deps|
-      Component.new(key, deps, mode: :dynamic, &block)
-    end
+  # A dynamic component (built on each read), from dependencies and a block, or a component provider
+  def component(key, deps_or_provider = [], &block)
+    register(key, provider_for(deps_or_provider, &block), mode: :dynamic)
   end
 
   def locked? = status != :open
@@ -503,7 +510,7 @@ class System
         theirs = their_components[key]
         ours = @components[key]
         if theirs && !theirs.default?
-          add_component(key, theirs.deps) { theirs.copy }
+          register(key, theirs.provider, mode: theirs.mode) # set up again, with this system's declaration
         elsif (ours.nil? || ours.default?) && declaration.default? && !declaration.default.equal?(previous&.default)
           register_default(declaration)
         end
@@ -535,8 +542,8 @@ class System
   end
 
   # #<System status=built components=2/3
-  #   logger.output : Any (singleton, built) hooks=[build]
-  #   logger : Interface[info, debug] (singleton, built) deps=[logger.output] hooks=[prepare, build]
+  #   logger.output : Any (singleton, built)
+  #   logger : Interface[info, debug] (singleton, built) deps=[logger.output]
   #   db : (Nil | Interface[append]) (not registered)
   # >
   # Declarations are listed in dependency order once the system is prepared.
@@ -569,7 +576,7 @@ class System
   #         status: :built,            # nil if not registered
   #         deps: ['logger.output'],   # components this one depends on
   #         dependents: ['app'],       # components that depend on this one
-  #         hooks: [:prepare, :build]
+  #         provider: <component provider>
   #       },
   #       ...
   #     ]
@@ -598,7 +605,7 @@ class System
         status: component&.status,
         deps: component ? component.deps : [],
         dependents: dependents[key],
-        hooks: component ? component.hooks : [],
+        provider: component&.provider,
         pid: component&.pid,
         thread_id: component&.thread_id,
         fiber_id: component&.fiber_id
@@ -827,25 +834,34 @@ class System
 
   # Register a declaration's default as a singleton config
   private def register_default(declaration)
-    add_component(declaration.key, []) do |key, deps|
-      Component.new(key, deps, mode: :singleton, default: true) do |c|
-        c.build(&declaration.default)
-      end
-    end
+    register(declaration.key, BlockProvider.new { |c| c.build(&declaration.default) }, mode: :singleton, default: true)
   end
 
+  private def provider_for(deps_or_provider, &block)
+    return BlockProvider.new(deps_or_provider, &block) if deps_or_provider.is_a?(Array)
+    raise ArgumentError, 'pass either a component provider or a block, not both' if block
+
+    deps_or_provider
+  end
+
+  # Register a component from a provider. Its #setup is called now, with the key's declaration,
+  # and the builder it returns is completed with no-ops for missing hooks.
   # Registering a key that already has a component overrides it (ex. an extension replacing an app default).
   # The declaration is left untouched, so the new component must still satisfy the declared type.
-  private def add_component(key, deps, &)
+  private def register(key, provider, mode:, default: false)
     @lock.synchronize do
       raise LockedSystemError, "can't add components to a locked system" if locked?
 
       key = build_key(key)
       raise UndeclaredComponentError, "#{key} component is not declared in this system" unless declared?(key)
 
+      provider = ProviderInterface.parse(provider)
+      deps = provider.dependencies.map { |d| build_key(d) }
+      builder = CompleteBuilder.wrap(provider.setup(@declarations[key]))
+
       override = @components.key?(key)
-      component = @components[key] = yield(key, deps.map { |d| build_key(d) })
-      emit(Events::ComponentRegistered, key:, mode: component.mode, deps: component.deps, override:)
+      @components[key] = Component.new(key, deps:, mode:, provider:, builder:, default:)
+      emit(Events::ComponentRegistered, key:, mode:, deps:, override:)
       self
     end
   end
