@@ -648,8 +648,10 @@ RSpec.describe System do
     end
 
     it 'fails the build on missing or invalid variables' do
-      with_env('NAME' => 'Ismael', 'DOB' => nil) do
-        expect { env_system(user).build! }.to raise_error(Plumb::ParseError, /dob/)
+      with_env('NAME' => nil, 'DOB' => nil) do
+        expect { env_system(user).build! }.to raise_error(
+          System::ENVProvider::Error, "invalid ENV for users.info:\n  NAME is missing\n  DOB is missing"
+        )
       end
 
       with_env('NAME' => 'Ismael', 'DOB' => 'not-a-date') do
@@ -657,9 +659,19 @@ RSpec.describe System do
         failures = []
         sys.notifier.subscribe('components.failed') { |e| failures << [e.key, e.stage] }
 
-        expect { sys.build! }.to raise_error(Plumb::ParseError, /dob/)
+        expect { sys.build! }.to raise_error(Plumb::ParseError) { |e|
+          expect(e).to be_a(System::ENVProvider::Error)
+          expect(e.message).to eq("invalid ENV for users.info:\n  DOB is invalid: Must match /\\A\\d{4}-\\d{2}-\\d{2}\\z/")
+          expect(e.message).not_to include('not-a-date') # values are left out
+        }
         expect(failures).to eq([['users.info', :build]])
       end
+    end
+
+    it 'explains that declared types must be structs or hashes' do
+      expect { env_system(String).build! }.to raise_error(
+        System::ENVProvider::Error, /invalid ENV for users.info: ENVProvider maps ENV into struct or hash types/
+      )
     end
 
     it 'supports optional attributes and defaults for missing variables' do
@@ -700,7 +712,9 @@ RSpec.describe System do
 
       it "doesn't fall back to unprefixed variables" do
         with_env('NAME' => 'root', 'DOB' => '1900-01-01', 'USERS_NAME' => 'Ismael', 'USERS_DOB' => nil) do
-          expect { prefixed_system(user, 'USERS_').build! }.to raise_error(Plumb::ParseError, /dob/)
+          expect { prefixed_system(user, 'USERS_').build! }.to raise_error(
+            System::ENVProvider::Error, "invalid ENV for users.info:\n  USERS_DOB is missing"
+          )
         end
       end
 

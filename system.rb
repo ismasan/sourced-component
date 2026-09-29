@@ -285,6 +285,10 @@ class System
   class ENVProvider
     T = Plumb::Types
 
+    # Raised when ENV variables are missing or invalid, naming each variable.
+    # A Plumb::ParseError, like any other type mismatch.
+    Error = Class.new(Plumb::ParseError)
+
     DEPS = [].freeze
     Downcase = T::String.transform(::String, &:downcase)
     ENVHash = T::Hash[Downcase, T::String] >> T::SymbolizedHash
@@ -303,20 +307,47 @@ class System
     def dependencies = DEPS
 
     def setup(declaration)
-      Builder.new(ENVHash / (Plumb::Codec::Forms >> declaration.type), prefix)
+      Builder.new(declaration.key, ENVHash / (Plumb::Codec::Forms >> declaration.type), prefix)
     end
 
     def inspect = prefix ? "#<#{self.class} prefix=#{prefix.inspect}>" : "#<#{self.class}>"
 
     # The ComponentBuilder interface. Reads ENV on each build.
     class Builder
-      def initialize(decoder, prefix)
+      def initialize(key, decoder, prefix)
+        @key = key
         @decoder = decoder
         @prefix = prefix
       end
 
       def build(*_)
-        @decoder.parse(env)
+        vars = env
+        result = @decoder.resolve(vars)
+        raise Error, error_message(result.errors, vars) unless result.valid?
+
+        result.value
+      end
+
+      # ex.
+      #   invalid ENV for payments.settings:
+      #     PAYMENTS_API_KEY is missing
+      #     PAYMENTS_PORT is invalid: Must match /\A-?\d+\z/
+      # Values are left out, as ENV often holds secrets.
+      private def error_message(errors, vars)
+        # ex. the declared type isn't a struct or hash
+        unless errors.is_a?(::Hash)
+          return "invalid ENV for #{@key}: ENVProvider maps ENV into struct or hash types (#{errors})"
+        end
+
+        lines = errors.map do |attribute, error|
+          name = "#{@prefix}#{attribute.to_s.upcase}"
+          if vars.keys.any? { |var| var.casecmp?(attribute.to_s) }
+            "  #{name} is invalid: #{error.is_a?(::String) ? error : error.inspect}"
+          else
+            "  #{name} is missing"
+          end
+        end
+        ["invalid ENV for #{@key}:", *lines].join("\n")
       end
 
       # ENV, with only prefixed variables (and the prefix removed) when there's a prefix
