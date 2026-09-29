@@ -276,6 +276,60 @@ class System
     def teardown(value) = @hooks[:teardown].each { |b| b.call(value) }
   end
 
+  # Take data from ENV and map it / coerce it into the declared type
+  # for a component
+  #   sys.component!('users.info', System::ENVProvider)                        # reads NAME, DOB...
+  #   sys.component!('users.info', System::ENVProvider.new(prefix: 'USERS_'))  # reads USERS_NAME, USERS_DOB...
+  # A prefix is matched case-insensitively and removed before mapping to attributes.
+  # Variables without the prefix are ignored.
+  class ENVProvider
+    T = Plumb::Types
+
+    DEPS = [].freeze
+    Downcase = T::String.transform(::String, &:downcase)
+    ENVHash = T::Hash[Downcase, T::String] >> T::SymbolizedHash
+
+    # The ComponentProvider interface, with no prefix
+    def self.dependencies = DEPS
+    def self.setup(declaration) = new.setup(declaration)
+
+    attr_reader :prefix
+
+    def initialize(prefix: nil)
+      @prefix = prefix&.to_s&.upcase&.freeze
+    end
+
+    # The ComponentProvider interface
+    def dependencies = DEPS
+
+    def setup(declaration)
+      Builder.new(ENVHash / (Plumb::Codec::Forms >> declaration.type), prefix)
+    end
+
+    def inspect = prefix ? "#<#{self.class} prefix=#{prefix.inspect}>" : "#<#{self.class}>"
+
+    # The ComponentBuilder interface. Reads ENV on each build.
+    class Builder
+      def initialize(decoder, prefix)
+        @decoder = decoder
+        @prefix = prefix
+      end
+
+      def build(*_)
+        @decoder.parse(env)
+      end
+
+      # ENV, with only prefixed variables (and the prefix removed) when there's a prefix
+      private def env
+        return ENV.to_h unless @prefix
+
+        ENV.each_with_object({}) do |(name, value), vars|
+          vars[name[@prefix.size..]] = value if name.upcase.start_with?(@prefix)
+        end
+      end
+    end
+  end
+
   # Decorates a builder with no-op versions of the optional hooks it doesn't implement,
   # so components can call every lifecycle method unconditionally.
   # The no-ops are singleton methods, so they never shadow the builder's own hooks, which are delegated.

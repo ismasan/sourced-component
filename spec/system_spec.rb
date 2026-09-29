@@ -597,6 +597,125 @@ RSpec.describe System do
     end
   end
 
+  describe System::ENVProvider do
+    let(:user) { Plumb::Types::Data[name: String, dob: Date] }
+
+    # Set ENV variables for the block, restoring previous values afterwards
+    def with_env(vars)
+      previous = vars.keys.to_h { |k| [k, ENV[k]] }
+      vars.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
+      yield
+    ensure
+      previous.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
+    end
+
+    def env_system(type)
+      System.new.tap do |sys|
+        sys.declare('users.info', type)
+        sys.component!('users.info', System::ENVProvider)
+      end
+    end
+
+    before(:all) { require 'date' }
+
+    it 'maps ENV variables into the declared struct, coercing values' do
+      with_env('NAME' => 'Ismael', 'DOB' => '1977-11-29', 'FOO' => 'bar') do
+        sys = env_system(user)
+        sys.start!
+
+        expect(sys['users.info']).to be_a(user)
+        expect(sys['users.info']).to have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
+        expect(sys['users.info']).to be_valid
+      end
+    end
+
+    it 'maps into hash schemas' do
+      with_env('NAME' => 'Ismael', 'DOB' => '1977-11-29') do
+        sys = env_system(Plumb::Types::Hash[name: String, dob: Date])
+        sys.build!
+
+        expect(sys['users.info']).to eq(name: 'Ismael', dob: Date.new(1977, 11, 29))
+      end
+    end
+
+    it 'reads ENV when the component is built, not when it is registered' do
+      sys = env_system(user)
+
+      with_env('NAME' => 'Joe', 'DOB' => '2000-01-01') do
+        sys.build!
+        expect(sys['users.info'].name).to eq('Joe')
+      end
+    end
+
+    it 'fails the build on missing or invalid variables' do
+      with_env('NAME' => 'Ismael', 'DOB' => nil) do
+        expect { env_system(user).build! }.to raise_error(Plumb::ParseError, /dob/)
+      end
+
+      with_env('NAME' => 'Ismael', 'DOB' => 'not-a-date') do
+        sys = env_system(user)
+        failures = []
+        sys.notifier.subscribe('components.failed') { |e| failures << [e.key, e.stage] }
+
+        expect { sys.build! }.to raise_error(Plumb::ParseError, /dob/)
+        expect(failures).to eq([['users.info', :build]])
+      end
+    end
+
+    it 'supports optional attributes and defaults for missing variables' do
+      with_env('NAME' => 'Ismael', 'DOB' => nil) do
+        optional = env_system(Plumb::Types::Data[name: String, dob?: Date]).build!
+        defaulted = env_system(Plumb::Types::Data[name: String, dob: Plumb::Types::Date.default(Date.new(2000, 1, 1).freeze)]).build!
+
+        expect(optional['users.info']).to have_attributes(name: 'Ismael', dob: nil)
+        expect(defaulted['users.info'].dob).to eq(Date.new(2000, 1, 1))
+      end
+    end
+
+    describe 'with a prefix' do
+      def prefixed_system(type, prefix)
+        System.new.tap do |sys|
+          sys.declare('users.info', type)
+          sys.component!('users.info', System::ENVProvider.new(prefix:))
+        end
+      end
+
+      it 'only reads variables with the prefix, which is removed' do
+        with_env('NAME' => 'root', 'DOB' => '1900-01-01', 'USERS_NAME' => 'Ismael', 'USERS_DOB' => '1977-11-29') do
+          sys = prefixed_system(user, 'USERS_')
+          sys.build!
+
+          expect(sys['users.info']).to have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
+        end
+      end
+
+      it 'matches the prefix case-insensitively' do
+        with_env('users_name' => 'Ismael', 'Users_Dob' => '1977-11-29') do
+          sys = prefixed_system(user, 'users_')
+          sys.build!
+
+          expect(sys['users.info']).to have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
+        end
+      end
+
+      it "doesn't fall back to unprefixed variables" do
+        with_env('NAME' => 'root', 'DOB' => '1900-01-01', 'USERS_NAME' => 'Ismael', 'USERS_DOB' => nil) do
+          expect { prefixed_system(user, 'USERS_').build! }.to raise_error(Plumb::ParseError, /dob/)
+        end
+      end
+
+      it 'is shown when inspecting' do
+        expect(System::ENVProvider.new(prefix: 'users_').inspect).to eq('#<System::ENVProvider prefix="USERS_">')
+        expect(System::ENVProvider.new.inspect).to eq('#<System::ENVProvider>')
+      end
+    end
+
+    it 'implements the provider interface, with no dependencies' do
+      expect(System::ENVProvider.dependencies).to eq([])
+      expect(System::ENVProvider.setup(System::Declaration.new('users.info', user, nil))).to respond_to(:build)
+    end
+  end
+
   describe '#merge!' do
     def values(sys, *keys)
       sys.build!
