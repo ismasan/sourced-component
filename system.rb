@@ -276,12 +276,13 @@ class System
     def teardown(value) = @hooks[:teardown].each { |b| b.call(value) }
   end
 
-  # Take data from ENV and map it / coerce it into the declared type
-  # for a component
-  #   sys.component!('users.info', System::ENVProvider)                        # reads NAME, DOB...
-  #   sys.component!('users.info', System::ENVProvider.new(prefix: 'USERS_'))  # reads USERS_NAME, USERS_DOB...
-  # A prefix is matched case-insensitively and removed before mapping to attributes.
-  # Variables without the prefix are ignored.
+  # Builds a component from ENV, decoding values into the declared type with Plumb::Codec::Forms,
+  # the codec for string input (ex. '30' => 30, '1977-11-29' => Date).
+  #   ENVProvider.new('USER_EMAIL')         # a single variable
+  #   ENVProvider.new(/^USER_/)             # matching variables into a hash, with the match removed: USER_NAME => NAME
+  #   ENVProvider.new(/^USER_/, :downcase)  # ... and modified: USER_NAME => name
+  #   ENVProvider                           # all variables into a hash, same as ENVProvider.new(ENVProvider::ALL)
+  # See System#env
   class ENVProvider
     T = Plumb::Types
 
@@ -290,73 +291,151 @@ class System
     Error = Class.new(Plumb::ParseError)
 
     DEPS = [].freeze
-    Downcase = T::String.transform(::String, &:downcase)
-    ENVHash = T::Hash[Downcase, T::String] >> T::SymbolizedHash
 
-    # The ComponentProvider interface, with no prefix
+    # Matches every variable, without removing anything from their names
+    ALL = /\A/
+
+    # Applied to collected variable names, in order, after the match is removed
+    MODIFIERS = { downcase: :downcase.to_proc }.freeze
+
+    # The ComponentProvider interface, collecting all variables
     def self.dependencies = DEPS
     def self.setup(declaration) = new.setup(declaration)
 
-    attr_reader :prefix
+    def self.error_text(error) = error.is_a?(::String) ? error : error.inspect
 
-    def initialize(prefix: nil)
-      @prefix = prefix&.to_s&.upcase&.freeze
+    # Whether a type accepts a hash, from what it consumes: Any, Hash types and Data structs,
+    # or a union or wrapper (ex. nullable, default) with a branch that does.
+    def self.takes_hash?(type)
+      type = type.input_type if type.respond_to?(:input_type)
+      return true if type.is_a?(Plumb::AnyClass) || type.subtype_of?(T::Hash)
+
+      case type
+      when Plumb::Disjunction, Plumb::Policy then type.children.any? { |child| takes_hash?(child) }
+      when Plumb::And then takes_hash?(type.children.first)
+      else false
+      end
+    end
+
+    attr_reader :source, :modifiers
+
+    # source: a variable name, or a regex to collect variables with
+    # modifiers: ex. :downcase. Only when collecting with a regex
+    def initialize(source = ALL, *modifiers)
+      case source
+      when ::String
+        if modifiers.any?
+          raise ArgumentError, "ENV modifiers (#{modifiers.join(', ')}) can only be used when collecting variables with a regex"
+        end
+      when ::Regexp
+        unknown = modifiers - MODIFIERS.keys
+        if unknown.any?
+          raise ArgumentError, "unknown ENV modifiers: #{unknown.join(', ')}. Supported: #{MODIFIERS.keys.join(', ')}"
+        end
+      else
+        raise ArgumentError, "an ENV source must be a variable name or a regex, got #{source.inspect}"
+      end
+
+      @source = source.dup.freeze
+      @modifiers = modifiers.uniq.freeze
     end
 
     # The ComponentProvider interface
     def dependencies = DEPS
 
-    def setup(declaration)
-      Builder.new(declaration.key, ENVHash / (Plumb::Codec::Forms >> declaration.type), prefix)
+    # Regex sources collect variables into a hash, so the declared type must take one
+    def check!(declaration)
+      return self if source.is_a?(::String) || ENVProvider.takes_hash?(declaration.type)
+
+      raise ArgumentError, "#{declaration.key}: ENV variables matching #{source.inspect} are collected into a hash, " \
+                           "but #{declaration.type.inspect} doesn't take one. Declare a Hash or Data struct type, " \
+                           "or map a single variable, ex. env('VAR_NAME' => '#{declaration.key}')"
     end
 
-    def inspect = prefix ? "#<#{self.class} prefix=#{prefix.inspect}>" : "#<#{self.class}>"
+    def setup(declaration)
+      check!(declaration)
+      # Any (no declared type) takes raw strings. Codec::Forms can't decode into it
+      type = declaration.type
+      decoder = type.is_a?(Plumb::AnyClass) ? type : Plumb::Codec::Forms >> type
+      if source.is_a?(::String)
+        VariableBuilder.new(declaration.key, source, decoder)
+      else
+        # Collected names are strings. Codec::Forms decodes them into the type's keys (ex. 'name' => :name)
+        CollectionBuilder.new(declaration.key, source, modifiers, decoder)
+      end
+    end
 
-    # The ComponentBuilder interface. Reads ENV on each build.
-    class Builder
-      def initialize(key, decoder, prefix)
+    def inspect = "#<#{self.class} #{[source.inspect, *modifiers].join(' ')}>"
+
+    # Builds from a single variable. Reads ENV on each build.
+    class VariableBuilder
+      def initialize(key, name, decoder)
         @key = key
+        @name = name
         @decoder = decoder
-        @prefix = prefix
+      end
+
+      # ex. invalid ENV for user.email: USER_EMAIL is invalid: Must match /.../
+      # Values are left out, as ENV often holds secrets.
+      def build(*_)
+        result = @decoder.resolve(ENV[@name])
+        return result.value if result.valid?
+
+        detail = ENV.key?(@name) ? "is invalid: #{ENVProvider.error_text(result.errors)}" : 'is missing'
+        raise Error, "invalid ENV for #{@key}: #{@name} #{detail}"
+      end
+    end
+
+    # Builds from the variables matching a regex, collected into a hash. Reads ENV on each build.
+    class CollectionBuilder
+      def initialize(key, regex, modifiers, decoder)
+        @key = key
+        @regex = regex
+        @modifiers = modifiers.map { |name| MODIFIERS.fetch(name) }
+        @decoder = decoder
       end
 
       def build(*_)
-        vars = env
+        vars, names = collect
         result = @decoder.resolve(vars)
-        raise Error, error_message(result.errors, vars) unless result.valid?
+        raise Error, error_message(result.errors, vars, names) unless result.valid?
 
         result.value
       end
 
-      # ex.
-      #   invalid ENV for payments.settings:
-      #     PAYMENTS_API_KEY is missing
-      #     PAYMENTS_PORT is invalid: Must match /\A-?\d+\z/
-      # Values are left out, as ENV often holds secrets.
-      private def error_message(errors, vars)
-        # ex. the declared type isn't a struct or hash
-        unless errors.is_a?(::Hash)
-          return "invalid ENV for #{@key}: ENVProvider maps ENV into struct or hash types (#{errors})"
+      # Matching variables, as { collected name => value }, and { collected name => ENV name }.
+      # The match is removed from names, then modifiers are applied. Names left empty are skipped.
+      private def collect
+        ENV.each_with_object([{}, {}]) do |(name, value), (vars, names)|
+          next unless @regex.match?(name)
+
+          collected = @modifiers.reduce(name.sub(@regex, '')) { |n, modifier| modifier.call(n) }
+          next if collected.empty?
+
+          vars[collected] = value
+          names[collected] = name
         end
+      end
+
+      # ex.
+      #   invalid ENV for user.info:
+      #     USER_DOB is invalid: Must match /\A\d{4}-\d{2}-\d{2}\z/
+      #     email is missing from ENV variables matching /^USER_/
+      # Values are left out, as ENV often holds secrets.
+      private def error_message(errors, vars, names)
+        return "invalid ENV for #{@key}: #{ENVProvider.error_text(errors)}" unless errors.is_a?(::Hash)
 
         lines = errors.map do |attribute, error|
-          name = "#{@prefix}#{attribute.to_s.upcase}"
-          if vars.keys.any? { |var| var.casecmp?(attribute.to_s) }
-            "  #{name} is invalid: #{error.is_a?(::String) ? error : error.inspect}"
+          attribute = attribute.to_s
+          if names.key?(attribute)
+            "  #{names[attribute]} is invalid: #{ENVProvider.error_text(error)}"
           else
-            "  #{name} is missing"
+            line = "  #{attribute} is missing from ENV variables matching #{@regex.inspect}"
+            near = vars.keys.find { |collected| collected.casecmp?(attribute) }
+            near ? "#{line} (found #{names[near]}, try :downcase)" : line
           end
         end
         ["invalid ENV for #{@key}:", *lines].join("\n")
-      end
-
-      # ENV, with only prefixed variables (and the prefix removed) when there's a prefix
-      private def env
-        return ENV.to_h unless @prefix
-
-        ENV.each_with_object({}) do |(name, value), vars|
-          vars[name[@prefix.size..]] = value if name.upcase.start_with?(@prefix)
-        end
       end
     end
   end
@@ -555,6 +634,34 @@ class System
   #   sys.component!('users.settings', EnvSettingsProvider)
   def component!(key, deps_or_provider = [], &block)
     register(key, provider_for(deps_or_provider, &block), mode: :singleton)
+  end
+
+  # Register singleton components built from ENV variables (see System::ENVProvider),
+  # decoding values into each declared type with Plumb::Codec::Forms.
+  #   sys.env('USER_EMAIL' => 'user.email')        # a single variable
+  #   sys.env(/^USER_/ => 'user.info')             # matching variables into a hash, match removed: USER_NAME => NAME
+  #   sys.env(:downcase, /^USER_/ => 'user.info')  # ... with modifiers: USER_NAME => name
+  #   sys.env('user.info')                         # all variables into a hash
+  #   sys.env(:downcase, 'user.info')              # all variables, with modifiers
+  # A hash can map several sources at once. Modifiers are only allowed when collecting variables with a regex.
+  def env(*args)
+    mapping = args.last.is_a?(::Hash) ? args.pop : { ENVProvider::ALL => args.pop }
+    if mapping.empty? || mapping.value?(nil)
+      raise ArgumentError, 'env needs a component key, or a hash of ENV variables (or regexes) => component keys'
+    end
+
+    @lock.synchronize do
+      # Build and check every provider first, so invalid sources, modifiers, keys or types
+      # raise before anything is registered
+      providers = mapping.map { |source, key| [build_key(key), ENVProvider.new(source, *args)] }
+      providers.each do |key, provider|
+        raise UndeclaredComponentError, "#{key} component is not declared in this system" unless declared?(key)
+
+        provider.check!(@declarations[key])
+      end
+      providers.each { |key, provider| component!(key, provider) }
+      self
+    end
   end
 
   # A dynamic component (built on each read), from dependencies and a block, or a component provider

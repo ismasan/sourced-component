@@ -597,7 +597,7 @@ RSpec.describe System do
     end
   end
 
-  describe System::ENVProvider do
+  describe 'ENV components' do
     let(:user) { Plumb::Types::Data[name: String, dob: Date] }
 
     # Set ENV variables for the block, restoring previous values afterwards
@@ -609,124 +609,233 @@ RSpec.describe System do
       previous.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
     end
 
-    def env_system(type)
-      System.new.tap do |sys|
-        sys.declare('users.info', type)
-        sys.component!('users.info', System::ENVProvider)
-      end
-    end
-
     before(:all) { require 'date' }
 
-    it 'maps ENV variables into the declared struct, coercing values' do
-      with_env('NAME' => 'Ismael', 'DOB' => '1977-11-29', 'FOO' => 'bar') do
-        sys = env_system(user)
-        sys.start!
-
-        expect(sys['users.info']).to be_a(user)
-        expect(sys['users.info']).to have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
-        expect(sys['users.info']).to be_valid
-      end
+    def build(sys)
+      sys.build!
+      sys
     end
 
-    it 'maps into hash schemas' do
-      with_env('NAME' => 'Ismael', 'DOB' => '1977-11-29') do
-        sys = env_system(Plumb::Types::Hash[name: String, dob: Date])
-        sys.build!
+    describe 'single variables' do
+      it 'decodes a variable into the declared type' do
+        with_env('USER_EMAIL' => 'me@example.com', 'APP_PORT' => '3000') do
+          sys = System.new.declare('user.email', Plumb::Types::Email).declare('app.port', Integer)
+          expect(sys.env('USER_EMAIL' => 'user.email', 'APP_PORT' => 'app.port')).to be(sys)
 
-        expect(sys['users.info']).to eq(name: 'Ismael', dob: Date.new(1977, 11, 29))
-      end
-    end
-
-    it 'reads ENV when the component is built, not when it is registered' do
-      sys = env_system(user)
-
-      with_env('NAME' => 'Joe', 'DOB' => '2000-01-01') do
-        sys.build!
-        expect(sys['users.info'].name).to eq('Joe')
-      end
-    end
-
-    it 'fails the build on missing or invalid variables' do
-      with_env('NAME' => nil, 'DOB' => nil) do
-        expect { env_system(user).build! }.to raise_error(
-          System::ENVProvider::Error, "invalid ENV for users.info:\n  NAME is missing\n  DOB is missing"
-        )
-      end
-
-      with_env('NAME' => 'Ismael', 'DOB' => 'not-a-date') do
-        sys = env_system(user)
-        failures = []
-        sys.notifier.subscribe('components.failed') { |e| failures << [e.key, e.stage] }
-
-        expect { sys.build! }.to raise_error(Plumb::ParseError) { |e|
-          expect(e).to be_a(System::ENVProvider::Error)
-          expect(e.message).to eq("invalid ENV for users.info:\n  DOB is invalid: Must match /\\A\\d{4}-\\d{2}-\\d{2}\\z/")
-          expect(e.message).not_to include('not-a-date') # values are left out
-        }
-        expect(failures).to eq([['users.info', :build]])
-      end
-    end
-
-    it 'explains that declared types must be structs or hashes' do
-      expect { env_system(String).build! }.to raise_error(
-        System::ENVProvider::Error, /invalid ENV for users.info: ENVProvider maps ENV into struct or hash types/
-      )
-    end
-
-    it 'supports optional attributes and defaults for missing variables' do
-      with_env('NAME' => 'Ismael', 'DOB' => nil) do
-        optional = env_system(Plumb::Types::Data[name: String, dob?: Date]).build!
-        defaulted = env_system(Plumb::Types::Data[name: String, dob: Plumb::Types::Date.default(Date.new(2000, 1, 1).freeze)]).build!
-
-        expect(optional['users.info']).to have_attributes(name: 'Ismael', dob: nil)
-        expect(defaulted['users.info'].dob).to eq(Date.new(2000, 1, 1))
-      end
-    end
-
-    describe 'with a prefix' do
-      def prefixed_system(type, prefix)
-        System.new.tap do |sys|
-          sys.declare('users.info', type)
-          sys.component!('users.info', System::ENVProvider.new(prefix:))
+          expect(build(sys)['user.email']).to eq('me@example.com')
+          expect(sys['app.port']).to eq(3000)
         end
       end
 
-      it 'only reads variables with the prefix, which is removed' do
-        with_env('NAME' => 'root', 'DOB' => '1900-01-01', 'USERS_NAME' => 'Ismael', 'USERS_DOB' => '1977-11-29') do
-          sys = prefixed_system(user, 'USERS_')
+      it 'names the variable when it is missing or invalid, without its value' do
+        with_env('USER_EMAIL' => nil) do
+          sys = System.new.declare('user.email', Plumb::Types::Email).env('USER_EMAIL' => 'user.email')
+          expect { sys.build! }.to raise_error(System::ENVProvider::Error, 'invalid ENV for user.email: USER_EMAIL is missing')
+        end
+
+        with_env('USER_EMAIL' => 'secret-nope') do
+          sys = System.new.declare('user.email', Plumb::Types::Email).env('USER_EMAIL' => 'user.email')
+          expect { sys.build! }.to raise_error(Plumb::ParseError) { |e|
+            expect(e).to be_a(System::ENVProvider::Error)
+            expect(e.message).to start_with('invalid ENV for user.email: USER_EMAIL is invalid: Must match')
+            expect(e.message).not_to include('secret-nope')
+          }
+        end
+      end
+
+      it 'allows missing variables for nullable types' do
+        with_env('USER_EMAIL' => nil) do
+          sys = System.new.declare('user.email', Plumb::Types::Email.nullable).env('USER_EMAIL' => 'user.email')
+          expect(build(sys)['user.email']).to be_nil
+        end
+      end
+
+      it "doesn't allow modifiers" do
+        sys = System.new.declare('user.email')
+        expect { sys.env(:downcase, 'USER_EMAIL' => 'user.email') }.to raise_error(ArgumentError, /only be used when collecting variables with a regex/)
+        expect(sys.components).to be_empty
+      end
+    end
+
+    describe 'collecting variables with a regex' do
+      it 'collects matching variables into a hash, removing the match, and decodes it' do
+        with_env('NAME' => 'root', 'USER_NAME' => 'Ismael', 'USER_DOB' => '1977-11-29') do
+          sys = System.new.declare('user.info', Plumb::Types::Hash[NAME: String, DOB: Date])
+          sys.env(/^USER_/ => 'user.info')
+
+          expect(build(sys)['user.info']).to eq(NAME: 'Ismael', DOB: Date.new(1977, 11, 29))
+        end
+      end
+
+      it 'decodes names into the keys the type expects: symbols for schemas and symbol maps, strings for string maps' do
+        with_env('APP_HOST' => 'localhost', 'APP_PORT' => '3000') do
+          sys = System.new
+          sys.declare('strings', Plumb::Types::Hash[String, String])
+          sys.declare('symbols', Plumb::Types::Hash[Symbol, String])
+          sys.declare('schema', Plumb::Types::Hash['HOST' => String, 'PORT' => Integer])
+          # separate calls: the same regex twice in one hash literal would be one key
+          %w[strings symbols schema].each { |key| sys.env(/^APP_/ => key) }
           sys.build!
 
-          expect(sys['users.info']).to have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
+          expect(sys['strings']).to include('HOST' => 'localhost', 'PORT' => '3000')
+          expect(sys['symbols']).to include(HOST: 'localhost', PORT: '3000')
+          expect(sys['schema']).to eq('HOST' => 'localhost', 'PORT' => 3000)
         end
       end
 
-      it 'matches the prefix case-insensitively' do
-        with_env('users_name' => 'Ismael', 'Users_Dob' => '1977-11-29') do
-          sys = prefixed_system(user, 'users_')
-          sys.build!
+      it 'applies modifiers to collected names' do
+        with_env('USER_NAME' => 'Ismael', 'USER_DOB' => '1977-11-29') do
+          sys = System.new.declare('user.info', user).env(:downcase, /^USER_/ => 'user.info')
 
-          expect(sys['users.info']).to have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
+          expect(build(sys)['user.info']).to be_a(user).and have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
         end
       end
 
-      it "doesn't fall back to unprefixed variables" do
-        with_env('NAME' => 'root', 'DOB' => '1900-01-01', 'USERS_NAME' => 'Ismael', 'USERS_DOB' => nil) do
-          expect { prefixed_system(user, 'USERS_').build! }.to raise_error(
-            System::ENVProvider::Error, "invalid ENV for users.info:\n  USERS_DOB is missing"
+      it 'names invalid variables, and missing attributes, hinting at modifiers' do
+        with_env('USER_NAME' => 'Ismael', 'USER_DOB' => 'not-a-date', 'USER_EMAIL' => nil) do
+          type = Plumb::Types::Data[name: String, dob: Date, email: String]
+          sys = System.new.declare('user.info', type).env(:downcase, /^USER_/ => 'user.info')
+
+          expect { sys.build! }.to raise_error(System::ENVProvider::Error, <<~MSG.chomp)
+            invalid ENV for user.info:
+              USER_DOB is invalid: Must match /\\A\\d{4}-\\d{2}-\\d{2}\\z/
+              email is missing from ENV variables matching /^USER_/
+          MSG
+        end
+
+        with_env('USER_NAME' => 'Ismael', 'USER_DOB' => '1977-11-29') do
+          sys = System.new.declare('user.info', user).env(/^USER_/ => 'user.info')
+
+          expect { sys.build! }.to raise_error(
+            System::ENVProvider::Error, /name is missing from ENV variables matching \/\^USER_\/ \(found USER_NAME, try :downcase\)/
           )
         end
       end
 
-      it 'is shown when inspecting' do
-        expect(System::ENVProvider.new(prefix: 'users_').inspect).to eq('#<System::ENVProvider prefix="USERS_">')
-        expect(System::ENVProvider.new.inspect).to eq('#<System::ENVProvider>')
+      it 'checks at registration that the declared type takes a hash' do
+        person = Class.new(Plumb::Types::Data) { attribute :name, String }
+        takes_hash = [
+          Plumb::Types::Any,
+          Plumb::Types::Hash,
+          Plumb::Types::Hash[name: String],
+          Plumb::Types::Hash[String, String],
+          user,
+          person,
+          user.nullable,
+          Plumb::Types::Hash[name: String].default({}.freeze),
+          Plumb::Types::String | Plumb::Types::Hash
+        ]
+        takes_hash.each do |type|
+          sys = System.new.declare('user.info', type)
+          expect { sys.env(/^USER_/ => 'user.info') }.not_to raise_error, "expected #{type.inspect} to be accepted"
+        end
+
+        [Plumb::Types::String, Plumb::Types::Email, Integer, Plumb::Types::Array[String], Plumb::Types::String.nullable].each do |type|
+          sys = System.new.declare('user.info', type)
+          expect { sys.env(/^USER_/ => 'user.info') }.to raise_error(
+            ArgumentError, /user.info: ENV variables matching \/\^USER_\/ are collected into a hash, but .+ doesn't take one/
+          ), "expected #{type.inspect} to be rejected"
+          expect(sys.components).to be_empty
+        end
+      end
+
+      it 'checks types when collecting all variables, and with a provider directly' do
+        sys = System.new.declare('user.email', String)
+
+        expect { sys.env('user.email') }.to raise_error(ArgumentError, /doesn't take one/)
+        expect { sys.component!('user.email', System::ENVProvider.new(/^USER_/)) }.to raise_error(ArgumentError, /doesn't take one/)
+        expect { sys.env('USER_EMAIL' => 'user.email') }.not_to raise_error # single variables take any type
+      end
+
+      it 'supports optional attributes and defaults' do
+        with_env('USER_NAME' => 'Ismael', 'USER_DOB' => nil) do
+          optional = System.new.declare('user.info', Plumb::Types::Data[name: String, dob?: Date])
+          optional.env(:downcase, /^USER_/ => 'user.info')
+          defaulted = System.new.declare('user.info', Plumb::Types::Data[name: String, dob: Plumb::Types::Date.default(Date.new(2000, 1, 1).freeze)])
+          defaulted.env(:downcase, /^USER_/ => 'user.info')
+
+          expect(build(optional)['user.info']).to have_attributes(name: 'Ismael', dob: nil)
+          expect(build(defaulted)['user.info'].dob).to eq(Date.new(2000, 1, 1))
+        end
+      end
+
+      it 'rejects unknown modifiers' do
+        expect { System.new.declare('a').env(:upcase, /^A_/ => 'a') }.to raise_error(ArgumentError, /unknown ENV modifiers: upcase/)
       end
     end
 
-    it 'implements the provider interface, with no dependencies' do
-      expect(System::ENVProvider.dependencies).to eq([])
-      expect(System::ENVProvider.setup(System::Declaration.new('users.info', user, nil))).to respond_to(:build)
+    describe 'collecting all variables' do
+      it 'collects every variable when given only a component key' do
+        with_env('NAME' => 'Ismael', 'DOB' => '1977-11-29') do
+          sys = System.new.declare('user.info', Plumb::Types::Hash[NAME: String, DOB: Date]).env('user.info')
+
+          expect(build(sys)['user.info']).to eq(NAME: 'Ismael', DOB: Date.new(1977, 11, 29))
+          expect(sys.components['user.info'].provider.source).to eq(System::ENVProvider::ALL)
+        end
+      end
+
+      it 'applies modifiers' do
+        with_env('NAME' => 'Ismael', 'DOB' => '1977-11-29') do
+          sys = System.new.declare('user.info', user).env(:downcase, 'user.info')
+
+          expect(build(sys)['user.info']).to have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
+        end
+      end
+
+      it 'is what the bare ENVProvider class does' do
+        with_env('NAME' => 'Ismael') do
+          sys = System.new.declare('user.info', Plumb::Types::Hash[NAME: String])
+          sys.component!('user.info', System::ENVProvider)
+
+          expect(build(sys)['user.info']).to eq(NAME: 'Ismael')
+        end
+      end
+    end
+
+    it 'reads raw strings into untyped (Any) components' do
+      with_env('USER_EMAIL' => 'me@example.com', 'USER_NAME' => 'Ismael') do
+        sys = System.new.declare('user.email').declare('user.info')
+        sys.env('USER_EMAIL' => 'user.email', /^USER_/ => 'user.info')
+        sys.build!
+
+        expect(sys['user.email']).to eq('me@example.com')
+        expect(sys['user.info']).to include('NAME' => 'Ismael', 'EMAIL' => 'me@example.com')
+      end
+    end
+
+    it 'reads ENV when components are built, not when they are registered' do
+      sys = System.new.declare('user.email', String).env('USER_EMAIL' => 'user.email')
+
+      with_env('USER_EMAIL' => 'later@example.com') do
+        expect(build(sys)['user.email']).to eq('later@example.com')
+      end
+    end
+
+    it 'registers singleton components, publishing failures like any component' do
+      with_env('USER_EMAIL' => nil) do
+        sys = System.new.declare('user.email', String).env('USER_EMAIL' => 'user.email')
+        failures = []
+        sys.notifier.subscribe('components.failed') { |e| failures << [e.key, e.stage] }
+
+        expect(sys.components['user.email']).to be_singleton
+        expect { sys.build! }.to raise_error(System::ENVProvider::Error)
+        expect(failures).to eq([['user.email', :build]])
+      end
+    end
+
+    it 'validates every source, key and type before registering any' do
+      sys = System.new.declare('a').declare('b', String)
+
+      expect { sys.env('A' => 'a', 42 => 'b') }.to raise_error(ArgumentError, /must be a variable name or a regex/)
+      expect { sys.env('A' => 'a', /^B_/ => 'b') }.to raise_error(ArgumentError, /doesn't take one/)
+      expect { sys.env('A' => 'a', 'B' => 'nope') }.to raise_error(System::UndeclaredComponentError)
+      expect { sys.env }.to raise_error(ArgumentError, /needs a component key/)
+      expect(sys.components).to be_empty
+    end
+
+    it 'shows sources and modifiers when inspecting' do
+      expect(System::ENVProvider.new('USER_EMAIL').inspect).to eq('#<System::ENVProvider "USER_EMAIL">')
+      expect(System::ENVProvider.new(/^USER_/, :downcase).inspect).to eq('#<System::ENVProvider /^USER_/ downcase>')
     end
   end
 

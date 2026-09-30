@@ -4,7 +4,7 @@ source "https://rubygems.org"
 
 # gem "rails"
 
-gem "plumb", "~> 0.3"
+gem "plumb", "~> 0.4"
 
 gem "tsort", "~> 0.2.0"
 
