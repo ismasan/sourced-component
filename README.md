@@ -265,7 +265,7 @@ The root component drives the lifecycle of the whole tree. Each step runs the ma
 | `#start!(context = Thread.current)` | Runs `start` hooks with `(value, context)` | `:started` |
 | `#teardown!` | Runs `teardown` hooks with `(value)`, in reverse order | `:toredown` |
 
-Each step runs the ones before it if needed (`#start!` prepares and builds), and is idempotent. `#teardown!` is a no-op unless the component is started.
+Each step runs the ones before it if needed (`#start!` prepares and builds), and is idempotent. `#teardown!` is a no-op unless the component is started. `:toredown` is terminal: `#start!` on a torn down component raises `TornDownError`.
 
 ```ruby
 App.boot_status          # => :started, the root's status

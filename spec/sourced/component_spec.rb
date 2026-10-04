@@ -1335,7 +1335,21 @@ RSpec.describe Sourced::Component do
         expect(calls).to eq(%i[start_a start_b teardown_b teardown_a])
         expect(comp.boot_status).to eq(:toredown)
         expect(comp.node('c').status).to eq(:built)
+        expect { comp.start! }.to raise_error(described_class::TornDownError)
       end
+    end
+
+    it "can't be restarted after teardown" do
+      calls = []
+      comp = new_component
+      comp.declare('a') { 1 }
+      comp.component!('a') { start { calls << :start } }
+      comp.start!
+      comp.teardown!
+
+      expect { comp.start! }.to raise_error(described_class::TornDownError)
+      expect(calls).to eq(%i[start])
+      expect(comp.boot_status).to eq(:toredown)
     end
 
     describe 'teardown! failures' do

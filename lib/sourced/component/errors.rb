@@ -12,5 +12,6 @@ module Sourced
     MissingDependencyError = Class.new(ComponentError)
     CircularDependencyError = Class.new(ComponentError)
     NotBuiltError = Class.new(ComponentError)
+    TornDownError = Class.new(ComponentError)
   end
 end

@@ -298,9 +298,12 @@ module Sourced
 
     # If a start hook raises, nodes already started are torn down (in reverse order),
     # the component is left :toredown, and the error is re-raised.
+    # :toredown is terminal: starting a torn down component raises TornDownError.
     def start!(context = Thread.current)
       raise_mounted!
       synchronize do
+        raise TornDownError, "can't start a torn down component" if boot_status == :toredown
+
         build!
         return self if past?(:started)
 
