@@ -9,6 +9,7 @@ require_relative 'system/dsl'
 require_relative 'system/implementation'
 require_relative 'system/injector'
 require_relative 'system/env_provider'
+require_relative 'system/graph'
 
 module Sourced
   # A tree of systems. Every node is a System: it can declare a type, be implemented with
@@ -291,6 +292,46 @@ module Sourced
       end
     end
 
+# A System::Graph describing the components under this system, by full path from the root.
+# Components are listed in dependency order once the tree is prepared, and in declaration order before that.
+# Namespaces without an implementation are left out.
+#   graph = sys.graph
+#   graph.status         # => :built, the root's status
+#   graph.components     # => [{ key: 'logger', type:, type_name:, implemented:, mode:, status:, deps:, missing:, dependents:, provider: }, ...]
+#   graph.to_mermaid     # => a Mermaid flowchart
+# See System::Graph
+def graph
+  synchronize do
+    nodes = index.values.reject(&:namespace?)
+    nodes = (root.order & nodes) | nodes if root.order
+
+    described = nodes.map { |n| [n, *graph_deps(n)] }
+    dependents = Hash.new { |h, k| h[k] = [] }
+    described.each { |n, deps, _| deps.each { |dep| dependents[dep] << n.path } }
+
+    components = described.map do |n, deps, missing|
+      impl = n.implementation
+      {
+        key: n.path,
+        type: n.type,
+        type_name: n.type_name,
+        implemented: !impl.nil?,
+        mode: impl&.mode,
+        status: n.status,
+        deps:,
+        missing:,
+        dependents: dependents[n.path],
+        provider: impl&.provider
+      }
+    end
+
+    Graph.new(status: root.boot_status, components:)
+  end
+end
+
+# Ordered nodes, with deps' values, ex. for an implementation's own #inspect
+
+
     # Nodes in dependency order. Available after #prepare!
     def ordered_nodes
       raise_mounted!
@@ -452,7 +493,7 @@ module Sourced
 
         target = node(ckey)
         implementation = if provider
-                           Implementation.from_builder(builder_from(target, provider), deps, implementer: self, mode:)
+                           Implementation.from_builder(builder_from(target, provider), deps, implementer: self, mode:, provider:)
                          else
                            Implementation.from_block(deps, implementer: self, mode:, &block)
                          end
@@ -475,6 +516,23 @@ module Sourced
       raise ArgumentError, "#{target.path}: a provider must respond to #call or #builder_for(node), got #{provider.inspect}"
     end
 
+# A node's deps, as full paths, and the ones that don't resolve to a component
+private def graph_deps(node)
+  impl = node.implementation
+  return [[], []] unless impl
+
+  impl.deps.each_with_object([[], []]) do |dep, (deps, missing)|
+    target = impl.implementer.index[dep]
+    if target && !target.namespace?
+      deps << target.path
+    else
+      full = [impl.implementer.path, dep].compact.join('.')
+      deps << full
+      missing << full
+    end
+  end
+end
+
     # Walk a key's intermediate segments from this system, creating namespace nodes owned by it.
     # Returns the branch node and the last segment.
     private def walk(ckey)
@@ -496,6 +554,6 @@ module Sourced
       "#{node.path} is owned by #{owner}: declare it there. This system can only implement it"
     end
 
-    private def type_name = type.inspect.gsub('Plumb::Types::', '')
+    protected def type_name = type.inspect.gsub(/(Plumb::Types|Sourced::System::T)::/, '')
   end
 end

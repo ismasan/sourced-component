@@ -164,6 +164,9 @@ end
 App.start!
 puts App.ordered_nodes.map(&:inspect)
 
+puts "\n== Graph (paste into https://mermaid.live)\n\n"
+puts App.graph.to_mermaid
+
 puts "\n== Read"
 puts "App['sourced.db'].name      => #{App['sourced.db'].name}"
 puts "Library['db'].name          => #{Library['db'].name} (the app's override, seen by the library)"

@@ -1373,6 +1373,215 @@ RSpec.describe Sourced::System do
     end
   end
 
+  describe '#graph' do
+    it 'describes all declared components, their statuses, dependencies and types' do
+      logger_type = Plumb::Types::Interface[:info]
+      sys = new_system
+      sys.declare('app')
+      sys.declare('logger', logger_type)
+      sys.declare('logger.output') { STDOUT }
+      sys.declare('db', Plumb::Types::Interface[:append].nullable)
+      sys.component!('app', %w[logger logger.output]) { start { |_v, _c| } }
+      sys.config('logger', ['logger.output']) { |o| o }
+
+      graph = sys.graph
+      expect(graph).to be_a(described_class::Graph)
+      expect(graph.status).to eq(:open)
+      expect(graph.to_h).to eq(status: :open, components: graph.components)
+      expect(graph.components.map { |c| c[:key] }).to eq(%w[app logger logger.output db])
+
+      expect(graph.components[1]).to match(
+        key: 'logger',
+        type: logger_type,
+        type_name: 'Interface[info]',
+        implemented: true,
+        mode: :dynamic,
+        status: :open,
+        deps: ['logger.output'],
+        missing: [],
+        dependents: ['app'],
+        provider: be_a(Proc)
+      )
+      expect(graph.components[0]).to include(provider: nil) # a block of hooks
+      expect(graph.components[2]).to include(deps: [], dependents: %w[app logger])
+      expect(graph.components[3]).to include(
+        key: 'db',
+        type_name: '(Nil | Interface[append])',
+        implemented: false,
+        mode: nil,
+        status: :open,
+        deps: [],
+        missing: [],
+        dependents: [],
+        provider: nil
+      )
+    end
+
+    it 'lists components in dependency order, with their statuses, once prepared' do
+      sys = new_system
+      sys.declare('app')
+      sys.declare('logger') { 'logger' }
+      sys.config!('app', ['logger']) { |l| l }
+      sys.start!
+
+      graph = sys.graph
+      expect(graph.status).to eq(:started)
+      expect(graph.components.map { |c| [c[:key], c[:status]] }).to eq([['logger', :started], ['app', :started]])
+    end
+
+    it 'lists deps that are not declared, or are namespaces without an implementation, as missing' do
+      sys = new_system
+      sys.declare('ns.x') { 1 }
+      sys.declare('app')
+      sys.config!('app', %w[ns.x nope ns]) { 1 }
+
+      expect(sys.graph.components.last).to include(key: 'app', deps: %w[ns.x nope ns], missing: %w[nope ns])
+    end
+
+    it 'leaves out namespaces, and includes namespaces with an implementation' do
+      sys = new_system
+      sys.declare('a.b.c') { 1 }
+      sys.declare('x.y') { 1 }
+      sys.config!('x') { 2 }
+
+      expect(sys.graph.components.map { |c| c[:key] }).to eq(%w[a.b.c x x.y])
+    end
+
+    it 'includes providers' do
+      provider = described_class::ENVProvider.new('A')
+      sys = new_system
+      sys.declare('a')
+      sys.declare('b')
+      sys.component!('a', provider)
+      sys.env('B' => 'b')
+
+      expect(sys.graph.components.map { |c| c[:provider] }).to match([provider, be_a(described_class::ENVProvider)])
+    end
+
+    it 'describes mounted systems by full path, with deps relative to their implementers' do
+      lib = new_system
+      lib.declare('logger') { 'lib logger' }
+      lib.declare('db')
+      lib.config!('db', ['logger']) { |l| l }
+      app = new_system
+      app.declare('logger') { 'app logger' }
+      app.mount('sourced', lib)
+      app.declare('app')
+      app.config!('app', ['sourced.db']) { |db| db }
+
+      expect(app.graph.components.map { |c| c.slice(:key, :deps, :dependents) }).to eq([
+        { key: 'logger', deps: [], dependents: [] },
+        { key: 'sourced.logger', deps: [], dependents: ['sourced.db'] },
+        { key: 'sourced.db', deps: ['sourced.logger'], dependents: ['app'] },
+        { key: 'app', deps: ['sourced.db'], dependents: [] }
+      ])
+
+      # The app re-implements the library's db, with its own logger
+      app.config!('sourced.db', ['logger']) { |l| l }
+      expect(app.graph.components.find { |c| c[:key] == 'logger' }[:dependents]).to eq(['sourced.db'])
+    end
+
+    it 'describes the components under a mounted system, with dependents only from its graph' do
+      lib = new_system
+      lib.declare('logger') { 'lib logger' }
+      lib.declare('db')
+      app = new_system
+      app.declare('logger') { 'app logger' }
+      app.declare('app')
+      app.mount('sourced', lib)
+      app.config!('sourced.db', ['logger']) { |l| l }
+      app.config!('app', ['sourced.db']) { |db| db }
+      app.start!
+
+      graph = lib.graph
+      expect(graph.status).to eq(:started)
+      expect(graph.components.map { |c| c.slice(:key, :deps, :missing, :dependents) }).to contain_exactly(
+        { key: 'sourced.logger', deps: [], missing: [], dependents: [] },
+        { key: 'sourced.db', deps: ['logger'], missing: [], dependents: [] }
+      )
+    end
+
+    it 'names types without module prefixes' do
+      sys = new_system
+      sys.declare('email', described_class::T::Email)
+
+      expect(sys.graph.components.first[:type_name]).to eq('Email')
+    end
+  end
+
+  describe 'Graph#to_mermaid' do
+    def classdefs = described_class::Graph::MERMAID_CLASSES.map { |name, style| "  classDef #{name} #{style}" }.join("\n")
+
+    it 'draws components, dependency edges, modes and implementations' do
+      sys = new_system
+      sys.declare('output') { STDOUT }
+      sys.declare('logger', Plumb::Types::Interface[:info])
+      sys.declare('db', Plumb::Types::Interface[:exec].nullable)
+      sys.declare('request_id', String)
+      sys.declare('app')
+      sys.config('logger', ['output']) { |o| o }
+      sys.config('request_id') { 'x' }
+      sys.config!('app', %w[logger db request_id nope]) { 1 }
+
+      expect(sys.graph.to_mermaid).to eq(<<~MERMAID.chomp)
+        flowchart LR
+          c0["output<br/>Any<br/><i>singleton, open</i>"]:::open
+          c1(["logger<br/>Interface[info]<br/><i>dynamic, open</i>"]):::open
+          c2["db<br/>(Nil | Interface[exec])<br/><i>not implemented</i>"]:::unimplemented
+          c3(["request_id<br/>String<br/><i>dynamic, open</i>"]):::open
+          c4["app<br/>Any<br/><i>singleton, open</i>"]:::open
+          c5["nope<br/><i>not declared</i>"]:::missing
+          c0 --> c1
+          c1 --> c4
+          c2 --> c4
+          c3 --> c4
+          c5 --> c4
+        #{classdefs}
+      MERMAID
+    end
+
+    it 'styles nodes by status, in dependency order' do
+      sys = new_system
+      sys.declare('app')
+      sys.declare('logger') { 1 }
+      sys.config!('app', ['logger']) { |l| l }
+      sys.start!
+
+      nodes = sys.graph.to_mermaid.lines.grep(/:::/).map(&:strip)
+      expect(nodes).to eq([
+        'c0["logger<br/>Any<br/><i>singleton, started</i>"]:::started',
+        'c1["app<br/>Any<br/><i>singleton, started</i>"]:::started'
+      ])
+    end
+
+    it 'draws deps outside the graph, ex. an app override in a library graph' do
+      lib = new_system
+      lib.declare('db')
+      app = new_system
+      app.declare('logger') { 1 }
+      app.mount('sourced', lib)
+      app.config!('sourced.db', ['logger']) { |l| l }
+
+      expect(lib.graph.to_mermaid).to eq(<<~MERMAID.chomp)
+        flowchart LR
+          c0["sourced.db<br/>Any<br/><i>singleton, open</i>"]:::open
+          c1["logger<br/><i>outside this system</i>"]:::external
+          c1 --> c0
+        #{classdefs}
+      MERMAID
+    end
+
+    it 'escapes labels' do
+      graph = described_class::Graph.new(status: :open, components: [
+        { key: 'a"b', type_name: 'Hash<String> & more', implemented: false, mode: nil, status: :open, deps: [] }
+      ])
+
+      expect(graph.to_mermaid.lines[1].strip).to eq(
+        'c0["a#quot;b<br/>Hash#lt;String#gt; #amp; more<br/><i>not implemented</i>"]:::unimplemented'
+      )
+    end
+  end
+
   describe '#inspect' do
     it 'describes the node' do
       sys = new_system

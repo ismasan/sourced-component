@@ -427,6 +427,64 @@ node.children        # => { segment => System }
 node.namespace?      # => no type and no implementation
 ```
 
+### `#graph`
+
+Returns a `Sourced::System::Graph` describing the components under a system, useful for tooling, visualisation or debugging. Components are listed by their full path from the root, in dependency order once the tree is prepared, and in declaration order before that. Namespaces without an implementation are left out.
+
+```ruby
+graph = App.graph
+graph.status     # => :built, the root's status
+graph.components # => an array of hashes, one per component
+
+graph.to_h
+# {
+#   status: :built,
+#   components: [
+#     {
+#       key: 'my_lib.store',                 # full path from the root
+#       type: <Plumb type>,                  # the declared type
+#       type_name: 'Interface[append]',      # readable version of it
+#       implemented: true,
+#       mode: :singleton,                    # :singleton or :dynamic. nil if not implemented
+#       status: :built,
+#       deps: ['db'],                        # full paths of the components this one depends on
+#       missing: [],                         # deps that aren't declared, or are namespaces without an implementation
+#       dependents: ['app'],                 # components in the graph that depend on this one
+#       provider: <provider>                 # the provider, or the block of #config!/#config. nil for blocks of hooks
+#     },
+#     ...
+#   ]
+# }
+```
+
+It's a graph rather than a tree, since several components can share a dependency. Each component lists both `deps` and `dependents`, so you can walk the graph in either direction. Dependencies are resolved from the system that implemented each component, so an app's override of a library component lists the app's dependencies.
+
+Calling `#graph` on a mounted system describes only the components under it, ex. `MyLib.system.graph` lists `my_lib.*`. Their `deps` can point outside it (to an app's components, through its overrides), and `dependents` only include components in that graph.
+
+### Mermaid diagrams
+
+`Graph#to_mermaid` returns a [Mermaid](https://mermaid.js.org) flowchart of the dependency graph, which GitHub, many docs tools and editors render natively.
+
+```ruby
+puts App.graph.to_mermaid
+```
+
+```mermaid
+flowchart LR
+  c0["db<br/>DB<br/><i>singleton, started</i>"]:::started
+  c1["my_lib.logger<br/>Interface[info]<br/><i>singleton, started</i>"]:::started
+  c2["my_lib.store<br/>Interface[append]<br/><i>singleton, started</i>"]:::started
+  c3(["request_id<br/>String<br/><i>dynamic, started</i>"]):::started
+  c0 --> c2
+  classDef started fill:#dcfce7,stroke:#16a34a
+```
+
+- **Arrows point from each dependency to the components that depend on it,** which is the order they're built and started in.
+- **Each node shows** the full path, the declared type, and the mode and status.
+- **Shapes:** singletons are rectangles and dynamic components are rounded.
+- **Nodes are colored by status.** Declared but unimplemented components (yellow) and dependencies that aren't declared (red) have dashed borders, so problems that `#prepare!` would reject are visible in the diagram. In a mounted system's graph, dependencies outside it are drawn with a light dashed border.
+- **Label text is escaped,** so type names with brackets, pipes or quotes are safe.
+
 ## Errors
 
 All errors inherit from `Sourced::System::SystemError`, except type mismatches, which raise `Plumb::ParseError` naming the component (without the value, which can hold secrets):
