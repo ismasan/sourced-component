@@ -3,19 +3,19 @@
 require 'spec_helper'
 require 'date'
 
-RSpec.describe Sourced::System do
-  def new_system = described_class.new
+RSpec.describe Sourced::Component do
+  def new_component = described_class.new
 
   it 'has a version number' do
-    expect(Sourced::System::VERSION).not_to be_nil
+    expect(Sourced::Component::VERSION).not_to be_nil
   end
 
   describe '#declare' do
     it 'builds a tree of nodes from dot-separated keys, with intermediate namespaces' do
-      sys = new_system
-      sys.declare('sourced.db.logger', String)
+      comp = new_component
+      comp.declare('sourced.db.logger', String)
 
-      sourced = sys.children.fetch('sourced')
+      sourced = comp.children.fetch('sourced')
       db = sourced.children.fetch('db')
       logger = db.children.fetch('logger')
 
@@ -27,124 +27,124 @@ RSpec.describe Sourced::System do
       expect([sourced.key, db.key, logger.key]).to eq(%w[sourced db logger])
       expect(logger.path).to eq('sourced.db.logger')
       expect(logger.parent).to be(db)
-      expect(logger.root).to be(sys)
+      expect(logger.root).to be(comp)
     end
 
     it 'indexes every descendant by relative key, in every ancestor' do
-      sys = new_system
-      sys.declare('sourced.db.logger', String)
+      comp = new_component
+      comp.declare('sourced.db.logger', String)
 
-      expect(sys.index.keys).to eq(%w[sourced sourced.db sourced.db.logger])
-      expect(sys.node('sourced').index.keys).to eq(%w[db db.logger])
-      expect(sys.node('sourced.db').index.keys).to eq(%w[logger])
-      expect(sys.node('sourced.db.logger')).to be(sys.node('sourced').node('db.logger'))
-      expect(sys.declared?('sourced.db')).to be(true)
-      expect(sys.declared?('nope')).to be(false)
+      expect(comp.index.keys).to eq(%w[sourced sourced.db sourced.db.logger])
+      expect(comp.node('sourced').index.keys).to eq(%w[db db.logger])
+      expect(comp.node('sourced.db').index.keys).to eq(%w[logger])
+      expect(comp.node('sourced.db.logger')).to be(comp.node('sourced').node('db.logger'))
+      expect(comp.declared?('sourced.db')).to be(true)
+      expect(comp.declared?('nope')).to be(false)
     end
 
-    it 'makes the declaring system the owner of the nodes it creates' do
-      sys = new_system
-      sys.declare('a.b', String)
+    it 'makes the declaring component the owner of the nodes it creates' do
+      comp = new_component
+      comp.declare('a.b', String)
 
-      expect(sys.owner).to be(sys)
-      expect(sys.node('a').owner).to be(sys)
-      expect(sys.node('a.b').owner).to be(sys)
+      expect(comp.owner).to be(comp)
+      expect(comp.node('a').owner).to be(comp)
+      expect(comp.node('a.b').owner).to be(comp)
     end
 
     it 'defaults the type to Any' do
-      sys = new_system
-      sys.declare('anything') { 1 }
+      comp = new_component
+      comp.declare('anything') { 1 }
 
-      expect(sys.node('anything').type).to eq(Plumb::Types::Any)
-      expect(sys.node('anything').implicit?).to be(false)
+      expect(comp.node('anything').type).to eq(Plumb::Types::Any)
+      expect(comp.node('anything').implicit?).to be(false)
     end
 
     it 'treats nil as a valid type' do
-      sys = new_system
-      sys.declare('nothing', nil) { nil }
-      sys.build!
+      comp = new_component
+      comp.declare('nothing', nil) { nil }
+      comp.build!
 
-      expect(sys.node('nothing').implicit?).to be(false)
-      expect(sys['nothing']).to be_nil
+      expect(comp.node('nothing').implicit?).to be(false)
+      expect(comp['nothing']).to be_nil
     end
 
     it 'gives implicit nodes the Any type' do
-      sys = new_system
-      sys.declare('ns.x', String)
+      comp = new_component
+      comp.declare('ns.x', String)
 
-      expect(sys.node('ns').implicit?).to be(true)
-      expect(sys.node('ns').type).to eq(Plumb::Types::Any)
+      expect(comp.node('ns').implicit?).to be(true)
+      expect(comp.node('ns').type).to eq(Plumb::Types::Any)
     end
 
     it 'registers a default block as a singleton implementation' do
-      sys = new_system
-      sys.declare('name', String) { 'Joe' }
-      sys.build!
+      comp = new_component
+      comp.declare('name', String) { 'Joe' }
+      comp.build!
 
-      expect(sys.node('name').implementation.mode).to eq(:singleton)
-      expect(sys['name']).to eq('Joe')
+      expect(comp.node('name').implementation.mode).to eq(:singleton)
+      expect(comp['name']).to eq('Joe')
     end
 
     it 'can add children to namespaces it owns' do
-      sys = new_system
-      sys.declare('cache.redis', String) { 'redis://' }
-      sys.declare('cache.redis.pool', Integer) { 5 }
-      sys.build!
+      comp = new_component
+      comp.declare('cache.redis', String) { 'redis://' }
+      comp.declare('cache.redis.pool', Integer) { 5 }
+      comp.build!
 
-      expect(sys['cache.redis']).to eq('redis://')
-      expect(sys['cache.redis.pool']).to eq(5)
+      expect(comp['cache.redis']).to eq('redis://')
+      expect(comp['cache.redis.pool']).to eq(5)
     end
 
     it 'gives a type to an implicit namespace it created' do
-      sys = new_system
-      sys.declare('db.url', String) { 'sqlite://' }
-      sys.declare('db', String)
-      sys.component!('db', ['db.url']) { build { |url| "DB(#{url})" } }
-      sys.build!
+      comp = new_component
+      comp.declare('db.url', String) { 'sqlite://' }
+      comp.declare('db', String)
+      comp.component!('db', ['db.url']) { build { |url| "DB(#{url})" } }
+      comp.build!
 
-      expect(sys.node('db').implicit?).to be(false)
-      expect(sys['db']).to eq('DB(sqlite://)')
+      expect(comp.node('db').implicit?).to be(false)
+      expect(comp['db']).to eq('DB(sqlite://)')
     end
 
     it 'raises when re-declaring a key' do
-      sys = new_system
-      sys.declare('a', String)
+      comp = new_component
+      comp.declare('a', String)
 
-      expect { sys.declare('a', Integer) }.to raise_error(described_class::DeclarationOverrideError, /a is already declared/)
+      expect { comp.declare('a', Integer) }.to raise_error(described_class::DeclarationOverrideError, /a is already declared/)
     end
 
     it 'raises on invalid keys' do
-      sys = new_system
+      comp = new_component
 
-      expect { sys.declare('a..b') }.to raise_error(ArgumentError)
-      expect { sys.declare('') }.to raise_error(ArgumentError)
-      expect { sys.declare('.a') }.to raise_error(ArgumentError)
+      expect { comp.declare('a..b') }.to raise_error(ArgumentError)
+      expect { comp.declare('') }.to raise_error(ArgumentError)
+      expect { comp.declare('.a') }.to raise_error(ArgumentError)
     end
   end
 
   describe 'ownership' do
     let(:lib) do
-      new_system.tap do |s|
+      new_component.tap do |s|
         s.declare('db', String) { 'lib db' }
       end
     end
 
     let(:app) do
-      new_system.tap { |s| s.mount('sourced', lib) }
+      new_component.tap { |s| s.mount('sourced', lib) }
     end
 
-    it "can't declare under a mounted system's nodes" do
+    it "can't declare under a mounted component's nodes" do
       expect { app.declare('sourced.extra', String) }.to raise_error(described_class::OwnershipError, /sourced is owned by/)
       expect { app.declare('sourced.db.extra', String) }.to raise_error(described_class::OwnershipError)
     end
 
-    it "can't declare under namespaces created by another system" do
+    it "can't declare under namespaces created by another component" do
       lib.declare('settings.retries', Integer) { 3 }
 
       expect { app.declare('sourced.settings.timeout', Integer) }.to raise_error(described_class::OwnershipError, /sourced is owned by/)
     end
 
-    it 'lets the mounted system keep declaring under itself' do
+    it 'lets the mounted component keep declaring under itself' do
       app
       lib.declare('settings.retries', Integer) { 3 }
 
@@ -152,7 +152,7 @@ RSpec.describe Sourced::System do
       expect(lib.node('settings.retries')).to be(app.node('sourced.settings.retries'))
     end
 
-    it "lets an ancestor implement a mounted system's nodes" do
+    it "lets an ancestor implement a mounted component's nodes" do
       app.component!('sourced.db') { build { 'app db' } }
       app.build!
 
@@ -162,45 +162,45 @@ RSpec.describe Sourced::System do
 
   describe '#component' do
     it 'implements a declared node with deps and lifecycle hooks' do
-      sys = new_system
-      sys.declare('url', String) { 'sqlite://' }
-      sys.declare('db', String)
-      sys.component!('db', ['url']) do
+      comp = new_component
+      comp.declare('url', String) { 'sqlite://' }
+      comp.declare('db', String)
+      comp.component!('db', ['url']) do
         build { |url| "DB(#{url})" }
       end
-      sys.build!
+      comp.build!
 
-      impl = sys.node('db').implementation
+      impl = comp.node('db').implementation
       expect(impl.deps).to eq(['url'])
-      expect(impl.implementer).to be(sys)
-      expect(sys['db']).to eq('DB(sqlite://)')
+      expect(impl.implementer).to be(comp)
+      expect(comp['db']).to eq('DB(sqlite://)')
     end
 
     it 'accepts a block with the DSL as an argument' do
-      sys = new_system
-      sys.declare('a', Integer)
-      sys.component!('a') { |c| c.build { 1 } }
-      sys.build!
+      comp = new_component
+      comp.declare('a', Integer)
+      comp.component!('a') { |c| c.build { 1 } }
+      comp.build!
 
-      expect(sys['a']).to eq(1)
+      expect(comp['a']).to eq(1)
     end
 
     it 'accepts callables as hooks' do
-      sys = new_system
-      sys.declare('a', Integer)
-      sys.component!('a') { build(-> { 2 }) }
-      sys.build!
+      comp = new_component
+      comp.declare('a', Integer)
+      comp.component!('a') { build(-> { 2 }) }
+      comp.build!
 
-      expect(sys['a']).to eq(2)
+      expect(comp['a']).to eq(2)
     end
 
-    it 'resolves deps relative to the implementing system' do
-      lib = new_system
+    it 'resolves deps relative to the implementing component' do
+      lib = new_component
       lib.declare('logger', String) { 'lib logger' }
       lib.declare('db', String)
       lib.component!('db', ['logger']) { build { |logger| "db with #{logger}" } }
 
-      app = new_system
+      app = new_component
       app.declare('logger', String) { 'app logger' }
       app.mount('sourced', lib)
       app.build!
@@ -209,12 +209,12 @@ RSpec.describe Sourced::System do
     end
 
     it 'lets an ancestor re-implement a node, with deps relative to the ancestor' do
-      lib = new_system
+      lib = new_component
       lib.declare('logger', String) { 'lib logger' }
       lib.declare('db', String)
       lib.component!('db', ['logger']) { build { |logger| "db with #{logger}" } }
 
-      app = new_system
+      app = new_component
       app.declare('logger', String) { 'app logger' }
       app.mount('sourced', lib)
       app.component!('sourced.db', ['logger']) { build { |logger| "app db with #{logger}" } }
@@ -225,11 +225,11 @@ RSpec.describe Sourced::System do
       expect(lib['db']).to be(app['sourced.db'])
     end
 
-    it 'can depend on nodes in mounted systems' do
-      lib = new_system
+    it 'can depend on nodes in mounted components' do
+      lib = new_component
       lib.declare('logger', String) { 'lib logger' }
 
-      app = new_system
+      app = new_component
       app.mount('sourced', lib)
       app.declare('db', String)
       app.component!('db', ['sourced.logger']) { build { |logger| "db with #{logger}" } }
@@ -239,80 +239,80 @@ RSpec.describe Sourced::System do
     end
 
     it 'replaces previous implementations' do
-      sys = new_system
-      sys.declare('a', Integer) { 1 }
-      sys.component!('a') { build { 2 } }
-      sys.build!
+      comp = new_component
+      comp.declare('a', Integer) { 1 }
+      comp.component!('a') { build { 2 } }
+      comp.build!
 
-      expect(sys['a']).to eq(2)
+      expect(comp['a']).to eq(2)
     end
 
     it 'can implement a namespace node' do
-      sys = new_system
-      sys.declare('ns.x', Integer) { 1 }
-      sys.component!('ns', ['ns.x']) { build { |x| x + 1 } }
-      sys.build!
+      comp = new_component
+      comp.declare('ns.x', Integer) { 1 }
+      comp.component!('ns', ['ns.x']) { build { |x| x + 1 } }
+      comp.build!
 
-      expect(sys['ns']).to eq(2)
-      expect(sys.node('ns').namespace?).to be(false)
+      expect(comp['ns']).to eq(2)
+      expect(comp.node('ns').namespace?).to be(false)
     end
 
     it 'raises for undeclared keys' do
-      sys = new_system
+      comp = new_component
 
-      expect { sys.component!('nope') { build { 1 } } }.to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
+      expect { comp.component!('nope') { build { 1 } } }.to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
     end
 
     it 'implements singletons with #component! and dynamic components with #component' do
-      sys = new_system
-      sys.declare('a')
-      sys.declare('b')
-      sys.component!('a') { build { 1 } }
-      sys.component('b', ['a']) { build { |a| a + 1 } }
+      comp = new_component
+      comp.declare('a')
+      comp.declare('b')
+      comp.component!('a') { build { 1 } }
+      comp.component('b', ['a']) { build { |a| a + 1 } }
 
-      expect(sys.node('a').implementation.mode).to eq(:singleton)
-      expect(sys.node('b').implementation.mode).to eq(:dynamic)
-      expect(sys.node('b').implementation.deps).to eq(['a'])
+      expect(comp.node('a').implementation.mode).to eq(:singleton)
+      expect(comp.node('b').implementation.mode).to eq(:dynamic)
+      expect(comp.node('b').implementation.deps).to eq(['a'])
     end
 
     describe 'providers' do
       it 'builds components with callables, called with the deps values' do
         factory = Class.new { def self.call(url) = "DB(#{url})" }
-        sys = new_system
-        sys.declare('db.url', String) { 'sqlite://' }
-        sys.declare('db', String)
-        sys.declare('clock')
-        sys.component!('db', ['db.url'], factory)
-        sys.component!('clock', -> { Time }) # no deps
-        sys.build!
+        comp = new_component
+        comp.declare('db.url', String) { 'sqlite://' }
+        comp.declare('db', String)
+        comp.declare('clock')
+        comp.component!('db', ['db.url'], factory)
+        comp.component!('clock', -> { Time }) # no deps
+        comp.build!
 
-        expect(sys['db']).to eq('DB(sqlite://)')
-        expect(sys['clock']).to be(Time)
-        expect(sys.node('db').implementation).to have_attributes(mode: :singleton, deps: ['db.url'], implementer: sys)
+        expect(comp['db']).to eq('DB(sqlite://)')
+        expect(comp['clock']).to be(Time)
+        expect(comp.node('db').implementation).to have_attributes(mode: :singleton, deps: ['db.url'], implementer: comp)
       end
 
       it 'builds dynamic components with callables' do
         counter = 0
-        sys = new_system
-        sys.declare('id', Integer)
-        sys.component('id', -> { counter += 1 })
-        sys.build!
+        comp = new_component
+        comp.declare('id', Integer)
+        comp.component('id', -> { counter += 1 })
+        comp.build!
 
-        expect(sys.node('id').implementation.mode).to eq(:dynamic)
-        expect([sys['id'], sys['id']]).to eq([1, 2])
+        expect(comp.node('id').implementation.mode).to eq(:dynamic)
+        expect([comp['id'], comp['id']]).to eq([1, 2])
       end
 
       it 'sets up providers with #builder_for(node)' do
         provider = Class.new do
           def self.builder_for(node) = ->(prefix) { "#{prefix} #{node.path} #{node.type.inspect}" }
         end
-        sys = new_system
-        sys.declare('prefix', String) { 'built' }
-        sys.declare('a.b', String)
-        sys.component!('a.b', ['prefix'], provider)
-        sys.build!
+        comp = new_component
+        comp.declare('prefix', String) { 'built' }
+        comp.declare('a.b', String)
+        comp.component!('a.b', ['prefix'], provider)
+        comp.build!
 
-        expect(sys['a.b']).to eq('built a.b String')
+        expect(comp['a.b']).to eq('built a.b String')
       end
 
       it "runs the builder's optional prepare, start and teardown hooks" do
@@ -325,12 +325,12 @@ RSpec.describe Sourced::System do
           define_method(:start) { |pool, context| @calls << [:start, pool, context] }
           define_method(:teardown) { |pool| @calls << [:teardown, pool] }
         end
-        sys = new_system
-        sys.declare('db.url', String) { 'sqlite://' }
-        sys.declare('db.pool', String)
-        sys.component!('db.pool', ['db.url'], pool_provider)
-        sys.start!(:ctx)
-        sys.teardown!
+        comp = new_component
+        comp.declare('db.url', String) { 'sqlite://' }
+        comp.declare('db.pool', String)
+        comp.component!('db.pool', ['db.url'], pool_provider)
+        comp.start!(:ctx)
+        comp.teardown!
 
         expect(calls).to eq([
           [:prepare, 'db.pool'],
@@ -345,10 +345,10 @@ RSpec.describe Sourced::System do
         provider = Object.new
         provider.define_singleton_method(:call) { 'value' }
         provider.define_singleton_method(:teardown) { |value| calls << [:teardown, value] }
-        sys = new_system.declare('a', String)
-        sys.component!('a', provider)
-        sys.start!
-        sys.teardown!
+        comp = new_component.declare('a', String)
+        comp.component!('a', provider)
+        comp.start!
+        comp.teardown!
 
         expect(calls).to eq([[:teardown, 'value']])
       end
@@ -358,70 +358,70 @@ RSpec.describe Sourced::System do
         provider = Object.new
         provider.define_singleton_method(:call) { 'fresh' }
         provider.define_singleton_method(:start) { |value, _context| calls << [:start, value] }
-        sys = new_system.declare('a', String)
-        sys.component('a', provider)
-        sys.start!
+        comp = new_component.declare('a', String)
+        comp.component('a', provider)
+        comp.start!
 
         expect(calls).to eq([[:start, nil]])
-        expect(sys['a']).to eq('fresh')
+        expect(comp['a']).to eq('fresh')
       end
 
       it 'raises if #builder_for returns something that is not callable' do
         provider = Class.new { def self.builder_for(_node) = Object.new }
-        sys = new_system.declare('a')
+        comp = new_component.declare('a')
 
-        expect { sys.component!('a', provider) }.to raise_error(ArgumentError, /a: .+\.builder_for must return a callable/)
+        expect { comp.component!('a', provider) }.to raise_error(ArgumentError, /a: .+\.builder_for must return a callable/)
       end
 
       it 'accepts ENV providers' do
         previous = ENV['SYS_TEST_NAME']
         ENV['SYS_TEST_NAME'] = 'Joe'
-        sys = new_system
-        sys.declare('name', String)
-        sys.declare('all', Plumb::Types::Hash[SYS_TEST_NAME: String])
-        sys.component!('name', described_class::ENVProvider.new('SYS_TEST_NAME'))
-        sys.component!('all', described_class::ENVProvider) # all variables
-        sys.build!
+        comp = new_component
+        comp.declare('name', String)
+        comp.declare('all', Plumb::Types::Hash[SYS_TEST_NAME: String])
+        comp.component!('name', described_class::ENVProvider.new('SYS_TEST_NAME'))
+        comp.component!('all', described_class::ENVProvider) # all variables
+        comp.build!
 
-        expect(sys['name']).to eq('Joe')
-        expect(sys['all']).to eq(SYS_TEST_NAME: 'Joe')
+        expect(comp['name']).to eq('Joe')
+        expect(comp['all']).to eq(SYS_TEST_NAME: 'Joe')
       ensure
         previous.nil? ? ENV.delete('SYS_TEST_NAME') : ENV['SYS_TEST_NAME'] = previous
       end
 
       it 'checks ENV providers against the node type' do
-        sys = new_system.declare('name', String)
+        comp = new_component.declare('name', String)
 
-        expect { sys.component!('name', described_class::ENVProvider.new(/^USER_/)) }.to raise_error(ArgumentError, /doesn't take one/)
-        expect(sys.node('name').implementation).to be_nil
+        expect { comp.component!('name', described_class::ENVProvider.new(/^USER_/)) }.to raise_error(ArgumentError, /doesn't take one/)
+        expect(comp.node('name').implementation).to be_nil
       end
 
       it 'parses provided values through the declared type' do
-        sys = new_system.declare('n', Integer)
-        sys.component!('n', -> { 'nope' })
+        comp = new_component.declare('n', Integer)
+        comp.component!('n', -> { 'nope' })
 
-        expect { sys.build! }.to raise_error(Plumb::ParseError, 'n: Must be a Integer')
+        expect { comp.build! }.to raise_error(Plumb::ParseError, 'n: Must be a Integer')
       end
 
       it 'raises for providers that are not callable' do
-        sys = new_system.declare('a')
+        comp = new_component.declare('a')
 
-        expect { sys.component!('a', Object.new) }.to raise_error(ArgumentError, /a: a provider must respond to #call or #builder_for/)
-        expect { sys.component!('a', 'b') }.to raise_error(ArgumentError, /a provider must respond/)
+        expect { comp.component!('a', Object.new) }.to raise_error(ArgumentError, /a: a provider must respond to #call or #builder_for/)
+        expect { comp.component!('a', 'b') }.to raise_error(ArgumentError, /a provider must respond/)
       end
 
       it 'raises when given both a provider and a block, or deps that are not an array' do
-        sys = new_system.declare('a')
+        comp = new_component.declare('a')
 
-        expect { sys.component!('a', -> { 1 }) { build { 2 } } }.to raise_error(ArgumentError, /either a provider or a block/)
-        expect { sys.component!('a', ['b'], -> { 1 }) { build { 2 } } }.to raise_error(ArgumentError, /either a provider or a block/)
-        expect { sys.component!('a', 'b', -> { 1 }) }.to raise_error(ArgumentError, /deps must be an Array/)
+        expect { comp.component!('a', -> { 1 }) { build { 2 } } }.to raise_error(ArgumentError, /either a provider or a block/)
+        expect { comp.component!('a', ['b'], -> { 1 }) { build { 2 } } }.to raise_error(ArgumentError, /either a provider or a block/)
+        expect { comp.component!('a', 'b', -> { 1 }) }.to raise_error(ArgumentError, /deps must be an Array/)
       end
     end
 
     it 'raises for unknown implementation modes' do
       expect {
-        described_class::Implementation.new([], implementer: new_system, mode: :lazy, hooks: {})
+        described_class::Implementation.new([], implementer: new_component, mode: :lazy, hooks: {})
       }.to raise_error(ArgumentError, /unknown mode/)
     end
   end
@@ -429,33 +429,33 @@ RSpec.describe Sourced::System do
   describe '#config! and #config' do
     it 'implements singletons with only a build step' do
       builds = 0
-      sys = new_system
-      sys.declare('foo.bar', Integer)
-      sys.config!('foo.bar') { builds += 1; 10 }
-      sys.build!
+      comp = new_component
+      comp.declare('foo.bar', Integer)
+      comp.config!('foo.bar') { builds += 1; 10 }
+      comp.build!
 
-      expect(sys.node('foo.bar').implementation.mode).to eq(:singleton)
-      expect(sys['foo.bar']).to eq(10)
-      expect(sys['foo.bar']).to eq(10)
+      expect(comp.node('foo.bar').implementation.mode).to eq(:singleton)
+      expect(comp['foo.bar']).to eq(10)
+      expect(comp['foo.bar']).to eq(10)
       expect(builds).to eq(1)
     end
 
     it 'implements dynamic components with only a build step' do
       counter = 0
-      sys = new_system
-      sys.declare('counter', Integer)
-      sys.config('counter') { counter += 1 }
-      sys.build!
+      comp = new_component
+      comp.declare('counter', Integer)
+      comp.config('counter') { counter += 1 }
+      comp.build!
 
-      expect(sys.node('counter').implementation.mode).to eq(:dynamic)
-      expect(sys['counter']).to eq(1)
-      expect(sys['counter']).to eq(2)
+      expect(comp.node('counter').implementation.mode).to eq(:dynamic)
+      expect(comp['counter']).to eq(1)
+      expect(comp['counter']).to eq(2)
     end
 
-    it 'passes dependency values to the block, relative to the implementing system' do
-      lib = new_system
+    it 'passes dependency values to the block, relative to the implementing component' do
+      lib = new_component
       lib.declare('db', String) { 'lib db' }
-      app = new_system
+      app = new_component
       app.mount('sourced', lib)
       app.declare('with.deps', String)
       app.declare('dynamic', String)
@@ -468,48 +468,48 @@ RSpec.describe Sourced::System do
     end
 
     it 'runs no other hooks' do
-      sys = new_system
-      sys.declare('a', Integer)
-      sys.config!('a') { 1 }
-      sys.start!
-      sys.teardown!
+      comp = new_component
+      comp.declare('a', Integer)
+      comp.config!('a') { 1 }
+      comp.start!
+      comp.teardown!
 
-      expect(sys.node('a').status).to eq(:toredown)
-      expect(sys['a']).to eq(1)
+      expect(comp.node('a').status).to eq(:toredown)
+      expect(comp['a']).to eq(1)
     end
 
     it 'parses values through the declared type' do
-      sys = new_system
-      sys.declare('a', Integer)
-      sys.config!('a') { 'nope' }
+      comp = new_component
+      comp.declare('a', Integer)
+      comp.config!('a') { 'nope' }
 
-      expect { sys.build! }.to raise_error(Plumb::ParseError, 'a: Must be a Integer')
+      expect { comp.build! }.to raise_error(Plumb::ParseError, 'a: Must be a Integer')
     end
 
     it 'replaces previous implementations' do
-      sys = new_system
-      sys.declare('a', Integer) { 1 }
-      sys.config!('a') { 2 }
-      sys.build!
+      comp = new_component
+      comp.declare('a', Integer) { 1 }
+      comp.config!('a') { 2 }
+      comp.build!
 
-      expect(sys['a']).to eq(2)
+      expect(comp['a']).to eq(2)
     end
 
     it 'requires a block' do
-      sys = new_system
-      sys.declare('a')
+      comp = new_component
+      comp.declare('a')
 
-      expect { sys.config!('a') }.to raise_error(ArgumentError, /needs a block/)
-      expect { sys.config('a') }.to raise_error(ArgumentError, /needs a block/)
+      expect { comp.config!('a') }.to raise_error(ArgumentError, /needs a block/)
+      expect { comp.config('a') }.to raise_error(ArgumentError, /needs a block/)
     end
 
-    it 'raises for undeclared keys and locked systems' do
-      sys = new_system
+    it 'raises for undeclared keys and locked components' do
+      comp = new_component
 
-      expect { sys.config!('nope') { 1 } }.to raise_error(described_class::UndeclaredComponentError)
-      sys.declare('a') { 1 }
-      sys.prepare!
-      expect { sys.config('a') { 2 } }.to raise_error(described_class::LockedSystemError)
+      expect { comp.config!('nope') { 1 } }.to raise_error(described_class::UndeclaredComponentError)
+      comp.declare('a') { 1 }
+      comp.prepare!
+      expect { comp.config('a') { 2 } }.to raise_error(described_class::LockedComponentError)
     end
   end
 
@@ -525,9 +525,9 @@ RSpec.describe Sourced::System do
       previous.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
     end
 
-    def build(sys)
-      sys.build!
-      sys
+    def build(comp)
+      comp.build!
+      comp
     end
 
     def env_error = described_class::ENVProvider::Error
@@ -535,23 +535,23 @@ RSpec.describe Sourced::System do
     describe 'single variables' do
       it 'decodes a variable into the declared type' do
         with_env('USER_EMAIL' => 'me@example.com', 'APP_PORT' => '3000') do
-          sys = new_system.declare('user.email', Plumb::Types::Email).declare('app.port', Integer)
-          expect(sys.env('USER_EMAIL' => 'user.email', 'APP_PORT' => 'app.port')).to be(sys)
+          comp = new_component.declare('user.email', Plumb::Types::Email).declare('app.port', Integer)
+          expect(comp.env('USER_EMAIL' => 'user.email', 'APP_PORT' => 'app.port')).to be(comp)
 
-          expect(build(sys)['user.email']).to eq('me@example.com')
-          expect(sys['app.port']).to eq(3000)
+          expect(build(comp)['user.email']).to eq('me@example.com')
+          expect(comp['app.port']).to eq(3000)
         end
       end
 
       it 'names the variable when it is missing or invalid, without its value' do
         with_env('USER_EMAIL' => nil) do
-          sys = new_system.declare('user.email', Plumb::Types::Email).env('USER_EMAIL' => 'user.email')
-          expect { sys.build! }.to raise_error(env_error, 'invalid ENV for user.email: USER_EMAIL is missing')
+          comp = new_component.declare('user.email', Plumb::Types::Email).env('USER_EMAIL' => 'user.email')
+          expect { comp.build! }.to raise_error(env_error, 'invalid ENV for user.email: USER_EMAIL is missing')
         end
 
         with_env('USER_EMAIL' => 'secret-nope') do
-          sys = new_system.declare('user.email', Plumb::Types::Email).env('USER_EMAIL' => 'user.email')
-          expect { sys.build! }.to raise_error(Plumb::ParseError) { |e|
+          comp = new_component.declare('user.email', Plumb::Types::Email).env('USER_EMAIL' => 'user.email')
+          expect { comp.build! }.to raise_error(Plumb::ParseError) { |e|
             expect(e).to be_a(env_error)
             expect(e.message).to start_with('invalid ENV for user.email: USER_EMAIL is invalid: Must match')
             expect(e.message).not_to include('secret-nope')
@@ -561,58 +561,58 @@ RSpec.describe Sourced::System do
 
       it 'allows missing variables for nullable types' do
         with_env('USER_EMAIL' => nil) do
-          sys = new_system.declare('user.email', Plumb::Types::Email.nullable).env('USER_EMAIL' => 'user.email')
-          expect(build(sys)['user.email']).to be_nil
+          comp = new_component.declare('user.email', Plumb::Types::Email.nullable).env('USER_EMAIL' => 'user.email')
+          expect(build(comp)['user.email']).to be_nil
         end
       end
 
       it "doesn't allow modifiers" do
-        sys = new_system.declare('user.email')
-        expect { sys.env(:downcase, 'USER_EMAIL' => 'user.email') }.to raise_error(ArgumentError, /only be used when collecting variables with a regex/)
-        expect(sys.node('user.email').implementation).to be_nil
+        comp = new_component.declare('user.email')
+        expect { comp.env(:downcase, 'USER_EMAIL' => 'user.email') }.to raise_error(ArgumentError, /only be used when collecting variables with a regex/)
+        expect(comp.node('user.email').implementation).to be_nil
       end
     end
 
     describe 'collecting variables with a regex' do
       it 'collects matching variables into a hash, removing the match, and decodes it' do
         with_env('NAME' => 'root', 'USER_NAME' => 'Ismael', 'USER_DOB' => '1977-11-29') do
-          sys = new_system.declare('user.info', Plumb::Types::Hash[NAME: String, DOB: Date])
-          sys.env(/^USER_/ => 'user.info')
+          comp = new_component.declare('user.info', Plumb::Types::Hash[NAME: String, DOB: Date])
+          comp.env(/^USER_/ => 'user.info')
 
-          expect(build(sys)['user.info']).to eq(NAME: 'Ismael', DOB: Date.new(1977, 11, 29))
+          expect(build(comp)['user.info']).to eq(NAME: 'Ismael', DOB: Date.new(1977, 11, 29))
         end
       end
 
       it 'decodes names into the keys the type expects: symbols for schemas and symbol maps, strings for string maps' do
         with_env('APP_HOST' => 'localhost', 'APP_PORT' => '3000') do
-          sys = new_system
-          sys.declare('strings', Plumb::Types::Hash[String, String])
-          sys.declare('symbols', Plumb::Types::Hash[Symbol, String])
-          sys.declare('schema', Plumb::Types::Hash['HOST' => String, 'PORT' => Integer])
+          comp = new_component
+          comp.declare('strings', Plumb::Types::Hash[String, String])
+          comp.declare('symbols', Plumb::Types::Hash[Symbol, String])
+          comp.declare('schema', Plumb::Types::Hash['HOST' => String, 'PORT' => Integer])
           # separate calls: the same regex twice in one hash literal would be one key
-          %w[strings symbols schema].each { |key| sys.env(/^APP_/ => key) }
-          sys.build!
+          %w[strings symbols schema].each { |key| comp.env(/^APP_/ => key) }
+          comp.build!
 
-          expect(sys['strings']).to include('HOST' => 'localhost', 'PORT' => '3000')
-          expect(sys['symbols']).to include(HOST: 'localhost', PORT: '3000')
-          expect(sys['schema']).to eq('HOST' => 'localhost', 'PORT' => 3000)
+          expect(comp['strings']).to include('HOST' => 'localhost', 'PORT' => '3000')
+          expect(comp['symbols']).to include(HOST: 'localhost', PORT: '3000')
+          expect(comp['schema']).to eq('HOST' => 'localhost', 'PORT' => 3000)
         end
       end
 
       it 'applies modifiers to collected names' do
         with_env('USER_NAME' => 'Ismael', 'USER_DOB' => '1977-11-29') do
-          sys = new_system.declare('user.info', user).env(:downcase, /^USER_/ => 'user.info')
+          comp = new_component.declare('user.info', user).env(:downcase, /^USER_/ => 'user.info')
 
-          expect(build(sys)['user.info']).to be_a(user).and have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
+          expect(build(comp)['user.info']).to be_a(user).and have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
         end
       end
 
       it 'names invalid variables, and missing attributes, hinting at modifiers' do
         with_env('USER_NAME' => 'Ismael', 'USER_DOB' => 'not-a-date', 'USER_EMAIL' => nil) do
           type = Plumb::Types::Data[name: String, dob: Date, email: String]
-          sys = new_system.declare('user.info', type).env(:downcase, /^USER_/ => 'user.info')
+          comp = new_component.declare('user.info', type).env(:downcase, /^USER_/ => 'user.info')
 
-          expect { sys.build! }.to raise_error(env_error, <<~MSG.chomp)
+          expect { comp.build! }.to raise_error(env_error, <<~MSG.chomp)
             invalid ENV for user.info:
               USER_DOB is invalid: Must match /\\A\\d{4}-\\d{2}-\\d{2}\\z/
               email is missing from ENV variables matching /^USER_/
@@ -620,9 +620,9 @@ RSpec.describe Sourced::System do
         end
 
         with_env('USER_NAME' => 'Ismael', 'USER_DOB' => '1977-11-29') do
-          sys = new_system.declare('user.info', user).env(/^USER_/ => 'user.info')
+          comp = new_component.declare('user.info', user).env(/^USER_/ => 'user.info')
 
-          expect { sys.build! }.to raise_error(
+          expect { comp.build! }.to raise_error(
             env_error, /name is missing from ENV variables matching \/\^USER_\/ \(found USER_NAME, try :downcase\)/
           )
         end
@@ -642,32 +642,32 @@ RSpec.describe Sourced::System do
           Plumb::Types::String | Plumb::Types::Hash
         ]
         takes_hash.each do |type|
-          sys = new_system.declare('user.info', type)
-          expect { sys.env(/^USER_/ => 'user.info') }.not_to raise_error, "expected #{type.inspect} to be accepted"
+          comp = new_component.declare('user.info', type)
+          expect { comp.env(/^USER_/ => 'user.info') }.not_to raise_error, "expected #{type.inspect} to be accepted"
         end
 
         [Plumb::Types::String, Plumb::Types::Email, Integer, Plumb::Types::Array[String], Plumb::Types::String.nullable].each do |type|
-          sys = new_system.declare('user.info', type)
-          expect { sys.env(/^USER_/ => 'user.info') }.to raise_error(
+          comp = new_component.declare('user.info', type)
+          expect { comp.env(/^USER_/ => 'user.info') }.to raise_error(
             ArgumentError, /user.info: ENV variables matching \/\^USER_\/ are collected into a hash, but .+ doesn't take one/
           ), "expected #{type.inspect} to be rejected"
-          expect(sys.node('user.info').implementation).to be_nil
+          expect(comp.node('user.info').implementation).to be_nil
         end
       end
 
       it 'checks types when collecting all variables, and with a provider directly' do
-        sys = new_system.declare('user.email', String)
+        comp = new_component.declare('user.email', String)
 
-        expect { sys.env('user.email') }.to raise_error(ArgumentError, /doesn't take one/)
-        expect { described_class::ENVProvider.new(/^USER_/).check!(sys.node('user.email')) }.to raise_error(ArgumentError, /doesn't take one/)
-        expect { sys.env('USER_EMAIL' => 'user.email') }.not_to raise_error # single variables take any type
+        expect { comp.env('user.email') }.to raise_error(ArgumentError, /doesn't take one/)
+        expect { described_class::ENVProvider.new(/^USER_/).check!(comp.node('user.email')) }.to raise_error(ArgumentError, /doesn't take one/)
+        expect { comp.env('USER_EMAIL' => 'user.email') }.not_to raise_error # single variables take any type
       end
 
       it 'supports optional attributes and defaults' do
         with_env('USER_NAME' => 'Ismael', 'USER_DOB' => nil) do
-          optional = new_system.declare('user.info', Plumb::Types::Data[name: String, dob?: Date])
+          optional = new_component.declare('user.info', Plumb::Types::Data[name: String, dob?: Date])
           optional.env(:downcase, /^USER_/ => 'user.info')
-          defaulted = new_system.declare('user.info', Plumb::Types::Data[name: String, dob: Plumb::Types::Date.default(Date.new(2000, 1, 1).freeze)])
+          defaulted = new_component.declare('user.info', Plumb::Types::Data[name: String, dob: Plumb::Types::Date.default(Date.new(2000, 1, 1).freeze)])
           defaulted.env(:downcase, /^USER_/ => 'user.info')
 
           expect(build(optional)['user.info']).to have_attributes(name: 'Ismael', dob: nil)
@@ -676,24 +676,24 @@ RSpec.describe Sourced::System do
       end
 
       it 'rejects unknown modifiers' do
-        expect { new_system.declare('a').env(:upcase, /^A_/ => 'a') }.to raise_error(ArgumentError, /unknown ENV modifiers: upcase/)
+        expect { new_component.declare('a').env(:upcase, /^A_/ => 'a') }.to raise_error(ArgumentError, /unknown ENV modifiers: upcase/)
       end
     end
 
     describe 'collecting all variables' do
       it 'collects every variable when given only a component key' do
         with_env('NAME' => 'Ismael', 'DOB' => '1977-11-29') do
-          sys = new_system.declare('user.info', Plumb::Types::Hash[NAME: String, DOB: Date]).env('user.info')
+          comp = new_component.declare('user.info', Plumb::Types::Hash[NAME: String, DOB: Date]).env('user.info')
 
-          expect(build(sys)['user.info']).to eq(NAME: 'Ismael', DOB: Date.new(1977, 11, 29))
+          expect(build(comp)['user.info']).to eq(NAME: 'Ismael', DOB: Date.new(1977, 11, 29))
         end
       end
 
       it 'applies modifiers' do
         with_env('NAME' => 'Ismael', 'DOB' => '1977-11-29') do
-          sys = new_system.declare('user.info', user).env(:downcase, 'user.info')
+          comp = new_component.declare('user.info', user).env(:downcase, 'user.info')
 
-          expect(build(sys)['user.info']).to have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
+          expect(build(comp)['user.info']).to have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
         end
       end
 
@@ -704,74 +704,74 @@ RSpec.describe Sourced::System do
 
     it 'reads raw strings into untyped (Any) components' do
       with_env('USER_EMAIL' => 'me@example.com', 'USER_NAME' => 'Ismael') do
-        sys = new_system.declare('user.email').declare('user.info')
-        sys.env('USER_EMAIL' => 'user.email', /^USER_/ => 'user.info')
-        sys.build!
+        comp = new_component.declare('user.email').declare('user.info')
+        comp.env('USER_EMAIL' => 'user.email', /^USER_/ => 'user.info')
+        comp.build!
 
-        expect(sys['user.email']).to eq('me@example.com')
-        expect(sys['user.info']).to include('NAME' => 'Ismael', 'EMAIL' => 'me@example.com')
+        expect(comp['user.email']).to eq('me@example.com')
+        expect(comp['user.info']).to include('NAME' => 'Ismael', 'EMAIL' => 'me@example.com')
       end
     end
 
     it 'reads ENV when components are built, not when they are implemented' do
-      sys = new_system.declare('user.email', String).env('USER_EMAIL' => 'user.email')
+      comp = new_component.declare('user.email', String).env('USER_EMAIL' => 'user.email')
 
       with_env('USER_EMAIL' => 'later@example.com') do
-        expect(build(sys)['user.email']).to eq('later@example.com')
+        expect(build(comp)['user.email']).to eq('later@example.com')
       end
     end
 
     it 'implements singleton components, replacing previous implementations' do
       with_env('USER_EMAIL' => 'me@example.com') do
-        sys = new_system.declare('user.email', String) { 'default' }
-        sys.env('USER_EMAIL' => 'user.email')
+        comp = new_component.declare('user.email', String) { 'default' }
+        comp.env('USER_EMAIL' => 'user.email')
 
-        expect(sys.node('user.email').implementation).to have_attributes(mode: :singleton, implementer: sys, deps: [])
-        expect(build(sys)['user.email']).to eq('me@example.com')
+        expect(comp.node('user.email').implementation).to have_attributes(mode: :singleton, implementer: comp, deps: [])
+        expect(build(comp)['user.email']).to eq('me@example.com')
       end
     end
 
     it 'validates every source, key and type before implementing any' do
-      sys = new_system.declare('a').declare('b', String)
+      comp = new_component.declare('a').declare('b', String)
 
-      expect { sys.env('A' => 'a', 42 => 'b') }.to raise_error(ArgumentError, /must be a variable name or a regex/)
-      expect { sys.env('A' => 'a', /^B_/ => 'b') }.to raise_error(ArgumentError, /doesn't take one/)
-      expect { sys.env('A' => 'a', 'B' => 'nope') }.to raise_error(described_class::UndeclaredComponentError)
-      expect { sys.env }.to raise_error(ArgumentError, /needs a component key/)
-      expect(sys.node('a').implementation).to be_nil
+      expect { comp.env('A' => 'a', 42 => 'b') }.to raise_error(ArgumentError, /must be a variable name or a regex/)
+      expect { comp.env('A' => 'a', /^B_/ => 'b') }.to raise_error(ArgumentError, /doesn't take one/)
+      expect { comp.env('A' => 'a', 'B' => 'nope') }.to raise_error(described_class::UndeclaredComponentError)
+      expect { comp.env }.to raise_error(ArgumentError, /needs a component key/)
+      expect(comp.node('a').implementation).to be_nil
     end
 
-    it "can't implement components in a locked system" do
-      sys = new_system.declare('a') { 1 }
-      sys.prepare!
+    it "can't implement components in a locked component" do
+      comp = new_component.declare('a') { 1 }
+      comp.prepare!
 
-      expect { sys.env('A' => 'a') }.to raise_error(described_class::LockedSystemError)
+      expect { comp.env('A' => 'a') }.to raise_error(described_class::LockedComponentError)
     end
 
-    it 'takes keys relative to the system' do
+    it 'takes keys relative to the component' do
       with_env('DB_URL' => 'sqlite://') do
-        sys = new_system.declare('sourced.db.url', String)
-        sys.node('sourced').env('DB_URL' => 'db.url')
+        comp = new_component.declare('sourced.db.url', String)
+        comp.node('sourced').env('DB_URL' => 'db.url')
 
-        expect(sys.node('sourced.db.url').implementation.implementer).to be(sys.node('sourced'))
-        expect(build(sys)['sourced.db.url']).to eq('sqlite://')
+        expect(comp.node('sourced.db.url').implementation.implementer).to be(comp.node('sourced'))
+        expect(build(comp)['sourced.db.url']).to eq('sqlite://')
       end
     end
 
-    it 'names the full path of components in mounted systems, even if implemented before mounting' do
+    it 'names the full path of components in mounted components, even if implemented before mounting' do
       with_env('DB_PORT' => 'nope') do
-        lib = new_system.declare('db.port', Integer).env('DB_PORT' => 'db.port')
-        app = new_system
+        lib = new_component.declare('db.port', Integer).env('DB_PORT' => 'db.port')
+        app = new_component
         app.mount('sourced', lib)
 
         expect { app.build! }.to raise_error(env_error, /\Ainvalid ENV for sourced\.db\.port: DB_PORT is invalid/)
       end
     end
 
-    it 'lets an app implement components of a mounted system from ENV' do
+    it 'lets an app implement components of a mounted component from ENV' do
       with_env('DB_PORT' => '5432') do
-        lib = new_system.declare('db.port', Integer) { 3306 }
-        app = new_system
+        lib = new_component.declare('db.port', Integer) { 3306 }
+        app = new_component
         app.mount('sourced', lib)
         app.env('DB_PORT' => 'sourced.db.port')
 
@@ -781,14 +781,14 @@ RSpec.describe Sourced::System do
     end
 
     it 'shows sources and modifiers when inspecting' do
-      expect(described_class::ENVProvider.new('USER_EMAIL').inspect).to eq('#<Sourced::System::ENVProvider "USER_EMAIL">')
-      expect(described_class::ENVProvider.new(/^USER_/, :downcase).inspect).to eq('#<Sourced::System::ENVProvider /^USER_/ downcase>')
+      expect(described_class::ENVProvider.new('USER_EMAIL').inspect).to eq('#<Sourced::Component::ENVProvider "USER_EMAIL">')
+      expect(described_class::ENVProvider.new(/^USER_/, :downcase).inspect).to eq('#<Sourced::Component::ENVProvider /^USER_/ downcase>')
     end
   end
 
   describe '#inject' do
-    def injectable_system
-      new_system.tap do |s|
+    def injectable_component
+      new_component.tap do |s|
         s.declare('logger') { 'the logger' }
         s.declare('sourced.store') { 'the store' }
         counter = 0
@@ -797,10 +797,10 @@ RSpec.describe Sourced::System do
       end
     end
 
-    it 'injects components as kwargs with readers, defaulting to system values' do
-      sys = injectable_system
-      sys.build!
-      klass = Class.new { include sys.inject('logger') }
+    it 'injects components as kwargs with readers, defaulting to component values' do
+      comp = injectable_component
+      comp.build!
+      klass = Class.new { include comp.inject('logger') }
 
       expect(klass.new.logger).to eq('the logger')
       expect(klass.new(logger: 'custom').logger).to eq('custom')
@@ -808,9 +808,9 @@ RSpec.describe Sourced::System do
     end
 
     it 'names kwargs after the last segment of dotted keys, and takes multiple keys' do
-      sys = injectable_system
-      sys.build!
-      klass = Class.new { include sys.inject('logger', 'sourced.store') }
+      comp = injectable_component
+      comp.build!
+      klass = Class.new { include comp.inject('logger', 'sourced.store') }
       obj = klass.new(store: 'custom store')
 
       expect(obj.logger).to eq('the logger')
@@ -818,9 +818,9 @@ RSpec.describe Sourced::System do
     end
 
     it 'aliases keys to custom kwargs with a hash' do
-      sys = injectable_system
-      sys.build!
-      klass = Class.new { include sys.inject('logger', 'sourced.store' => 'st') }
+      comp = injectable_component
+      comp.build!
+      klass = Class.new { include comp.inject('logger', 'sourced.store' => 'st') }
 
       expect(klass.new.st).to eq('the store')
       expect(klass.new(st: 'custom').st).to eq('custom')
@@ -828,11 +828,11 @@ RSpec.describe Sourced::System do
     end
 
     it "composes multiple injections with the class' own #initialize" do
-      sys = injectable_system
-      sys.build!
+      comp = injectable_component
+      comp.build!
       klass = Class.new do
-        include sys.inject('logger')
-        include sys.inject('sourced.store')
+        include comp.inject('logger')
+        include comp.inject('sourced.store')
         attr_reader :args
 
         def initialize(name, age: 1)
@@ -847,40 +847,40 @@ RSpec.describe Sourced::System do
     end
 
     it 'is inherited by subclasses' do
-      sys = injectable_system
-      sys.build!
-      parent = Class.new { include sys.inject('logger') }
-      child = Class.new(parent) { include sys.inject('sourced.store') }
+      comp = injectable_component
+      comp.build!
+      parent = Class.new { include comp.inject('logger') }
+      child = Class.new(parent) { include comp.inject('sourced.store') }
       obj = child.new(logger: 'custom')
 
       expect(obj.logger).to eq('custom')
       expect(obj.store).to eq('the store')
     end
 
-    it 'reads values on instantiation, so classes can be defined before the system is built' do
-      sys = injectable_system
-      klass = Class.new { include sys.inject('counter') }
+    it 'reads values on instantiation, so classes can be defined before the component is built' do
+      comp = injectable_component
+      klass = Class.new { include comp.inject('counter') }
       expect { klass.new }.to raise_error(described_class::NotBuiltError)
 
-      sys.build!
+      comp.build!
       expect(klass.new.counter).to eq(1)
       expect(klass.new.counter).to eq(2)
     end
 
-    it 'injects by keys relative to the system' do
-      sys = injectable_system
-      sys.build!
-      klass = Class.new { include sys.node('sourced').inject('store') }
+    it 'injects by keys relative to the component' do
+      comp = injectable_component
+      comp.build!
+      klass = Class.new { include comp.node('sourced').inject('store') }
 
       expect(klass.new.store).to eq('the store')
     end
 
-    it "gives classes injecting from a library's system the overrides of the app that mounts it" do
-      lib = new_system
+    it "gives classes injecting from a library's component the overrides of the app that mounts it" do
+      lib = new_component
       lib.declare('store', String) { 'lib store' }
       klass = Class.new { include lib.inject('store') } # defined before the library is mounted
 
-      app = new_system
+      app = new_component
       app.mount('sourced', lib)
       app.config!('sourced.store') { 'app store' }
 
@@ -890,33 +890,33 @@ RSpec.describe Sourced::System do
     end
 
     it 'describes the injection' do
-      sys = injectable_system
+      comp = injectable_component
 
-      expect(sys.inject('logger', 'sourced.store' => 'st').inspect)
-        .to eq('#<Sourced::System::Injector logger => logger, sourced.store => st>')
+      expect(comp.inject('logger', 'sourced.store' => 'st').inspect)
+        .to eq('#<Sourced::Component::Injector logger => logger, sourced.store => st>')
     end
 
     it 'raises on undeclared components' do
-      sys = injectable_system
+      comp = injectable_component
 
-      expect { sys.inject('nope') }.to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
+      expect { comp.inject('nope') }.to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
     end
 
     it 'raises on duplicate names' do
-      sys = injectable_system
-      sys.declare('other.logger')
-      expect { sys.inject('logger', 'other.logger') }.to raise_error(ArgumentError, /duplicate injected names: logger/)
+      comp = injectable_component
+      comp.declare('other.logger')
+      expect { comp.inject('logger', 'other.logger') }.to raise_error(ArgumentError, /duplicate injected names: logger/)
 
-      klass = Class.new { include sys.inject('logger') }
-      expect { klass.include(sys.inject('other.logger')) }.to raise_error(ArgumentError, /already injects logger/)
+      klass = Class.new { include comp.inject('logger') }
+      expect { klass.include(comp.inject('other.logger')) }.to raise_error(ArgumentError, /already injects logger/)
     end
   end
 
   describe '#mount' do
-    it 'attaches a standalone system as a branch, indexing its nodes' do
-      lib = new_system
+    it 'attaches a standalone component as a branch, indexing its nodes' do
+      lib = new_component
       lib.declare('db', String) { 'db' }
-      app = new_system
+      app = new_component
       app.mount('sourced', lib)
 
       expect(lib.parent).to be(app)
@@ -929,9 +929,9 @@ RSpec.describe Sourced::System do
     end
 
     it 'mounts under dotted keys, creating namespaces' do
-      lib = new_system
+      lib = new_component
       lib.declare('db', String) { 'db' }
-      app = new_system
+      app = new_component
       app.mount('libs.sourced', lib)
       app.build!
 
@@ -941,11 +941,11 @@ RSpec.describe Sourced::System do
     end
 
     it 'mounts nested trees' do
-      inner = new_system
+      inner = new_component
       inner.declare('x', Integer) { 1 }
-      middle = new_system
+      middle = new_component
       middle.mount('inner', inner)
-      app = new_system
+      app = new_component
       app.mount('middle', middle)
       app.build!
 
@@ -955,11 +955,11 @@ RSpec.describe Sourced::System do
       expect(inner.path).to eq('middle.inner')
     end
 
-    it 'indexes nodes declared in mounted systems after mounting, in every ancestor' do
-      inner = new_system
-      middle = new_system
+    it 'indexes nodes declared in mounted components after mounting, in every ancestor' do
+      inner = new_component
+      middle = new_component
       middle.mount('inner', inner)
-      app = new_system
+      app = new_component
       app.mount('middle', middle)
       inner.declare('late', Integer) { 1 }
 
@@ -967,88 +967,88 @@ RSpec.describe Sourced::System do
       expect(middle.node('inner.late')).to be(inner.node('late'))
     end
 
-    it 'mounts anything that implements #to_system' do
-      lib_system = new_system.declare('db', String) { 'lib db' }
+    it 'mounts anything that implements #to_component' do
+      lib_component = new_component.declare('db', String) { 'lib db' }
       lib = Module.new
-      lib.define_singleton_method(:to_system) { lib_system }
+      lib.define_singleton_method(:to_component) { lib_component }
 
-      app = new_system
+      app = new_component
       expect(app.mount('sourced', lib)).to be(app)
       app.build!
 
-      expect(app.node('sourced')).to be(lib_system)
+      expect(app.node('sourced')).to be(lib_component)
       expect(app['sourced.db']).to eq('lib db')
     end
 
-    it 'is implemented by systems, returning themselves' do
-      sys = new_system
+    it 'is implemented by components, returning themselves' do
+      comp = new_component
 
-      expect(sys.to_system).to be(sys)
+      expect(comp.to_component).to be(comp)
     end
 
-    it 'raises if not given something that implements #to_system' do
-      expect { new_system.mount('x', Object.new) }.to raise_error(ArgumentError, /must respond to #to_system/)
+    it 'raises if not given something that implements #to_component' do
+      expect { new_component.mount('x', Object.new) }.to raise_error(ArgumentError, /must respond to #to_component/)
     end
 
-    it 'raises if #to_system does not return a System' do
+    it 'raises if #to_component does not return a Component' do
       fake = Object.new
-      fake.define_singleton_method(:to_system) { Object.new }
+      fake.define_singleton_method(:to_component) { Object.new }
 
-      expect { new_system.mount('x', fake) }.to raise_error(ArgumentError, /to_system must return a System/)
+      expect { new_component.mount('x', fake) }.to raise_error(ArgumentError, /to_component must return a Component/)
     end
 
-    it 'applies the same checks to the returned system' do
-      lib_system = new_system
-      new_system.mount('a', lib_system)
+    it 'applies the same checks to the returned component' do
+      lib_component = new_component
+      new_component.mount('a', lib_component)
       lib = Module.new
-      lib.define_singleton_method(:to_system) { lib_system }
+      lib.define_singleton_method(:to_component) { lib_component }
 
-      expect { new_system.mount('b', lib) }.to raise_error(described_class::SubsystemError, /already mounted/)
+      expect { new_component.mount('b', lib) }.to raise_error(described_class::SubcomponentError, /already mounted/)
     end
 
-    it 'raises if the system is already mounted' do
-      lib = new_system
-      new_system.mount('a', lib)
+    it 'raises if the component is already mounted' do
+      lib = new_component
+      new_component.mount('a', lib)
 
-      expect { new_system.mount('b', lib) }.to raise_error(described_class::SubsystemError, /already mounted/)
+      expect { new_component.mount('b', lib) }.to raise_error(described_class::SubcomponentError, /already mounted/)
     end
 
-    it 'raises when mounting a system into its own tree' do
-      app = new_system
-      lib = new_system
+    it 'raises when mounting a component into its own tree' do
+      app = new_component
+      lib = new_component
       app.mount('lib', lib)
 
-      expect { app.mount('self', app) }.to raise_error(described_class::SubsystemError, /own tree/)
-      expect { lib.mount('up', app) }.to raise_error(described_class::SubsystemError, /own tree/)
+      expect { app.mount('self', app) }.to raise_error(described_class::SubcomponentError, /own tree/)
+      expect { lib.mount('up', app) }.to raise_error(described_class::SubcomponentError, /own tree/)
     end
 
     it 'raises if the key is taken' do
-      app = new_system
+      app = new_component
       app.declare('a', String)
 
-      expect { app.mount('a', new_system) }.to raise_error(described_class::DeclarationOverrideError, /a is already declared/)
+      expect { app.mount('a', new_component) }.to raise_error(described_class::DeclarationOverrideError, /a is already declared/)
     end
 
-    it "raises if the key is under another system's nodes" do
-      lib = new_system
-      app = new_system
+    it "raises if the key is under another component's nodes" do
+      lib = new_component
+      app = new_component
       app.mount('sourced', lib)
 
-      expect { app.mount('sourced.other', new_system) }.to raise_error(described_class::OwnershipError)
+      expect { app.mount('sourced.other', new_component) }.to raise_error(described_class::OwnershipError)
     end
 
-    it 'raises if the mounted system is locked' do
-      lib = new_system
+    it 'raises if the mounted component is locked' do
+      lib = new_component
       lib.build!
 
-      expect { new_system.mount('lib', lib) }.to raise_error(described_class::LockedSystemError, /must be open/)
+      expect { new_component.mount('lib', lib) }.to raise_error(described_class::LockedComponentError, /must be open/)
     end
   end
 
   describe 'lifecycle' do
     it 'runs prepare, build, start and teardown hooks across the tree, in dependency order' do
       calls = []
-      lib = new_system
+      lib = new_component
       lib.declare('logger', String)
       lib.component!('logger') do
         prepare { calls << [:prepare, 'logger'] }
@@ -1057,7 +1057,7 @@ RSpec.describe Sourced::System do
         teardown { |value| calls << [:teardown, 'logger', value] }
       end
 
-      app = new_system
+      app = new_component
       app.declare('db', String)
       app.component!('db', ['sourced.logger']) do
         prepare { calls << [:prepare, 'db'] }
@@ -1083,73 +1083,73 @@ RSpec.describe Sourced::System do
     end
 
     it 'moves the root and every node through statuses' do
-      sys = new_system
-      sys.declare('a.b', Integer) { 1 }
-      node = sys.node('a.b')
+      comp = new_component
+      comp.declare('a.b', Integer) { 1 }
+      node = comp.node('a.b')
 
-      expect([sys.boot_status, node.status]).to eq(%i[open open])
-      sys.prepare!
-      expect([sys.boot_status, node.status]).to eq(%i[prepared prepared])
-      sys.build!
-      expect([sys.boot_status, node.status]).to eq(%i[built built])
-      sys.start!
-      expect([sys.boot_status, node.status]).to eq(%i[started started])
-      sys.teardown!
-      expect([sys.boot_status, node.status]).to eq(%i[toredown toredown])
-      expect(sys.node('a').status).to eq(:open) # namespaces are skipped
+      expect([comp.boot_status, node.status]).to eq(%i[open open])
+      comp.prepare!
+      expect([comp.boot_status, node.status]).to eq(%i[prepared prepared])
+      comp.build!
+      expect([comp.boot_status, node.status]).to eq(%i[built built])
+      comp.start!
+      expect([comp.boot_status, node.status]).to eq(%i[started started])
+      comp.teardown!
+      expect([comp.boot_status, node.status]).to eq(%i[toredown toredown])
+      expect(comp.node('a').status).to eq(:open) # namespaces are skipped
     end
 
     it 'defaults the start context to the current thread' do
       context = nil
-      sys = new_system
-      sys.declare('a')
-      sys.component!('a') { start { |_, ctx| context = ctx } }
-      sys.start!
+      comp = new_component
+      comp.declare('a')
+      comp.component!('a') { start { |_, ctx| context = ctx } }
+      comp.start!
 
       expect(context).to be(Thread.current)
     end
 
     it 'is idempotent' do
       builds = 0
-      sys = new_system
-      sys.declare('a', Integer)
-      sys.component!('a') { build { builds += 1 } }
+      comp = new_component
+      comp.declare('a', Integer)
+      comp.component!('a') { build { builds += 1 } }
 
-      sys.start!
-      sys.start!
-      sys.build!
-      sys.prepare!
+      comp.start!
+      comp.start!
+      comp.build!
+      comp.prepare!
 
       expect(builds).to eq(1)
     end
 
-    it 'only tears down a started system' do
+    it 'only tears down a started component' do
       torn = false
-      sys = new_system
-      sys.declare('a')
-      sys.component!('a') { teardown { torn = true } }
-      sys.build!
-      sys.teardown!
+      comp = new_component
+      comp.declare('a')
+      comp.component!('a') { teardown { torn = true } }
+      comp.build!
+      comp.teardown!
 
       expect(torn).to be(false)
-      expect(sys.boot_status).to eq(:built)
+      expect(comp.boot_status).to eq(:built)
     end
 
     it 'exposes nodes in dependency order once prepared' do
-      sys = new_system
-      sys.declare('b', Integer)
-      sys.declare('a', Integer) { 1 }
-      sys.component!('b', ['a']) { build { |a| a + 1 } }
+      comp = new_component
+      comp.declare('b', Integer)
+      comp.declare('a', Integer) { 1 }
+      comp.component!('b', ['a']) { build { |a| a + 1 } }
 
-      expect { sys.ordered_nodes }.to raise_error(described_class::NotBuiltError)
-      sys.prepare!
-      expect(sys.ordered_nodes.map(&:path)).to eq(%w[a b])
+      expect { comp.ordered_nodes }.to raise_error(described_class::NotBuiltError)
+      comp.prepare!
+      expect(comp.ordered_nodes.map(&:path)).to eq(%w[a b])
     end
 
     it 'includes the root when it is implemented' do
-      lib = new_system
+      lib = new_component
       lib.declare('x', Integer) { 1 }
-      app = new_system
+      app = new_component
       app.mount('lib', lib)
       app.component!('lib', ['lib.x']) { build { |x| x * 10 } }
       app.build!
@@ -1158,16 +1158,16 @@ RSpec.describe Sourced::System do
     end
 
     it 'parses built values through the declared type' do
-      sys = new_system
-      sys.declare('n', Integer) { 'nope' }
+      comp = new_component
+      comp.declare('n', Integer) { 'nope' }
 
-      expect { sys.build! }.to raise_error(Plumb::ParseError, 'n: Must be a Integer')
+      expect { comp.build! }.to raise_error(Plumb::ParseError, 'n: Must be a Integer')
     end
 
     it 'names the full path of the component in type errors' do
-      lib = new_system
+      lib = new_component
       lib.declare('db.port', Integer) { 'nope' }
-      app = new_system
+      app = new_component
       app.mount('libs.sourced', lib)
 
       expect { app.build! }.to raise_error(Plumb::ParseError, 'libs.sourced.db.port: Must be a Integer')
@@ -1175,10 +1175,10 @@ RSpec.describe Sourced::System do
     end
 
     it 'includes structured errors, without the value' do
-      sys = new_system
-      sys.declare('user', Plumb::Types::Hash[name: String, age: Integer]) { { name: 'Joe', age: 'secret' } }
+      comp = new_component
+      comp.declare('user', Plumb::Types::Hash[name: String, age: Integer]) { { name: 'Joe', age: 'secret' } }
 
-      expect { sys.build! }.to raise_error(Plumb::ParseError) { |e|
+      expect { comp.build! }.to raise_error(Plumb::ParseError) { |e|
         expect(e.message).to start_with('user: {')
         expect(e.message).to include('age')
         expect(e.message).not_to include('secret')
@@ -1186,49 +1186,49 @@ RSpec.describe Sourced::System do
     end
 
     it 'stores the parsed value' do
-      sys = new_system
-      sys.declare('port', Plumb::Types::Lax::Integer) { '3000' }
-      sys.build!
+      comp = new_component
+      comp.declare('port', Plumb::Types::Lax::Integer) { '3000' }
+      comp.build!
 
-      expect(sys['port']).to eq(3000)
+      expect(comp['port']).to eq(3000)
     end
 
     it 'locks the tree once prepared' do
-      lib = new_system
-      app = new_system
+      lib = new_component
+      app = new_component
       app.mount('lib', lib)
       app.prepare!
 
-      expect { app.declare('a') }.to raise_error(described_class::LockedSystemError)
-      expect { lib.declare('a') }.to raise_error(described_class::LockedSystemError)
-      expect { app.component!('lib') { build { 1 } } }.to raise_error(described_class::LockedSystemError)
-      expect { app.mount('other', new_system) }.to raise_error(described_class::LockedSystemError)
+      expect { app.declare('a') }.to raise_error(described_class::LockedComponentError)
+      expect { lib.declare('a') }.to raise_error(described_class::LockedComponentError)
+      expect { app.component!('lib') { build { 1 } } }.to raise_error(described_class::LockedComponentError)
+      expect { app.mount('other', new_component) }.to raise_error(described_class::LockedComponentError)
       expect(lib.locked?).to be(true)
     end
 
-    it 'raises when booting a mounted system' do
-      lib = new_system
-      new_system.mount('lib', lib)
+    it 'raises when booting a mounted component' do
+      lib = new_component
+      new_component.mount('lib', lib)
 
       %i[prepare! build! start! teardown! ordered_nodes].each do |method|
-        expect { lib.public_send(method) }.to raise_error(described_class::SubsystemError, /boot the root/)
+        expect { lib.public_send(method) }.to raise_error(described_class::SubcomponentError, /boot the root/)
       end
     end
 
     describe 'prepare! errors' do
       it 'raises for declared nodes without an implementation' do
-        sys = new_system
-        sys.declare('deep.thing', Integer)
-        sys.declare('other', Integer)
+        comp = new_component
+        comp.declare('deep.thing', Integer)
+        comp.declare('other', Integer)
 
-        expect { sys.prepare! }.to raise_error(described_class::UnimplementedComponentError, /deep\.thing, other/)
+        expect { comp.prepare! }.to raise_error(described_class::UnimplementedComponentError, /deep\.thing, other/)
       end
 
       it 'raises for missing deps, with full keys' do
-        lib = new_system
+        lib = new_component
         lib.declare('x', Integer)
         lib.component!('x', ['nope']) { build { 1 } }
-        app = new_system
+        app = new_component
         app.mount('libs.lib', lib)
 
         expect { app.prepare! }.to raise_error(
@@ -1238,19 +1238,19 @@ RSpec.describe Sourced::System do
       end
 
       it 'raises for deps on unimplemented namespaces' do
-        sys = new_system
-        sys.declare('ns.x', Integer) { 1 }
-        sys.declare('a', Integer)
-        sys.component!('a', ['ns']) { build { 1 } }
+        comp = new_component
+        comp.declare('ns.x', Integer) { 1 }
+        comp.declare('a', Integer)
+        comp.component!('a', ['ns']) { build { 1 } }
 
-        expect { sys.prepare! }.to raise_error(described_class::MissingDependencyError, /a depends on ns, which is not implemented/)
+        expect { comp.prepare! }.to raise_error(described_class::MissingDependencyError, /a depends on ns, which is not implemented/)
       end
 
       it "can't reach outside the implementer's tree" do
-        lib = new_system
+        lib = new_component
         lib.declare('x', Integer)
         lib.component!('x', ['logger']) { build { 1 } }
-        app = new_system
+        app = new_component
         app.declare('logger') { 'app logger' }
         app.mount('lib', lib)
 
@@ -1258,148 +1258,148 @@ RSpec.describe Sourced::System do
       end
 
       it 'raises for circular dependencies' do
-        sys = new_system
-        sys.declare('a', Integer)
-        sys.declare('b', Integer)
-        sys.component!('a', ['b']) { build { |b| b } }
-        sys.component!('b', ['a']) { build { |a| a } }
+        comp = new_component
+        comp.declare('a', Integer)
+        comp.declare('b', Integer)
+        comp.component!('a', ['b']) { build { |b| b } }
+        comp.component!('b', ['a']) { build { |a| a } }
 
-        expect { sys.prepare! }.to raise_error(described_class::CircularDependencyError, /between a, b/)
+        expect { comp.prepare! }.to raise_error(described_class::CircularDependencyError, /between a, b/)
       end
 
       it 'raises for self dependencies' do
-        sys = new_system
-        sys.declare('a', Integer)
-        sys.component!('a', ['a']) { build { |a| a } }
+        comp = new_component
+        comp.declare('a', Integer)
+        comp.component!('a', ['a']) { build { |a| a } }
 
-        expect { sys.prepare! }.to raise_error(described_class::CircularDependencyError, /between a/)
+        expect { comp.prepare! }.to raise_error(described_class::CircularDependencyError, /between a/)
       end
 
       it 'resolves deps declared after the component' do
-        sys = new_system
-        sys.declare('b', Integer)
-        sys.component!('b', ['a']) { build { |a| a + 1 } }
-        sys.declare('a', Integer) { 1 }
-        sys.build!
+        comp = new_component
+        comp.declare('b', Integer)
+        comp.component!('b', ['a']) { build { |a| a + 1 } }
+        comp.declare('a', Integer) { 1 }
+        comp.build!
 
-        expect(sys['b']).to eq(2)
+        expect(comp['b']).to eq(2)
       end
     end
 
     describe 'start! failures' do
       it 'tears down started nodes, in reverse order, and re-raises' do
         calls = []
-        sys = new_system
-        sys.declare('a') { 1 }
-        sys.declare('b') { 2 }
-        sys.declare('c')
-        sys.component!('a') { start { calls << :start_a }; teardown { calls << :teardown_a } }
-        sys.component!('b', ['a']) { start { calls << :start_b }; teardown { calls << :teardown_b } }
-        sys.component!('c', ['b']) { start { raise 'boom' }; teardown { calls << :teardown_c } }
+        comp = new_component
+        comp.declare('a') { 1 }
+        comp.declare('b') { 2 }
+        comp.declare('c')
+        comp.component!('a') { start { calls << :start_a }; teardown { calls << :teardown_a } }
+        comp.component!('b', ['a']) { start { calls << :start_b }; teardown { calls << :teardown_b } }
+        comp.component!('c', ['b']) { start { raise 'boom' }; teardown { calls << :teardown_c } }
 
-        expect { sys.start! }.to raise_error(RuntimeError, 'boom')
+        expect { comp.start! }.to raise_error(RuntimeError, 'boom')
         expect(calls).to eq(%i[start_a start_b teardown_b teardown_a])
-        expect(sys.boot_status).to eq(:toredown)
-        expect(sys.node('c').status).to eq(:built)
+        expect(comp.boot_status).to eq(:toredown)
+        expect(comp.node('c').status).to eq(:built)
       end
     end
 
     describe 'teardown! failures' do
       it 'tears down every node, then re-raises the first error' do
         calls = []
-        sys = new_system
-        sys.declare('a') { 1 }
-        sys.declare('b')
-        sys.declare('c')
-        sys.component!('a') { teardown { calls << :a } }
-        sys.component!('b', ['a']) { teardown { calls << :b; raise 'b failed' } }
-        sys.component!('c', ['b']) { teardown { calls << :c; raise 'c failed' } }
-        sys.start!
+        comp = new_component
+        comp.declare('a') { 1 }
+        comp.declare('b')
+        comp.declare('c')
+        comp.component!('a') { teardown { calls << :a } }
+        comp.component!('b', ['a']) { teardown { calls << :b; raise 'b failed' } }
+        comp.component!('c', ['b']) { teardown { calls << :c; raise 'c failed' } }
+        comp.start!
 
-        expect { sys.teardown! }.to raise_error(RuntimeError, 'c failed')
+        expect { comp.teardown! }.to raise_error(RuntimeError, 'c failed')
         expect(calls).to eq(%i[c b a])
-        expect(sys.boot_status).to eq(:toredown)
+        expect(comp.boot_status).to eq(:toredown)
       end
     end
   end
 
   describe 'reading values' do
-    it 'raises until the system is built' do
-      sys = new_system
-      sys.declare('a') { 1 }
+    it 'raises until the component is built' do
+      comp = new_component
+      comp.declare('a') { 1 }
 
-      expect { sys['a'] }.to raise_error(described_class::NotBuiltError)
-      sys.prepare!
-      expect { sys['a'] }.to raise_error(described_class::NotBuiltError)
-      sys.build!
-      expect(sys['a']).to eq(1)
+      expect { comp['a'] }.to raise_error(described_class::NotBuiltError)
+      comp.prepare!
+      expect { comp['a'] }.to raise_error(described_class::NotBuiltError)
+      comp.build!
+      expect(comp['a']).to eq(1)
     end
 
     it 'keeps values readable after teardown' do
-      sys = new_system
-      sys.declare('a') { 1 }
-      sys.start!
-      sys.teardown!
+      comp = new_component
+      comp.declare('a') { 1 }
+      comp.start!
+      comp.teardown!
 
-      expect(sys['a']).to eq(1)
+      expect(comp['a']).to eq(1)
     end
 
     it 'memoizes singletons' do
-      sys = new_system
-      sys.declare('a', String) { +'a' }
-      sys.build!
+      comp = new_component
+      comp.declare('a', String) { +'a' }
+      comp.build!
 
-      expect(sys['a']).to be(sys['a'])
+      expect(comp['a']).to be(comp['a'])
     end
 
     it 'builds dynamic components on each read, with their deps' do
       counter = 0
-      sys = new_system
-      sys.declare('prefix', String) { 'req' }
-      sys.declare('request_id', String)
-      sys.component('request_id', ['prefix']) { build { |prefix| "#{prefix}-#{counter += 1}" } }
-      sys.build!
+      comp = new_component
+      comp.declare('prefix', String) { 'req' }
+      comp.declare('request_id', String)
+      comp.component('request_id', ['prefix']) { build { |prefix| "#{prefix}-#{counter += 1}" } }
+      comp.build!
 
-      expect(sys['request_id']).to eq('req-1')
-      expect(sys['request_id']).to eq('req-2')
+      expect(comp['request_id']).to eq('req-1')
+      expect(comp['request_id']).to eq('req-2')
     end
 
     it 'gives singletons that depend on dynamic components a value built once' do
       counter = 0
-      sys = new_system
-      sys.declare('id', Integer)
-      sys.component('id') { build { counter += 1 } }
-      sys.declare('first', Integer)
-      sys.component!('first', ['id']) { build { |id| id } }
-      sys.build!
+      comp = new_component
+      comp.declare('id', Integer)
+      comp.component('id') { build { counter += 1 } }
+      comp.declare('first', Integer)
+      comp.component!('first', ['id']) { build { |id| id } }
+      comp.build!
 
-      expect(sys['first']).to eq(1)
-      expect(sys['first']).to eq(1)
-      expect(sys['id']).to eq(2)
+      expect(comp['first']).to eq(1)
+      expect(comp['first']).to eq(1)
+      expect(comp['id']).to eq(2)
     end
 
     it 'parses dynamic values through the declared type' do
-      sys = new_system
-      sys.declare('n', Integer)
-      sys.component('n') { build { 'nope' } }
-      sys.build!
+      comp = new_component
+      comp.declare('n', Integer)
+      comp.component('n') { build { 'nope' } }
+      comp.build!
 
-      expect { sys['n'] }.to raise_error(Plumb::ParseError, 'n: Must be a Integer')
+      expect { comp['n'] }.to raise_error(Plumb::ParseError, 'n: Must be a Integer')
     end
 
     it 'raises for undeclared keys and namespaces' do
-      sys = new_system
-      sys.declare('ns.x') { 1 }
-      sys.build!
+      comp = new_component
+      comp.declare('ns.x') { 1 }
+      comp.build!
 
-      expect { sys['nope'] }.to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
-      expect { sys['ns'] }.to raise_error(described_class::UndeclaredComponentError, /ns is a namespace/)
+      expect { comp['nope'] }.to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
+      expect { comp['ns'] }.to raise_error(described_class::UndeclaredComponentError, /ns is a namespace/)
     end
 
-    it 'reads from mounted systems through their own keys' do
-      lib = new_system
+    it 'reads from mounted components through their own keys' do
+      lib = new_component
       lib.declare('db', String) { 'lib db' }
-      app = new_system
+      app = new_component
       app.mount('sourced', lib)
       app.build!
 
@@ -1411,15 +1411,15 @@ RSpec.describe Sourced::System do
   describe '#graph' do
     it 'describes all declared components, their statuses, dependencies and types' do
       logger_type = Plumb::Types::Interface[:info]
-      sys = new_system
-      sys.declare('app')
-      sys.declare('logger', logger_type)
-      sys.declare('logger.output') { STDOUT }
-      sys.declare('db', Plumb::Types::Interface[:append].nullable)
-      sys.component!('app', %w[logger logger.output]) { start { |_v, _c| } }
-      sys.config('logger', ['logger.output']) { |o| o }
+      comp = new_component
+      comp.declare('app')
+      comp.declare('logger', logger_type)
+      comp.declare('logger.output') { STDOUT }
+      comp.declare('db', Plumb::Types::Interface[:append].nullable)
+      comp.component!('app', %w[logger logger.output]) { start { |_v, _c| } }
+      comp.config('logger', ['logger.output']) { |o| o }
 
-      graph = sys.graph
+      graph = comp.graph
       expect(graph).to be_a(described_class::Graph)
       expect(graph.status).to eq(:open)
       expect(graph.to_h).to eq(status: :open, components: graph.components)
@@ -1453,52 +1453,52 @@ RSpec.describe Sourced::System do
     end
 
     it 'lists components in dependency order, with their statuses, once prepared' do
-      sys = new_system
-      sys.declare('app')
-      sys.declare('logger') { 'logger' }
-      sys.config!('app', ['logger']) { |l| l }
-      sys.start!
+      comp = new_component
+      comp.declare('app')
+      comp.declare('logger') { 'logger' }
+      comp.config!('app', ['logger']) { |l| l }
+      comp.start!
 
-      graph = sys.graph
+      graph = comp.graph
       expect(graph.status).to eq(:started)
       expect(graph.components.map { |c| [c[:key], c[:status]] }).to eq([['logger', :started], ['app', :started]])
     end
 
     it 'lists deps that are not declared, or are namespaces without an implementation, as missing' do
-      sys = new_system
-      sys.declare('ns.x') { 1 }
-      sys.declare('app')
-      sys.config!('app', %w[ns.x nope ns]) { 1 }
+      comp = new_component
+      comp.declare('ns.x') { 1 }
+      comp.declare('app')
+      comp.config!('app', %w[ns.x nope ns]) { 1 }
 
-      expect(sys.graph.components.last).to include(key: 'app', deps: %w[ns.x nope ns], missing: %w[nope ns])
+      expect(comp.graph.components.last).to include(key: 'app', deps: %w[ns.x nope ns], missing: %w[nope ns])
     end
 
     it 'leaves out namespaces, and includes namespaces with an implementation' do
-      sys = new_system
-      sys.declare('a.b.c') { 1 }
-      sys.declare('x.y') { 1 }
-      sys.config!('x') { 2 }
+      comp = new_component
+      comp.declare('a.b.c') { 1 }
+      comp.declare('x.y') { 1 }
+      comp.config!('x') { 2 }
 
-      expect(sys.graph.components.map { |c| c[:key] }).to eq(%w[a.b.c x x.y])
+      expect(comp.graph.components.map { |c| c[:key] }).to eq(%w[a.b.c x x.y])
     end
 
     it 'includes providers' do
       provider = described_class::ENVProvider.new('A')
-      sys = new_system
-      sys.declare('a')
-      sys.declare('b')
-      sys.component!('a', provider)
-      sys.env('B' => 'b')
+      comp = new_component
+      comp.declare('a')
+      comp.declare('b')
+      comp.component!('a', provider)
+      comp.env('B' => 'b')
 
-      expect(sys.graph.components.map { |c| c[:provider] }).to match([provider, be_a(described_class::ENVProvider)])
+      expect(comp.graph.components.map { |c| c[:provider] }).to match([provider, be_a(described_class::ENVProvider)])
     end
 
-    it 'describes mounted systems by full path, with deps relative to their implementers' do
-      lib = new_system
+    it 'describes mounted components by full path, with deps relative to their implementers' do
+      lib = new_component
       lib.declare('logger') { 'lib logger' }
       lib.declare('db')
       lib.config!('db', ['logger']) { |l| l }
-      app = new_system
+      app = new_component
       app.declare('logger') { 'app logger' }
       app.mount('sourced', lib)
       app.declare('app')
@@ -1516,11 +1516,11 @@ RSpec.describe Sourced::System do
       expect(app.graph.components.find { |c| c[:key] == 'logger' }[:dependents]).to eq(['sourced.db'])
     end
 
-    it 'describes the components under a mounted system, with dependents only from its graph' do
-      lib = new_system
+    it 'describes the components under a mounted component, with dependents only from its graph' do
+      lib = new_component
       lib.declare('logger') { 'lib logger' }
       lib.declare('db')
-      app = new_system
+      app = new_component
       app.declare('logger') { 'app logger' }
       app.declare('app')
       app.mount('sourced', lib)
@@ -1537,10 +1537,10 @@ RSpec.describe Sourced::System do
     end
 
     it 'names types without module prefixes' do
-      sys = new_system
-      sys.declare('email', described_class::T::Email)
+      comp = new_component
+      comp.declare('email', described_class::T::Email)
 
-      expect(sys.graph.components.first[:type_name]).to eq('Email')
+      expect(comp.graph.components.first[:type_name]).to eq('Email')
     end
   end
 
@@ -1548,17 +1548,17 @@ RSpec.describe Sourced::System do
     def classdefs = described_class::Graph::MERMAID_CLASSES.map { |name, style| "  classDef #{name} #{style}" }.join("\n")
 
     it 'draws components, dependency edges, modes and implementations' do
-      sys = new_system
-      sys.declare('output') { STDOUT }
-      sys.declare('logger', Plumb::Types::Interface[:info])
-      sys.declare('db', Plumb::Types::Interface[:exec].nullable)
-      sys.declare('request_id', String)
-      sys.declare('app')
-      sys.config('logger', ['output']) { |o| o }
-      sys.config('request_id') { 'x' }
-      sys.config!('app', %w[logger db request_id nope]) { 1 }
+      comp = new_component
+      comp.declare('output') { STDOUT }
+      comp.declare('logger', Plumb::Types::Interface[:info])
+      comp.declare('db', Plumb::Types::Interface[:exec].nullable)
+      comp.declare('request_id', String)
+      comp.declare('app')
+      comp.config('logger', ['output']) { |o| o }
+      comp.config('request_id') { 'x' }
+      comp.config!('app', %w[logger db request_id nope]) { 1 }
 
-      expect(sys.graph.to_mermaid).to eq(<<~MERMAID.chomp)
+      expect(comp.graph.to_mermaid).to eq(<<~MERMAID.chomp)
         flowchart LR
           c0["output<br/>Any<br/><i>singleton, open</i>"]:::open
           c1(["logger<br/>Interface[info]<br/><i>dynamic, open</i>"]):::open
@@ -1576,13 +1576,13 @@ RSpec.describe Sourced::System do
     end
 
     it 'styles nodes by status, in dependency order' do
-      sys = new_system
-      sys.declare('app')
-      sys.declare('logger') { 1 }
-      sys.config!('app', ['logger']) { |l| l }
-      sys.start!
+      comp = new_component
+      comp.declare('app')
+      comp.declare('logger') { 1 }
+      comp.config!('app', ['logger']) { |l| l }
+      comp.start!
 
-      nodes = sys.graph.to_mermaid.lines.grep(/:::/).map(&:strip)
+      nodes = comp.graph.to_mermaid.lines.grep(/:::/).map(&:strip)
       expect(nodes).to eq([
         'c0["logger<br/>Any<br/><i>singleton, started</i>"]:::started',
         'c1["app<br/>Any<br/><i>singleton, started</i>"]:::started'
@@ -1590,9 +1590,9 @@ RSpec.describe Sourced::System do
     end
 
     it 'draws deps outside the graph, ex. an app override in a library graph' do
-      lib = new_system
+      lib = new_component
       lib.declare('db')
-      app = new_system
+      app = new_component
       app.declare('logger') { 1 }
       app.mount('sourced', lib)
       app.config!('sourced.db', ['logger']) { |l| l }
@@ -1600,7 +1600,7 @@ RSpec.describe Sourced::System do
       expect(lib.graph.to_mermaid).to eq(<<~MERMAID.chomp)
         flowchart LR
           c0["sourced.db<br/>Any<br/><i>singleton, open</i>"]:::open
-          c1["logger<br/><i>outside this system</i>"]:::external
+          c1["logger<br/><i>outside this component</i>"]:::external
           c1 --> c0
         #{classdefs}
       MERMAID
@@ -1620,13 +1620,13 @@ RSpec.describe Sourced::System do
   describe '#tree' do
     def app_with_library
       require 'logger'
-      lib = new_system
+      lib = new_component
       lib.declare('logger', Plumb::Types::Interface[:info]) { Logger.new(nil) }
       lib.declare('db', String)
       lib.config!('db', ['logger']) { 'lib db' }
       lib.declare('settings.retries', Integer) { 3 }
 
-      app = new_system
+      app = new_component
       app.declare('logger') { 2 }
       app.mount('libs.sourced', lib)
       app.config!('libs.sourced.db', ['logger']) { 'app db' }
@@ -1635,7 +1635,7 @@ RSpec.describe Sourced::System do
       [app, lib]
     end
 
-    it 'renders the tree of systems, with mounted systems and overrides' do
+    it 'renders the tree of components, with mounted components and overrides' do
       app, = app_with_library
 
       expect(app.tree.to_s).to eq(<<~TREE.chomp)
@@ -1702,7 +1702,7 @@ RSpec.describe Sourced::System do
       expect(hash.dig(:root, :children, 2, :children, 0, :children, 0)).to include(key: 'pool', path: 'cache.redis.pool', implemented: false, children: [])
     end
 
-    it 'renders the tree under a mounted system' do
+    it 'renders the tree under a mounted component' do
       _app, lib = app_with_library
 
       expect(lib.tree.to_s).to eq(<<~TREE.chomp)
@@ -1715,9 +1715,9 @@ RSpec.describe Sourced::System do
     end
 
     it 'names implementers by path' do
-      lib = new_system
+      lib = new_component
       lib.declare('db') { 1 }
-      app = new_system
+      app = new_component
       app.mount('libs.sourced', lib)
       app.node('libs').config!('sourced.db') { 2 }
 
@@ -1725,35 +1725,35 @@ RSpec.describe Sourced::System do
     end
 
     it 'shows implemented namespaces as components with children' do
-      sys = new_system
-      sys.declare('db.url', String) { 'sqlite://' }
-      sys.config!('db', ['db.url']) { |url| url }
+      comp = new_component
+      comp.declare('db.url', String) { 'sqlite://' }
+      comp.config!('db', ['db.url']) { |url| url }
 
-      expect(sys.tree.to_s).to eq(<<~TREE.chomp)
+      expect(comp.tree.to_s).to eq(<<~TREE.chomp)
         (root)
         └── db Any (singleton, open)
             └── url String (singleton, open)
       TREE
     end
 
-    it 'renders an empty system' do
-      expect(new_system.tree.to_s).to eq('(root)')
+    it 'renders an empty component' do
+      expect(new_component.tree.to_s).to eq('(root)')
     end
 
     describe '#to_mermaid' do
       def classdefs = described_class::Tree::MERMAID_CLASSES.map { |name, style| "  classDef #{name} #{style}" }.join("\n")
 
-      it 'draws a top-down tree, with systems, namespaces, components and overrides' do
+      it 'draws a top-down tree, with roots, namespaces, components and overrides' do
         app, = app_with_library
         app.declare('request_id', String)
         app.config('request_id') { 'x' }
 
         expect(app.tree.to_mermaid).to eq(<<~MERMAID.chomp)
           flowchart TD
-            n0{{"(root)"}}:::system
+            n0{{"(root)"}}:::root
             n1["logger<br/>Any<br/><i>singleton, open</i>"]:::open
             n2("libs"):::namespace
-            n3{{"sourced"}}:::system
+            n3{{"sourced"}}:::root
             n4["logger<br/>Interface[info]<br/><i>singleton, open</i>"]:::open
             n5["db<br/>String<br/><i>singleton, open</i><br/><i>implemented by (root)</i>"]:::open
             n6("settings"):::namespace
@@ -1778,27 +1778,27 @@ RSpec.describe Sourced::System do
       end
 
       it 'styles nodes by status' do
-        sys = new_system
-        sys.declare('a') { 1 }
-        sys.start!
+        comp = new_component
+        comp.declare('a') { 1 }
+        comp.start!
 
-        expect(sys.tree.to_mermaid.lines[2].strip).to eq('n1["a<br/>Any<br/><i>singleton, started</i>"]:::started')
+        expect(comp.tree.to_mermaid.lines[2].strip).to eq('n1["a<br/>Any<br/><i>singleton, started</i>"]:::started')
       end
 
-      it 'draws the tree under a mounted system, from its full path' do
+      it 'draws the tree under a mounted component, from its full path' do
         _app, lib = app_with_library
 
         expect(lib.tree.to_mermaid.lines.first(3).map(&:strip)).to eq([
           'flowchart TD',
-          'n0{{"libs.sourced"}}:::system',
+          'n0{{"libs.sourced"}}:::root',
           'n1["logger<br/>Interface[info]<br/><i>singleton, open</i>"]:::open'
         ])
       end
 
-      it 'draws implemented systems as hexagons, styled by status' do
-        lib = new_system
+      it 'draws implemented components as hexagons, styled by status' do
+        lib = new_component
         lib.declare('x') { 1 }
-        app = new_system
+        app = new_component
         app.mount('lib', lib)
         app.config!('lib', ['lib.x']) { |x| x }
 
@@ -1821,26 +1821,26 @@ RSpec.describe Sourced::System do
 
   describe '#inspect' do
     it 'describes the node' do
-      sys = new_system
-      sys.declare('ns.a', Integer) { 1 }
-      sys.declare('ns.b', String)
-      sys.component('ns.b') { build { 'b' } }
-      sys.declare('ns.c', String)
+      comp = new_component
+      comp.declare('ns.a', Integer) { 1 }
+      comp.declare('ns.b', String)
+      comp.component('ns.b') { build { 'b' } }
+      comp.declare('ns.c', String)
 
-      expect(sys.inspect).to eq('#<Sourced::System (root) (namespace)>')
-      expect(sys.node('ns').inspect).to eq('#<Sourced::System ns (namespace)>')
-      expect(sys.node('ns.a').inspect).to eq('#<Sourced::System ns.a Integer (singleton, open)>')
-      expect(sys.node('ns.b').inspect).to eq('#<Sourced::System ns.b String (dynamic, open)>')
-      expect(sys.node('ns.c').inspect).to eq('#<Sourced::System ns.c String (not implemented, open)>')
+      expect(comp.inspect).to eq('#<Sourced::Component (root) (namespace)>')
+      expect(comp.node('ns').inspect).to eq('#<Sourced::Component ns (namespace)>')
+      expect(comp.node('ns.a').inspect).to eq('#<Sourced::Component ns.a Integer (singleton, open)>')
+      expect(comp.node('ns.b').inspect).to eq('#<Sourced::Component ns.b String (dynamic, open)>')
+      expect(comp.node('ns.c').inspect).to eq('#<Sourced::Component ns.c String (not implemented, open)>')
     end
   end
 
   describe 'lifecycle events' do
     def events_mod = described_class::Events
 
-    def record(sys)
+    def record(comp)
       [].tap do |events|
-        sys.notifier.subscribe(described_class::Event) { |e| events << e }
+        comp.notifier.subscribe(described_class::Event) { |e| events << e }
       end
     end
 
@@ -1849,34 +1849,34 @@ RSpec.describe Sourced::System do
     end
 
     it 'publishes events for every lifecycle step' do
-      sys = new_system
-      events = record(sys)
-      sys.declare('output') { STDOUT }
-      sys.declare('logger', String)
-      sys.config!('logger', ['output']) { |o| o.class.name }
-      sys.config!('logger', ['output']) { |_o| 'overridden' }
-      sys.start!
-      sys.teardown!
+      comp = new_component
+      events = record(comp)
+      comp.declare('output') { STDOUT }
+      comp.declare('logger', String)
+      comp.config!('logger', ['output']) { |o| o.class.name }
+      comp.config!('logger', ['output']) { |_o| 'overridden' }
+      comp.start!
+      comp.teardown!
 
       expect(summary(events)).to eq([
         'components.declared output', 'components.implemented output',
         'components.declared logger', 'components.implemented logger', 'components.implemented logger',
-        'system.preparing',
+        'root.preparing',
         'components.preparing output', 'components.prepared output',
         'components.preparing logger', 'components.prepared logger',
-        'system.prepared',
-        'system.building',
+        'root.prepared',
+        'root.building',
         'components.building output', 'components.built output',
         'components.building logger', 'components.built logger',
-        'system.built',
-        'system.starting',
+        'root.built',
+        'root.starting',
         'components.starting output', 'components.started output',
         'components.starting logger', 'components.started logger',
-        'system.started',
-        'system.tearing_down',
+        'root.started',
+        'root.tearing_down',
         'components.tearing_down logger', 'components.toredown logger',
         'components.tearing_down output', 'components.toredown output',
-        'system.toredown'
+        'root.toredown'
       ])
       expect(events).to all(be_valid)
       expect(events).to all(be_a(Sourced::Message))
@@ -1884,13 +1884,13 @@ RSpec.describe Sourced::System do
     end
 
     it 'includes event details' do
-      sys = new_system
-      events = record(sys)
-      sys.declare('output', Plumb::Types::Interface[:puts]) { STDOUT }
-      sys.declare('logger')
-      sys.config!('logger', ['output']) { 1 }
-      sys.config('logger', ['output']) { 2 }
-      sys.build!
+      comp = new_component
+      events = record(comp)
+      comp.declare('output', Plumb::Types::Interface[:puts]) { STDOUT }
+      comp.declare('logger')
+      comp.config!('logger', ['output']) { 1 }
+      comp.config('logger', ['output']) { 2 }
+      comp.build!
 
       declared = events.find { |e| e.type == 'components.declared' }
       expect(declared).to be_a(events_mod::ComponentDeclared)
@@ -1908,9 +1908,9 @@ RSpec.describe Sourced::System do
     end
 
     it 'names components by full path, and implementers by theirs' do
-      lib = new_system
+      lib = new_component
       lib.declare('logger')
-      app = new_system
+      app = new_component
       events = record(app)
       app.mount('libs.sourced', lib)
       lib.declare('db') { 1 }
@@ -1923,9 +1923,9 @@ RSpec.describe Sourced::System do
       ])
     end
 
-    it "publishes mounted systems' events to the root's notifier" do
-      lib = new_system
-      app = new_system
+    it "publishes mounted components' events to the root's notifier" do
+      lib = new_component
+      app = new_component
       app.mount('sourced', lib)
 
       expect(lib.notifier).to be(app.notifier)
@@ -1933,17 +1933,17 @@ RSpec.describe Sourced::System do
       lib.declare('db') { 1 }
       app.build!
 
-      expect(summary(events)).to include('components.declared sourced.db', 'system.built')
+      expect(summary(events)).to include('components.declared sourced.db', 'root.built')
     end
 
     it 'only publishes build events for singleton components' do
-      sys = new_system
-      events = record(sys)
-      sys.declare('singleton') { 1 }
-      sys.declare('dynamic')
-      sys.config('dynamic') { 2 }
-      sys.start!
-      sys['dynamic']
+      comp = new_component
+      events = record(comp)
+      comp.declare('singleton') { 1 }
+      comp.declare('dynamic')
+      comp.config('dynamic') { 2 }
+      comp.start!
+      comp['dynamic']
 
       types = summary(events)
       expect(types).to include('components.built singleton', 'components.started dynamic', 'components.prepared dynamic')
@@ -1951,74 +1951,74 @@ RSpec.describe Sourced::System do
     end
 
     it "doesn't publish events for steps that don't run" do
-      sys = new_system
-      sys.declare('a') { 1 }
-      sys.start!
-      events = record(sys)
-      sys.prepare!
-      sys.build!
-      sys.start!
+      comp = new_component
+      comp.declare('a') { 1 }
+      comp.start!
+      events = record(comp)
+      comp.prepare!
+      comp.build!
+      comp.start!
 
       expect(events).to be_empty
     end
 
     it 'publishes failures, including start rollbacks' do
-      sys = new_system
-      events = record(sys)
-      sys.declare('a') { 1 }
-      sys.declare('b')
-      sys.component!('b', ['a']) { start { |_v, _c| raise ArgumentError, 'boom' } }
+      comp = new_component
+      events = record(comp)
+      comp.declare('a') { 1 }
+      comp.declare('b')
+      comp.component!('b', ['a']) { start { |_v, _c| raise ArgumentError, 'boom' } }
 
-      expect { sys.start! }.to raise_error(ArgumentError)
-      expect(summary(events).drop_while { |t| t != 'system.starting' }).to eq([
-        'system.starting',
+      expect { comp.start! }.to raise_error(ArgumentError)
+      expect(summary(events).drop_while { |t| t != 'root.starting' }).to eq([
+        'root.starting',
         'components.starting a', 'components.started a',
         'components.starting b', 'components.failed b',
         'components.tearing_down a', 'components.toredown a',
-        'system.failed'
+        'root.failed'
       ])
 
-      component_failed, system_failed = events.select { |e| e.type.end_with?('failed') }
+      component_failed, root_failed = events.select { |e| e.type.end_with?('failed') }
       expect(component_failed.payload).to have_attributes(key: 'b', stage: :start, error_class: 'ArgumentError', error_message: 'boom')
       expect(component_failed.payload.backtrace).to all(be_a(String))
       expect(component_failed.payload.backtrace).not_to be_empty
-      expect(system_failed.payload).to have_attributes(stage: :start, error_class: 'ArgumentError')
+      expect(root_failed.payload).to have_attributes(stage: :start, error_class: 'ArgumentError')
     end
 
     it 'publishes teardown failures, and carries on tearing down' do
-      sys = new_system
-      sys.declare('a') { 1 }
-      sys.declare('b')
-      sys.component!('b', ['a']) { teardown { |_v| raise 'nope' } }
-      sys.start!
-      events = record(sys)
+      comp = new_component
+      comp.declare('a') { 1 }
+      comp.declare('b')
+      comp.component!('b', ['a']) { teardown { |_v| raise 'nope' } }
+      comp.start!
+      events = record(comp)
 
-      expect { sys.teardown! }.to raise_error(RuntimeError, 'nope')
+      expect { comp.teardown! }.to raise_error(RuntimeError, 'nope')
       expect(summary(events)).to eq([
-        'system.tearing_down',
+        'root.tearing_down',
         'components.tearing_down b', 'components.failed b',
         'components.tearing_down a', 'components.toredown a',
-        'system.failed'
+        'root.failed'
       ])
       expect(events.last.payload.stage).to eq(:teardown)
     end
 
-    it 'publishes system failures without a component' do
-      sys = new_system
-      events = record(sys)
-      sys.declare('a')
+    it 'publishes component failures without a component' do
+      comp = new_component
+      events = record(comp)
+      comp.declare('a')
 
-      expect { sys.prepare! }.to raise_error(described_class::UnimplementedComponentError)
-      expect(summary(events).last(2)).to eq(['system.preparing', 'system.failed'])
-      expect(events.last.payload).to have_attributes(stage: :prepare, error_class: 'Sourced::System::UnimplementedComponentError')
+      expect { comp.prepare! }.to raise_error(described_class::UnimplementedComponentError)
+      expect(summary(events).last(2)).to eq(['root.preparing', 'root.failed'])
+      expect(events.last.payload).to have_attributes(stage: :prepare, error_class: 'Sourced::Component::UnimplementedComponentError')
     end
 
     it 'publishes build failures, ex. type errors' do
-      sys = new_system
-      events = record(sys)
-      sys.declare('n', Integer) { 'nope' }
+      comp = new_component
+      events = record(comp)
+      comp.declare('n', Integer) { 'nope' }
 
-      expect { sys.build! }.to raise_error(Plumb::ParseError)
+      expect { comp.build! }.to raise_error(Plumb::ParseError)
       expect(events.last(2).map { |e| e.payload.to_h.slice(:key, :stage, :error_message) }).to eq([
         { key: 'n', stage: :build, error_message: 'n: Must be a Integer' },
         { stage: :build, error_message: 'n: Must be a Integer' }
@@ -2042,44 +2042,44 @@ RSpec.describe Sourced::System do
       end
 
       it 'publishes every event with the process, thread and fiber it was published from' do
-        sys = new_system
-        events = record(sys)
-        sys.declare('a') { 1 }
-        sys.build!
+        comp = new_component
+        events = record(comp)
+        comp.declare('a') { 1 }
+        comp.build!
 
-        expect(events.map(&:type)).to include('components.declared', 'components.implemented', 'system.built')
+        expect(events.map(&:type)).to include('components.declared', 'components.implemented', 'root.built')
         expect(events.map { |e| runtime_of(e) }.uniq).to eq([here])
 
         events.clear
-        elsewhere = in_thread_and_fiber { sys.start! }
+        elsewhere = in_thread_and_fiber { comp.start! }
 
         expect(elsewhere).not_to eq(here)
-        expect(events.map(&:type)).to include('system.starting', 'components.started', 'system.started')
+        expect(events.map(&:type)).to include('root.starting', 'components.started', 'root.started')
         expect(events.map { |e| runtime_of(e) }.uniq).to eq([elsewhere])
       end
     end
 
     describe 'messages' do
-      it 'subclasses System::Event, which subclasses Sourced::Message' do
+      it 'subclasses Component::Event, which subclasses Sourced::Message' do
         expect(described_class::Event.superclass).to be(Sourced::Message)
         expect(events_mod::ComponentBuilt.ancestors).to include(events_mod::ComponentEvent, described_class::Event)
-        expect(events_mod::SystemBuilt.ancestors).to include(events_mod::SystemEvent, described_class::Event)
+        expect(events_mod::RootBuilt.ancestors).to include(events_mod::RootEvent, described_class::Event)
       end
 
-      it 'registers event types, visible from System::Event and Sourced::Message' do
+      it 'registers event types, visible from Component::Event and Sourced::Message' do
         expect(described_class::Event.registry['components.built']).to be(events_mod::ComponentBuilt)
-        expect(Sourced::Message.registry['system.failed']).to be(events_mod::SystemFailed)
-        expect(described_class::Event.registry.all.to_a).to include(events_mod::ComponentDeclared, events_mod::SystemPrepared)
+        expect(Sourced::Message.registry['root.failed']).to be(events_mod::RootFailed)
+        expect(described_class::Event.registry.all.to_a).to include(events_mod::ComponentDeclared, events_mod::RootPrepared)
       end
 
       it 'can be serialized and deserialized with the JSON codec' do
         require 'json'
 
-        sys = new_system
-        events = record(sys)
-        sys.declare('a')
-        sys.component!('a') { start { |_v, _c| raise 'boom' } }
-        expect { sys.start! }.to raise_error(RuntimeError)
+        comp = new_component
+        events = record(comp)
+        comp.declare('a')
+        comp.component!('a') { start { |_v, _c| raise 'boom' } }
+        expect { comp.start! }.to raise_error(RuntimeError)
 
         codec = Sourced::Message::JSONCodec.new.compile!
         events.each do |event|
@@ -2095,26 +2095,26 @@ RSpec.describe Sourced::System do
 
       def payload(**attrs) = { pid: 1, thread_id: 2, fiber_id: 3, duration: 0.1, **attrs }
 
-      let(:built) { Sourced::System::Events::ComponentBuilt.new(payload: payload(key: 'a')) }
-      let(:started) { Sourced::System::Events::ComponentStarted.new(payload: payload(key: 'a')) }
-      let(:system_started) { Sourced::System::Events::SystemStarted.new(payload: payload) }
+      let(:built) { Sourced::Component::Events::ComponentBuilt.new(payload: payload(key: 'a')) }
+      let(:started) { Sourced::Component::Events::ComponentStarted.new(payload: payload(key: 'a')) }
+      let(:root_started) { Sourced::Component::Events::RootStarted.new(payload: payload) }
 
       it 'subscribes to event types, classes and their subclasses' do
         received = Hash.new { |h, k| h[k] = [] }
         notifier.subscribe('components.built') { |e| received[:type] << e }
         notifier.subscribe(:'components.built') { |e| received[:symbol] << e }
-        notifier.subscribe(Sourced::System::Events::ComponentStarted) { |e| received[:class] << e }
-        notifier.subscribe(Sourced::System::Events::ComponentEvent) { |e| received[:component] << e }
-        notifier.subscribe(Sourced::System::Event) { |e| received[:all] << e }
+        notifier.subscribe(Sourced::Component::Events::ComponentStarted) { |e| received[:class] << e }
+        notifier.subscribe(Sourced::Component::Events::ComponentEvent) { |e| received[:component] << e }
+        notifier.subscribe(Sourced::Component::Event) { |e| received[:all] << e }
 
-        [built, started, system_started].each { |e| notifier.publish(e) }
+        [built, started, root_started].each { |e| notifier.publish(e) }
 
         expect(received).to eq(
           type: [built],
           symbol: [built],
           class: [started],
           component: [built, started],
-          all: [built, started, system_started]
+          all: [built, started, root_started]
         )
       end
 
@@ -2135,12 +2135,12 @@ RSpec.describe Sourced::System do
         def subscribe(*) = self
       end.new
 
-      sys = described_class.new(notifier:)
-      sys.declare('a') { 1 }
-      sys.build!
+      comp = described_class.new(notifier:)
+      comp.declare('a') { 1 }
+      comp.build!
 
-      expect(sys.notifier).to be(notifier)
-      expect(notifier.events.map(&:type)).to include('system.built', 'components.built')
+      expect(comp.notifier).to be(notifier)
+      expect(notifier.events.map(&:type)).to include('root.built', 'components.built')
     end
 
     it 'validates custom notifiers' do
@@ -2151,19 +2151,19 @@ RSpec.describe Sourced::System do
   describe 'concurrency' do
     it 'boots once when started from multiple threads' do
       builds = 0
-      sys = new_system
-      sys.declare('a', Integer)
-      sys.component!('a') do
+      comp = new_component
+      comp.declare('a', Integer)
+      comp.component!('a') do
         build do
           sleep 0.01
           builds += 1
         end
       end
 
-      10.times.map { Thread.new { sys.start! } }.each(&:join)
+      10.times.map { Thread.new { comp.start! } }.each(&:join)
 
       expect(builds).to eq(1)
-      expect(sys.boot_status).to eq(:started)
+      expect(comp.boot_status).to eq(:started)
     end
   end
 end

@@ -3,28 +3,28 @@
 require 'monitor'
 require 'tsort'
 require 'plumb'
-require_relative 'system/version'
-require_relative 'system/errors'
-require_relative 'system/dsl'
-require_relative 'system/implementation'
-require_relative 'system/injector'
-require_relative 'system/env_provider'
-require_relative 'system/mermaid'
-require_relative 'system/graph'
-require_relative 'system/events'
-require_relative 'system/notifier'
-require_relative 'system/tree'
+require_relative 'component/version'
+require_relative 'component/errors'
+require_relative 'component/dsl'
+require_relative 'component/implementation'
+require_relative 'component/injector'
+require_relative 'component/env_provider'
+require_relative 'component/mermaid'
+require_relative 'component/graph'
+require_relative 'component/events'
+require_relative 'component/notifier'
+require_relative 'component/tree'
 
 module Sourced
-  # A tree of systems. Every node is a System: it can declare a type, be implemented with
-  # dependencies and lifecycle hooks, have its own lifecycle status, and have sub-systems.
+  # A tree of components. Every node is a Component: it can declare a type, be implemented with
+  # dependencies and lifecycle hooks, have its own lifecycle status, and have subcomponents.
   #   app.declare('sourced.db', DB)                 # builds the 'sourced' > 'db' branch
   #   app.component!('sourced.db', ['logger']) { build { |logger| DB.new(logger:) } }
-  #   app.mount('payments', Payments)               # attach an existing system as a branch
-  # Systems own their declarations and the sub-trees under them: an ancestor can implement
+  #   app.mount('payments', Payments)               # attach an existing component as a branch
+  # Components own their declarations and the sub-trees under them: an ancestor can implement
   # (or re-implement) any node below it, but can only declare under nodes it declared itself.
-  # The root system drives the lifecycle of the whole tree.
-  class System
+  # The root component drives the lifecycle of the whole tree.
+  class Component
     module T
       include Plumb::Types
     end
@@ -32,17 +32,17 @@ module Sourced
     # Lifecycle statuses, in order. Shared by the root (boot status) and every node.
     STATUSES = %i[open prepared built started toredown].freeze
 
-    # What #mount takes: anything that returns a System from #to_system
-    MountableInterface = Plumb::Types::Interface[:to_system]
+    # What #mount takes: anything that returns a Component from #to_component
+    MountableInterface = Plumb::Types::Interface[:to_component]
 
     # key:   local segment, ex. 'db'. nil for a root that isn't mounted anywhere
-    # owner: the system that declared this node. Standalone systems own themselves
+    # owner: the component that declared this node. Standalone components own themselves
     # type:  the declared type. Any for implicit nodes created as intermediate segments (namespaces)
-    # index: every descendant, by relative key, ex. { 'sourced' => <System>, 'sourced.db' => <System> }
+    # index: every descendant, by relative key, ex. { 'sourced' => <Component>, 'sourced.db' => <Component> }
     attr_reader :key, :parent, :owner, :type, :implementation, :status, :value, :children, :index, :boot_status
 
-    # notifier: receives lifecycle events. See System::Notifier and System::Events.
-    # The root's notifier receives the events of the whole tree, so a mounted system uses its root's.
+    # notifier: receives lifecycle events. See Component::Notifier and Component::Events.
+    # The root's notifier receives the events of the whole tree, so a mounted component uses its root's.
     def initialize(owner: nil, type: Plumb::Undefined, notifier: Notifier.new)
       @notifier = NotifierInterface.parse(notifier)
       @key = nil
@@ -66,7 +66,7 @@ module Sourced
     def root = parent ? parent.root : self
     def root? = parent.nil?
 
-    # The notifier lifecycle events are published to: the root's, for every system in the tree
+    # The notifier lifecycle events are published to: the root's, for every component in the tree
     def notifier = root? ? @notifier : root.notifier
 
     # Full key from the root, ex. 'sourced.db'. nil for the root
@@ -87,21 +87,21 @@ module Sourced
 
     # Declare a typed node. Dot-separated keys build the tree, creating intermediate (namespace) nodes as needed.
     # An optional block provides a default singleton implementation.
-    #   sys.declare('sourced.db.logger', Logger) { Logger.new(STDOUT) }
+    #   comp.declare('sourced.db.logger', Logger) { Logger.new(STDOUT) }
     def declare(ckey, type = T::Any, &default)
       synchronize do
-        raise LockedSystemError, "can't declare #{ckey} in a locked system" if locked?
+        raise LockedComponentError, "can't declare #{ckey} in a locked component" if locked?
 
         branch, leaf = walk(ckey)
         node = branch.children[leaf]
         if node.nil?
-          node = branch.attach(leaf, System.new(owner: self, type:))
+          node = branch.attach(leaf, Component.new(owner: self, type:))
         elsif !node.owner.equal?(self)
           raise OwnershipError, ownership_message(node)
         elsif !node.implicit?
           raise DeclarationOverrideError, "#{node.path} is already declared"
         else
-          node.declare_type!(type) # an implicit namespace this system created, now with a type
+          node.declare_type!(type) # an implicit namespace this component created, now with a type
         end
         emit(Events::ComponentDeclared, key: node.path, type_name: node.type_name)
 
@@ -110,10 +110,10 @@ module Sourced
       end
     end
 
-    # Implement (or re-implement) a node anywhere under this system as a singleton,
+    # Implement (or re-implement) a node anywhere under this component as a singleton,
     # built once on #build! and memoized. The last implementation wins.
-    # Deps are keys relative to this system.
-    #   sys.component!('sourced.db', ['logger']) do
+    # Deps are keys relative to this component.
+    #   comp.component!('sourced.db', ['logger']) do
     #     prepare { require 'sequel' }
     #     build { |logger| Sequel.sqlite(logger:) }
     #     start { |db, context| }
@@ -124,23 +124,23 @@ module Sourced
     # - or an object with #builder_for(node), which returns that callable for the node (ex. ENVProvider)
     # The callable can also implement any of #prepare, #start(value, context) and #teardown(value),
     # which become the component's other hooks.
-    #   sys.component!('db', ['db.url'], DBFactory)    # DBFactory.call(url)
-    #   sys.component!('clock', -> { Time })           # no deps
-    #   sys.component!('user.email', System::ENVProvider.new('USER_EMAIL'))
+    #   comp.component!('db', ['db.url'], DBFactory)    # DBFactory.call(url)
+    #   comp.component!('clock', -> { Time })           # no deps
+    #   comp.component!('user.email', Component::ENVProvider.new('USER_EMAIL'))
     def component!(ckey, deps_or_provider = [], provider = nil, &block)
       implement(ckey, deps_or_provider, provider, :singleton, &block)
     end
 
     # Same as #component!, but built on every read, ex. a per-request value.
-    #   sys.component('request_id') { build { SecureRandom.uuid } }
-    #   sys.component('request_id', -> { SecureRandom.uuid })
+    #   comp.component('request_id') { build { SecureRandom.uuid } }
+    #   comp.component('request_id', -> { SecureRandom.uuid })
     def component(ckey, deps_or_provider = [], provider = nil, &block)
       implement(ckey, deps_or_provider, provider, :dynamic, &block)
     end
 
     # A singleton component with only a build step. The block gets the deps' values.
-    #   sys.config!('db.url') { 'sqlite://app.db' }
-    #   sys.config!('db', ['db.url']) { |url| DB.new(url) }
+    #   comp.config!('db.url') { 'sqlite://app.db' }
+    #   comp.config!('db', ['db.url']) { |url| DB.new(url) }
     def config!(ckey, deps = [], &build_block)
       raise ArgumentError, "config! #{ckey} needs a block to build its value" unless build_block
 
@@ -148,22 +148,22 @@ module Sourced
     end
 
     # Same as #config!, but built on every read
-    #   sys.config('now') { Time.now }
+    #   comp.config('now') { Time.now }
     def config(ckey, deps = [], &build_block)
       raise ArgumentError, "config #{ckey} needs a block to build its value" unless build_block
 
       implement(ckey, deps, build_block, :dynamic)
     end
 
-    # Implement singleton components built from ENV variables (see System::ENVProvider),
+    # Implement singleton components built from ENV variables (see Component::ENVProvider),
     # decoding values into each declared type with Plumb::Codec::Forms. ENV is read when components are built.
-    #   sys.env('USER_EMAIL' => 'user.email')        # a single variable
-    #   sys.env(/^USER_/ => 'user.info')             # matching variables into a hash, match removed: USER_NAME => NAME
-    #   sys.env(:downcase, /^USER_/ => 'user.info')  # ... with modifiers: USER_NAME => name
-    #   sys.env('user.info')                         # all variables into a hash
-    #   sys.env(:downcase, 'user.info')              # all variables, with modifiers
+    #   comp.env('USER_EMAIL' => 'user.email')        # a single variable
+    #   comp.env(/^USER_/ => 'user.info')             # matching variables into a hash, match removed: USER_NAME => NAME
+    #   comp.env(:downcase, /^USER_/ => 'user.info')  # ... with modifiers: USER_NAME => name
+    #   comp.env('user.info')                         # all variables into a hash
+    #   comp.env(:downcase, 'user.info')              # all variables, with modifiers
     # A hash can map several sources at once. Modifiers are only allowed when collecting variables with a regex.
-    # Keys are relative to this system. Every source, key and type is checked before anything is implemented.
+    # Keys are relative to this component. Every source, key and type is checked before anything is implemented.
     def env(*args)
       mapping = args.last.is_a?(::Hash) ? args.pop : { ENVProvider::ALL => args.pop }
       if mapping.empty? || mapping.value?(nil)
@@ -171,7 +171,7 @@ module Sourced
       end
 
       synchronize do
-        raise LockedSystemError, "can't implement ENV components in a locked system" if locked?
+        raise LockedComponentError, "can't implement ENV components in a locked component" if locked?
 
         builders = mapping.map do |source, ckey|
           target = node(ckey)
@@ -185,13 +185,13 @@ module Sourced
       end
     end
 
-    # Build an Injector for components under this system, by relative key.
+    # Build an Injector for components under this component, by relative key.
     # Keys map to kwargs named after their last segment ('sourced.store' => :store),
     # and a Hash maps keys to custom kwarg names ('sourced.store' => 'st').
     #   class Dispatcher
-    #     include Sys.inject('logger', 'sourced.store' => 'st')
+    #     include App.inject('logger', 'sourced.store' => 'st')
     #   end
-    # Values are read when objects are instantiated, so classes can be defined before the system is built.
+    # Values are read when objects are instantiated, so classes can be defined before the component is built.
     def inject(*keys)
       names = keys.each_with_object({}) do |arg, map|
         pairs = arg.is_a?(::Hash) ? arg : { arg => arg.to_s.split('.').last }
@@ -206,28 +206,28 @@ module Sourced
       Injector.new(names.to_h { |key, _| [key, node(key)] }, names)
     end
 
-    # Attach an existing standalone system as a branch. It keeps owning its declarations,
-    # and this system can implement its nodes.
-    # Takes anything with #to_system, which must return a System, ex. a library module:
-    #   app.mount('sourced', Sourced.system)
-    #   app.mount('sourced', Sourced) # Sourced.to_system => its System
+    # Attach an existing standalone component as a branch. It keeps owning its declarations,
+    # and this component can implement its nodes.
+    # Takes anything with #to_component, which must return a Component, ex. a library module:
+    #   app.mount('sourced', Sourced.component)
+    #   app.mount('sourced', Sourced) # Sourced.to_component => its Component
     def mount(ckey, mountable)
       unless MountableInterface === mountable
-        raise ArgumentError, "can't mount #{mountable.inspect}: it must respond to #to_system"
+        raise ArgumentError, "can't mount #{mountable.inspect}: it must respond to #to_component"
       end
 
-      sub = mountable.to_system
-      raise ArgumentError, "#{mountable.inspect}.to_system must return a System, got #{sub.inspect}" unless sub.is_a?(System)
+      sub = mountable.to_component
+      raise ArgumentError, "#{mountable.inspect}.to_component must return a Component, got #{sub.inspect}" unless sub.is_a?(Component)
 
       synchronize do
-        raise LockedSystemError, "can't mount #{ckey} in a locked system" if locked?
-        raise SubsystemError, "#{sub.inspect} is already mounted in another system" unless sub.root?
-        raise SubsystemError, "can't mount a system into its own tree" if sub.equal?(root)
-        raise LockedSystemError, "can't mount a #{sub.boot_status} system: it must be open" if sub.locked?
+        raise LockedComponentError, "can't mount #{ckey} in a locked component" if locked?
+        raise SubcomponentError, "#{sub.inspect} is already mounted in another component" unless sub.root?
+        raise SubcomponentError, "can't mount a component into its own tree" if sub.equal?(root)
+        raise LockedComponentError, "can't mount a #{sub.boot_status} component: it must be open" if sub.locked?
 
         branch, leaf = walk(ckey)
         if (existing = branch.children[leaf])
-          raise DeclarationOverrideError, "#{existing.path} is already declared: can't mount a system there"
+          raise DeclarationOverrideError, "#{existing.path} is already declared: can't mount a component there"
         end
 
         branch.attach(leaf, sub)
@@ -236,11 +236,11 @@ module Sourced
     end
 
     # The mountable interface (see #mount)
-    def to_system = self
+    def to_component = self
 
-    # A node under this system, by relative key
+    # A node under this component, by relative key
     def node(ckey)
-      index.fetch(ckey.to_s) { raise UndeclaredComponentError, "#{ckey} is not declared in #{path || 'this system'}" }
+      index.fetch(ckey.to_s) { raise UndeclaredComponentError, "#{ckey} is not declared in #{path || 'this component'}" }
     end
 
     def declared?(ckey) = index.key?(ckey.to_s)
@@ -249,7 +249,7 @@ module Sourced
     def [](ckey) = node(ckey).read
 
     def read
-      raise NotBuiltError, 'system is not built yet' unless root.readable?
+      raise NotBuiltError, 'component is not built yet' unless root.readable?
       raise UndeclaredComponentError, "#{path} is a namespace, not a component" unless implementation
 
       current_value
@@ -257,14 +257,14 @@ module Sourced
 
     # ---- Lifecycle. Only the root drives it ----------------------------------------
 
-    # Each step publishes system.<stage>ing and system.<stage>ed events (or system.failed),
-    # and component events for every component whose hooks run. See System::Events
+    # Each step publishes root.<stage>ing and root.<stage>ed events (or root.failed),
+    # and component events for every component whose hooks run. See Component::Events
     def prepare!
       raise_mounted!
       synchronize do
         return self if past?(:prepared)
 
-        instrument_system(:prepare) do
+        instrument_root(:prepare) do
           @order = resolve_order
           @order.each { |n| instrument_component(n, :prepare) { n.prepare_node! } }
           @boot_status = :prepared
@@ -279,7 +279,7 @@ module Sourced
         prepare!
         return self if past?(:built)
 
-        instrument_system(:build) do
+        instrument_root(:build) do
           @order.each { |n| instrument_component(n, :build) { n.build_node! } }
           @boot_status = :built
           @readable = true
@@ -289,14 +289,14 @@ module Sourced
     end
 
     # If a start hook raises, nodes already started are torn down (in reverse order),
-    # the system is left :toredown, and the error is re-raised.
+    # the component is left :toredown, and the error is re-raised.
     def start!(context = Thread.current)
       raise_mounted!
       synchronize do
         build!
         return self if past?(:started)
 
-        instrument_system(:start) do
+        instrument_root(:start) do
           @order.each { |n| instrument_component(n, :start) { n.start_node!(context) } }
           @boot_status = :started
         rescue Exception # rubocop:disable Lint/RescueException -- any error (incl. Interrupt) must tear down what was started. Always re-raised
@@ -314,7 +314,7 @@ module Sourced
       synchronize do
         return self unless boot_status == :started
 
-        instrument_system(:teardown) do
+        instrument_root(:teardown) do
           errors = teardown_nodes
           @boot_status = :toredown
           raise errors.first if errors.any?
@@ -323,14 +323,14 @@ module Sourced
       end
     end
 
-    # A System::Graph describing the components under this system, by full path from the root.
+    # A Component::Graph describing the components under this component, by full path from the root.
     # Components are listed in dependency order once the tree is prepared, and in declaration order before that.
     # Namespaces without an implementation are left out.
-    #   graph = sys.graph
+    #   graph = comp.graph
     #   graph.status         # => :built, the root's status
     #   graph.components     # => [{ key: 'logger', type:, type_name:, implemented:, mode:, status:, deps:, missing:, dependents:, provider: }, ...]
     #   graph.to_mermaid     # => a Mermaid flowchart
-    # See System::Graph
+    # See Component::Graph
     def graph
       synchronize do
         nodes = index.values.reject(&:namespace?)
@@ -360,8 +360,8 @@ module Sourced
       end
     end
 
-    # A System::Tree of the systems under this one, as nested nodes: how components are nested,
-    # which systems are mounted, and who declared and implemented each one. See #graph for dependencies.
+    # A Component::Tree of the components under this one, as nested nodes: how components are nested,
+    # which components are mounted, and who declared and implemented each one. See #graph for dependencies.
     #   puts App.tree
     #   (root)
     #   ├── logger Interface[info] (singleton, built)
@@ -391,7 +391,7 @@ module Sourced
     # Nodes in dependency order. Available after #prepare!
     def ordered_nodes
       raise_mounted!
-      raise NotBuiltError, 'system is not prepared yet' unless @order
+      raise NotBuiltError, 'component is not prepared yet' unless @order
 
       @order.dup
     end
@@ -465,7 +465,7 @@ module Sourced
       transition(:toredown) { implementation.teardown(value) }
     end
 
-    # Without the readable check: deps are read while the system is building, in dependency order
+    # Without the readable check: deps are read while the component is building, in dependency order
     protected def current_value = implementation.singleton? ? value : build_value
 
     # Parse the built value through the declared type. Type errors name the component, ex.
@@ -497,7 +497,7 @@ module Sourced
     # ---- Root internals -------------------------------------------------------------
 
     private def raise_mounted!
-      raise SubsystemError, "#{path} is mounted in another system: boot the root" unless root?
+      raise SubcomponentError, "#{path} is mounted in another component: boot the root" unless root?
     end
 
     private def past?(new_status)
@@ -535,23 +535,23 @@ module Sourced
 
     # ---- Telemetry ------------------------------------------------------------------
 
-    # Publish system.<stage>ing, run the block, and publish system.<stage>ed with its duration,
-    # or system.failed if it raises.
-    private def instrument_system(stage)
-      before, after = SYSTEM_EVENTS.fetch(stage)
+    # Publish root.<stage>ing, run the block, and publish root.<stage>ed with its duration,
+    # or root.failed if it raises.
+    private def instrument_root(stage)
+      before, after = ROOT_EVENTS.fetch(stage)
       emit(before)
       started_at = now
       begin
         yield
       rescue Exception => e # rubocop:disable Lint/RescueException -- re-raised
-        emit(Events::SystemFailed, stage:, **error_attributes(e))
+        emit(Events::RootFailed, stage:, **error_attributes(e))
         raise
       end
       emit(after, duration: now - started_at)
     end
 
-    # Same as #instrument_system for a component, but only if the stage would run its hooks.
-    # Dynamic components aren't built by the system, so they don't publish build events.
+    # Same as #instrument_root for a component, but only if the stage would run its hooks.
+    # Dynamic components aren't built by the component, so they don't publish build events.
     private def instrument_component(node, stage)
       return yield unless node.pending?(STAGES.fetch(stage))
       return yield if stage == :build && node.implementation.dynamic?
@@ -568,7 +568,7 @@ module Sourced
       emit(after, key: node.path, duration: now - started_at)
     end
 
-    # Errors as JSON-friendly values. See System::Event
+    # Errors as JSON-friendly values. See Component::Event
     private def error_attributes(error)
       {
         error_class: error.class.name || error.class.inspect,
@@ -606,7 +606,7 @@ module Sourced
       raise ArgumentError, "#{ckey}: pass either a provider or a block, not both" if provider && block
 
       synchronize do
-        raise LockedSystemError, "can't implement #{ckey} in a locked system" if locked?
+        raise LockedComponentError, "can't implement #{ckey} in a locked component" if locked?
 
         target = node(ckey)
         implementation = if provider
@@ -663,7 +663,7 @@ module Sourced
       end
     end
 
-    # Walk a key's intermediate segments from this system, creating namespace nodes owned by it.
+    # Walk a key's intermediate segments from this component, creating namespace nodes owned by it.
     # Returns the branch node and the last segment.
     private def walk(ckey)
       ckey = ckey.to_s
@@ -671,7 +671,7 @@ module Sourced
 
       *segments, leaf = ckey.split('.')
       branch = segments.reduce(self) do |current, segment|
-        child = current.children[segment] || current.attach(segment, System.new(owner: self))
+        child = current.children[segment] || current.attach(segment, Component.new(owner: self))
         raise OwnershipError, ownership_message(child) unless child.owner.equal?(self)
 
         child
@@ -680,10 +680,10 @@ module Sourced
     end
 
     private def ownership_message(node)
-      owner = node.owner.path || 'another system'
-      "#{node.path} is owned by #{owner}: declare it there. This system can only implement it"
+      owner = node.owner.path || 'another component'
+      "#{node.path} is owned by #{owner}: declare it there. This component can only implement it"
     end
 
-    protected def type_name = type.inspect.gsub(/(Plumb::Types|Sourced::System::T)::/, '')
+    protected def type_name = type.inspect.gsub(/(Plumb::Types|Sourced::Component::T)::/, '')
   end
 end

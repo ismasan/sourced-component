@@ -5,9 +5,9 @@
 
 require 'date'
 require 'bundler/setup'
-require 'sourced/system'
+require 'sourced/component'
 
-T = Sourced::System::T
+T = Sourced::Component::T
 
 # Sample ENV, unless already set
 ENV['USER_NAME'] ||= 'Ismael'
@@ -27,40 +27,40 @@ AppSettings = T::Data[
 ]
 Shell = T::Data[user: String, home: String]
 
-Sys = Sourced::System.new
+App = Sourced::Component.new
 
-Sys.declare('user.email', T::Email)
-Sys.declare('app.port', Integer)
-Sys.declare('user.info', User)
-Sys.declare('app.settings', AppSettings)
-Sys.declare('shell', Shell)
+App.declare('user.email', T::Email)
+App.declare('app.port', Integer)
+App.declare('user.info', User)
+App.declare('app.settings', AppSettings)
+App.declare('shell', Shell)
 
 # Single variables, decoded into each declared type
-Sys.env('USER_EMAIL' => 'user.email', 'APP_PORT' => 'app.port')
+App.env('USER_EMAIL' => 'user.email', 'APP_PORT' => 'app.port')
 
 # Variables matching a regex, collected into a hash with the match removed,
 # and downcased: USER_NAME => name, USER_DOB => dob
-Sys.env(:downcase, /^USER_/ => 'user.info', /^APP_/ => 'app.settings')
+App.env(:downcase, /^USER_/ => 'user.info', /^APP_/ => 'app.settings')
 
 # All variables, downcased: picks up the system's USER and HOME.
 # This is why collecting with a regex matters for anything that isn't meant to read system variables.
-Sys.env(:downcase, 'shell')
+App.env(:downcase, 'shell')
 
-Sys.start!
+App.start!
 
 puts "== Components\n\n"
 %w[user.email app.port user.info app.settings shell].each do |key|
-  value = Sys[key]
+  value = App[key]
   puts "#{key}: #{(value.respond_to?(:to_h) ? value.to_h : value).inspect}"
 end
 
-puts "\n== System\n\n"
-puts Sys.ordered_nodes.map(&:inspect)
+puts "\n== Component\n\n"
+puts App.ordered_nodes.map(&:inspect)
 
 # Missing or invalid variables fail the boot, naming each variable
 puts "\n== Missing variables\n\n"
 
-Broken = Sourced::System.new
+Broken = Sourced::Component.new
 Broken.declare('payments.settings', T::Data[api_key: String, region: String])
 Broken.declare('payments.webhook', T::String[/\Ahttps:/])
 Broken.env(:downcase, /^PAYMENTS_/ => 'payments.settings')
@@ -75,4 +75,4 @@ rescue Plumb::ParseError => e
   puts 'try: PAYMENTS_API_KEY=abc PAYMENTS_REGION=eu PAYMENTS_WEBHOOK_URL=https://example.com bundle exec ruby examples/env.rb'
 end
 
-Sys.teardown!
+App.teardown!

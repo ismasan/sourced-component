@@ -1,17 +1,17 @@
 # frozen_string_literal: true
 
 module Sourced
-  class System
+  class Component
     MODES = %i[singleton dynamic].freeze
 
-    # How a node is built. Deps are keys relative to the implementer: the system that called #component! or #component.
+    # How a node is built. Deps are keys relative to the implementer: the component that called #component! or #component.
     #   prepare:  hooks run with no arguments
     #   build:    hooks run with dep values. The last result is the node's value
     #   start:    hooks run with (value, context)
     #   teardown: hooks run with (value)
     class Implementation
-      # provider: the provider the component was implemented with (see System#component!), the block of
-      # System#config! and #config, or nil for blocks of hooks
+      # provider: the provider the component was implemented with (see Component#component!), the block of
+      # Component#config! and #config, or nil for blocks of hooks
       attr_reader :deps, :implementer, :mode, :provider
 
       def self.from_block(deps, implementer:, mode:, &block)

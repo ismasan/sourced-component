@@ -3,10 +3,10 @@
 require 'sourced/message'
 
 module Sourced
-  class System
-    # The parent class of all lifecycle events published to a system's notifier.
+  class Component
+    # The parent class of all lifecycle events published to a component's notifier.
     # Events are Sourced::Message structs, so they build their own registry
-    # (System::Event.registry), and can be serialized with Sourced::Message codecs.
+    # (Component::Event.registry), and can be serialized with Sourced::Message codecs.
     #
     # Every event's payload carries the process, thread and fiber it was published from:
     #   event.type            # => 'components.built'
@@ -32,10 +32,10 @@ module Sourced
 
     # Each event class has a #type string, which can be used to subscribe to it,
     # ex. notifier.subscribe('components.built') { |event| ... }
-    # Events::SystemEvent and Events::ComponentEvent can be used to subscribe to all events of a kind.
+    # Events::RootEvent and Events::ComponentEvent can be used to subscribe to all events of a kind.
     module Events
       # Events about the whole tree, published by its root
-      class SystemEvent < Event; end
+      class RootEvent < Event; end
 
       # Events about a component, with its full path as the payload's key
       class ComponentEvent < Event
@@ -55,15 +55,15 @@ module Sourced
         attribute :backtrace, Plumb::Types::Array[String]
       end
 
-      SystemPreparing = SystemEvent.define('system.preparing')
-      SystemPrepared = SystemEvent.define('system.prepared', &Completed)
-      SystemBuilding = SystemEvent.define('system.building')
-      SystemBuilt = SystemEvent.define('system.built', &Completed)
-      SystemStarting = SystemEvent.define('system.starting')
-      SystemStarted = SystemEvent.define('system.started', &Completed)
-      SystemTearingDown = SystemEvent.define('system.tearing_down')
-      SystemToredown = SystemEvent.define('system.toredown', &Completed)
-      SystemFailed = SystemEvent.define('system.failed', &Failed)
+      RootPreparing = RootEvent.define('root.preparing')
+      RootPrepared = RootEvent.define('root.prepared', &Completed)
+      RootBuilding = RootEvent.define('root.building')
+      RootBuilt = RootEvent.define('root.built', &Completed)
+      RootStarting = RootEvent.define('root.starting')
+      RootStarted = RootEvent.define('root.started', &Completed)
+      RootTearingDown = RootEvent.define('root.tearing_down')
+      RootToredown = RootEvent.define('root.toredown', &Completed)
+      RootFailed = RootEvent.define('root.failed', &Failed)
 
       ComponentDeclared = ComponentEvent.define('components.declared') do
         attribute :type_name, String
@@ -88,11 +88,11 @@ module Sourced
     # Lifecycle stages, the status each one moves to, and their events
     STAGES = { prepare: :prepared, build: :built, start: :started, teardown: :toredown }.freeze
 
-    SYSTEM_EVENTS = {
-      prepare: [Events::SystemPreparing, Events::SystemPrepared],
-      build: [Events::SystemBuilding, Events::SystemBuilt],
-      start: [Events::SystemStarting, Events::SystemStarted],
-      teardown: [Events::SystemTearingDown, Events::SystemToredown]
+    ROOT_EVENTS = {
+      prepare: [Events::RootPreparing, Events::RootPrepared],
+      build: [Events::RootBuilding, Events::RootBuilt],
+      start: [Events::RootStarting, Events::RootStarted],
+      teardown: [Events::RootTearingDown, Events::RootToredown]
     }.freeze
 
     COMPONENT_EVENTS = {

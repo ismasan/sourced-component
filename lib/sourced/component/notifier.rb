@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module Sourced
-  class System
+  class Component
     # The default notifier. Custom notifiers must implement the same #publish and #subscribe interface.
     # Handlers are called synchronously, in the order they subscribed, by the thread or fiber running the lifecycle step.
     # Errors raised by handlers propagate to the caller.

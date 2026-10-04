@@ -1,15 +1,15 @@
 # frozen_string_literal: true
 
-require_relative "lib/sourced/system/version"
+require_relative "lib/sourced/component/version"
 
 Gem::Specification.new do |spec|
-  spec.name = "sourced-system"
-  spec.version = Sourced::System::VERSION
+  spec.name = "sourced-component"
+  spec.version = Sourced::Component::VERSION
   spec.authors = ["Ismael Celis"]
   spec.email = ["ismaelct@gmail.com"]
 
   spec.summary = "A tree of nested, typed components with dependencies and a managed lifecycle."
-  spec.description = "Declare typed components as a tree of systems, implement them with dependencies and prepare/build/start/teardown hooks, and mount library systems into applications."
+  spec.description = "Declare typed components as a tree, implement them with dependencies and prepare/build/start/teardown hooks, and mount library components into applications."
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.2.0"
 

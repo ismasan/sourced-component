@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module Sourced
-  class System
+  class Component
     # Helpers shared by Graph#to_mermaid and Tree#to_mermaid
     module Mermaid
       # Styles for component statuses, and for declared-but-unimplemented components

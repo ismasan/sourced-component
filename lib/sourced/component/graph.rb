@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 module Sourced
-  class System
-    # Returned by System#graph. #components are hashes describing each declared component, by full path:
+  class Component
+    # Returned by Component#graph. #components are hashes describing each declared component, by full path:
     #   {
     #     key: 'sourced.db',          # the component's full path from the root
     #     type: <Plumb type>,
@@ -44,7 +44,7 @@ module Sourced
         missing = components.flat_map { |node| node.fetch(:missing, []) }.uniq
         outside = components.flat_map { |node| node[:deps] }.uniq - keys
         outside.each do |key|
-          details, css_class = missing.include?(key) ? ['not declared', :missing] : ['outside this system', :external]
+          details, css_class = missing.include?(key) ? ['not declared', :missing] : ['outside this component', :external]
           lines << "  #{id_for.(key)}[\"#{Mermaid.escape(key)}<br/><i>#{details}</i>\"]:::#{css_class}"
         end
 

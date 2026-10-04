@@ -1,16 +1,16 @@
 # frozen_string_literal: true
 
 module Sourced
-  class System
+  class Component
     # Builds a component from ENV, decoding values into the node's type with Plumb::Codec::Forms,
     # the codec for string input (ex. '30' => 30, '1977-11-29' => Date).
     #   ENVProvider.new('USER_EMAIL')         # a single variable
     #   ENVProvider.new(/^USER_/)             # matching variables into a hash, with the match removed: USER_NAME => NAME
     #   ENVProvider.new(/^USER_/, :downcase)  # ... and modified: USER_NAME => name
     #   ENVProvider.new                       # all variables into a hash, same as ENVProvider.new(ENVProvider::ALL)
-    # A component provider (see System#component!), and what System#env uses:
-    #   sys.component!('user.email', ENVProvider.new('USER_EMAIL'))
-    #   sys.component!('everything', ENVProvider) # all variables
+    # A component provider (see Component#component!), and what Component#env uses:
+    #   comp.component!('user.email', ENVProvider.new('USER_EMAIL'))
+    #   comp.component!('everything', ENVProvider) # all variables
     class ENVProvider
       T = Plumb::Types
 

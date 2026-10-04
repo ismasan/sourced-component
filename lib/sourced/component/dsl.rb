@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module Sourced
-  class System
+  class Component
     # Lifecycle hooks a component can implement, in the order they run
     HOOKS = %i[prepare build start teardown].freeze
 

@@ -1,18 +1,18 @@
 # frozen_string_literal: true
 
 module Sourced
-  class System
-    # A module that injects system components into a class as keyword arguments to #initialize,
+  class Component
+    # A module that injects components into a class as keyword arguments to #initialize,
     # defaulting to the component's value when the object is instantiated.
-    #   include Sys.inject('logger', 'sourced.store' => 'st')
+    #   include App.inject('logger', 'sourced.store' => 'st')
     # Each include prepends its own #initialize, which takes its kwargs and passes the rest on to super,
     # so multiple injections (and the class' own #initialize) compose.
-    # Values are read from the nodes themselves, so a class injecting from a library's system
+    # Values are read from the nodes themselves, so a class injecting from a library's component
     # gets the overrides of the application that mounts it.
     class Injector < Module
       attr_reader :names
 
-      # nodes: { 'component.key' => <System node> }
+      # nodes: { 'component.key' => <Component node> }
       # names: { 'component.key' => :kwarg_name }
       def initialize(nodes, names)
         super()

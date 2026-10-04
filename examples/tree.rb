@@ -3,10 +3,10 @@
 # Run with: bundle exec ruby examples/tree.rb (Ctrl-C to stop), or RUN_FOR=2 bundle exec ruby examples/tree.rb
 
 require 'bundler/setup'
-require 'sourced/system'
+require 'sourced/component'
 require 'logger'
 
-T = Sourced::System::T
+T = Sourced::Component::T
 
 class FakeDB
   attr_reader :name, :logger
@@ -22,7 +22,7 @@ class FakeDB
 end
 
 # A long-running component: processes jobs in a background thread.
-# Start hooks run while holding the system lock, so #start spawns the thread and returns.
+# Start hooks run while holding the root's lock, so #start spawns the thread and returns.
 class Worker
   def initialize(db, logger:)
     @db = db
@@ -81,9 +81,9 @@ class Ticker
   end
 end
 
-# ---- A library, with its own system ----------------------------------------------
+# ---- A library, with its own root component ------------------------------------
 
-Library = Sourced::System.new
+Library = Sourced::Component.new
 Library.declare('logger', T::Interface[:info]) { Logger.new($stdout, progname: 'sourced') }
 Library.declare('db', FakeDB)
 Library.component!('db', ['logger']) do
@@ -94,7 +94,7 @@ end
 
 # ---- An app, mounting it -----------------------------------------------------------
 
-App = Sourced::System.new
+App = Sourced::Component.new
 App.declare('logger', T::Interface[:info]) { Logger.new($stdout, progname: 'app') }
 App.mount('sourced', Library)
 
@@ -121,8 +121,8 @@ App.config('request_id') { "req-#{counter += 1}" }
 # The library can still declare more after being mounted; App's index picks them up
 Library.declare('settings.retries', Integer) { 3 }
 
-# The library's classes inject from the library's own system.
-# Defined before the system is built: values are read on instantiation
+# The library's classes inject from the library's own root component.
+# Defined before the component is built: values are read on instantiation
 class Dispatcher
   include Library.inject('db', 'settings.retries')
 
@@ -148,14 +148,14 @@ end
 puts '== Ownership'
 begin
   App.declare('sourced.extra', String)
-rescue Sourced::System::OwnershipError => e
+rescue Sourced::Component::OwnershipError => e
   puts "App.declare('sourced.extra') => #{e.class}: #{e.message}"
 end
 
 puts "\n== Index"
 puts App.index.keys.join(', ')
 
-# Lifecycle events go to the root's notifier, for every system in the tree
+# Lifecycle events go to the root's notifier, for every component in the tree
 App.notifier.subscribe('components.built') do |event|
   puts format('built %-26s (%.3fms)', event.payload.key, event.payload.duration * 1000)
 end
@@ -169,7 +169,7 @@ end
 puts "\n== Boot"
 begin
   Library.start!
-rescue Sourced::System::SubsystemError => e
+rescue Sourced::Component::SubcomponentError => e
   puts "Library.start! => #{e.class}: #{e.message}"
 end
 App.start!
@@ -187,7 +187,7 @@ puts "App['sourced.db'].name      => #{App['sourced.db'].name}"
 puts "Library['db'].name          => #{Library['db'].name} (the app's override, seen by the library)"
 puts "same object                 => #{App['sourced.db'].equal?(Library['db'])}"
 puts "Library['db'].logger        => #{Library['db'].logger.progname}"
-puts "Dispatcher.new.db.name      => #{Dispatcher.new.db.name} (injected from the library's system)"
+puts "Dispatcher.new.db.name      => #{Dispatcher.new.db.name} (injected from the library's component)"
 puts "Dispatcher.new.retries      => #{Dispatcher.new.retries}"
 puts "Dispatcher.new(db: ...).db  => #{Dispatcher.new(db: :fake).db}"
 puts "App['sourced.settings.retries'] => #{App['sourced.settings.retries']}"
@@ -195,13 +195,13 @@ puts "App['cache.redis.pool']     => #{App['cache.redis.pool']}"
 puts "App['request_id'] x2        => #{App['request_id']}, #{App['request_id']}"
 begin
   App['cache']
-rescue Sourced::System::UndeclaredComponentError => e
+rescue Sourced::Component::UndeclaredComponentError => e
   puts "App['cache'] => #{e.class}: #{e.message}"
 end
 
 begin
   App.declare('late', String)
-rescue Sourced::System::LockedSystemError => e
+rescue Sourced::Component::LockedComponentError => e
   puts "App.declare('late') => #{e.class}: #{e.message}"
 end
 

@@ -2,7 +2,7 @@
 
 source "https://rubygems.org"
 
-# Specify your gem's dependencies in sourced-system.gemspec
+# Specify your gem's dependencies in sourced-component.gemspec
 gemspec
 
 gem "irb"
