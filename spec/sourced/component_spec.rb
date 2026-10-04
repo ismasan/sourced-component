@@ -990,6 +990,40 @@ RSpec.describe Sourced::Component do
       expect { new_component.mount('x', Object.new) }.to raise_error(ArgumentError, /must respond to #to_component/)
     end
 
+    it 'is what #component! and #component do when given a component' do
+      lib = new_component.declare('db', String) { 'lib db' }
+      other = new_component.declare('x') { 1 }
+      lib_module = Module.new
+      lib_module.define_singleton_method(:to_component) { other }
+
+      app = new_component
+      expect(app.component!('sourced', lib)).to be(app)
+      expect(app.component('libs.other', lib_module)).to be(app)
+      app.build!
+
+      expect(app.node('sourced')).to be(lib)
+      expect(app['sourced.db']).to eq('lib db')
+      expect(app['libs.other.x']).to eq(1)
+      expect(app.node('sourced').implementation).to be_nil # mounted, not implemented
+    end
+
+    it 'applies the mount checks when given a component to #component! or #component' do
+      lib = new_component
+      app = new_component.declare('taken')
+      app.component!('sourced', lib)
+
+      expect { new_component.component!('again', lib) }.to raise_error(described_class::SubcomponentError, /already mounted/)
+      expect { app.component('taken', new_component) }.to raise_error(described_class::DeclarationOverrideError, /taken is already declared/)
+    end
+
+    it "doesn't take providers or blocks when mounting with #component! or #component" do
+      app = new_component
+
+      expect { app.component!('a', new_component) { build { 1 } } }.to raise_error(ArgumentError, /a: can't pass a provider or a block when mounting/)
+      expect { app.component('a', new_component, -> { 1 }) }.to raise_error(ArgumentError, /can't pass a provider or a block when mounting/)
+      expect(app.declared?('a')).to be(false)
+    end
+
     it 'raises if #to_component does not return a Component' do
       fake = Object.new
       fake.define_singleton_method(:to_component) { Object.new }

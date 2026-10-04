@@ -358,6 +358,14 @@ App.mount('my_lib', MyLib)
 
 `#mount` raises `ArgumentError` for objects that don't respond to `#to_component`, or whose `#to_component` doesn't return a `Sourced::Component`.
 
+`#component!` and `#component` mount components too: given anything that implements `#to_component`, they're an alias to `#mount`.
+
+```ruby
+App.component('my_lib', MyLib) # same as App.mount('my_lib', MyLib)
+```
+
+Mounting takes no provider or block, so passing either along with a component raises `ArgumentError`.
+
 ### Dependencies are relative to the implementing component
 
 Dependency keys are resolved from the component that called `#component!` (or `#component`):

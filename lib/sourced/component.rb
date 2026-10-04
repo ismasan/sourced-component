@@ -127,14 +127,22 @@ module Sourced
     #   comp.component!('db', ['db.url'], DBFactory)    # DBFactory.call(url)
     #   comp.component!('clock', -> { Time })           # no deps
     #   comp.component!('user.email', Component::ENVProvider.new('USER_EMAIL'))
+    # Given a component (anything with #to_component), it mounts it instead. See #mount
+    #   comp.component!('sourced', Sourced)
     def component!(ckey, deps_or_provider = [], provider = nil, &block)
+      return mount_from(ckey, deps_or_provider, provider, &block) if MountableInterface === deps_or_provider
+
       implement(ckey, deps_or_provider, provider, :singleton, &block)
     end
 
     # Same as #component!, but built on every read, ex. a per-request value.
     #   comp.component('request_id') { build { SecureRandom.uuid } }
     #   comp.component('request_id', -> { SecureRandom.uuid })
+    # Given a component (anything with #to_component), it mounts it instead, same as #component!
+    #   comp.component('sourced', Sourced)
     def component(ckey, deps_or_provider = [], provider = nil, &block)
+      return mount_from(ckey, deps_or_provider, provider, &block) if MountableInterface === deps_or_provider
+
       implement(ckey, deps_or_provider, provider, :dynamic, &block)
     end
 
@@ -593,6 +601,13 @@ module Sourced
     end
 
     private def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    # #component! and #component given a component: an alias to #mount, which takes nothing else
+    private def mount_from(ckey, mountable, provider, &block)
+      raise ArgumentError, "#{ckey}: can't pass a provider or a block when mounting a component" if provider || block
+
+      mount(ckey, mountable)
+    end
 
     # deps_or_provider: deps, or a provider when there are no deps (#component!('clock', -> { Time }))
     private def implement(ckey, deps_or_provider, provider, mode, &block)
