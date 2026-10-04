@@ -8,6 +8,7 @@ require_relative 'system/errors'
 require_relative 'system/dsl'
 require_relative 'system/implementation'
 require_relative 'system/injector'
+require_relative 'system/env_provider'
 
 module Sourced
   # A tree of systems. Every node is a System: it can declare a type, be implemented with
@@ -103,14 +104,21 @@ module Sourced
     #     start { |db, context| }
     #     teardown { |db| db.disconnect }
     #   end
-    def component!(ckey, deps = [], &block)
-      implement(ckey, deps, :singleton, &block)
+    # Instead of a block, a provider can build the component:
+    # - a callable, called with the deps' values, as the build step
+    # - or an object with #builder_for(node), which returns that callable for the node (ex. ENVProvider)
+    #   sys.component!('db', ['db.url'], DBFactory)    # DBFactory.call(url)
+    #   sys.component!('clock', -> { Time })           # no deps
+    #   sys.component!('user.email', System::ENVProvider.new('USER_EMAIL'))
+    def component!(ckey, deps_or_provider = [], provider = nil, &block)
+      implement(ckey, deps_or_provider, provider, :singleton, &block)
     end
 
     # Same as #component!, but built on every read, ex. a per-request value.
     #   sys.component('request_id') { build { SecureRandom.uuid } }
-    def component(ckey, deps = [], &block)
-      implement(ckey, deps, :dynamic, &block)
+    #   sys.component('request_id', -> { SecureRandom.uuid })
+    def component(ckey, deps_or_provider = [], provider = nil, &block)
+      implement(ckey, deps_or_provider, provider, :dynamic, &block)
     end
 
     # A singleton component with only a build step. The block gets the deps' values.
@@ -119,7 +127,7 @@ module Sourced
     def config!(ckey, deps = [], &build_block)
       raise ArgumentError, "config! #{ckey} needs a block to build its value" unless build_block
 
-      implement(ckey, deps, :singleton) { build(&build_block) }
+      implement(ckey, deps, build_block, :singleton)
     end
 
     # Same as #config!, but built on every read
@@ -127,7 +135,36 @@ module Sourced
     def config(ckey, deps = [], &build_block)
       raise ArgumentError, "config #{ckey} needs a block to build its value" unless build_block
 
-      implement(ckey, deps, :dynamic) { build(&build_block) }
+      implement(ckey, deps, build_block, :dynamic)
+    end
+
+    # Implement singleton components built from ENV variables (see System::ENVProvider),
+    # decoding values into each declared type with Plumb::Codec::Forms. ENV is read when components are built.
+    #   sys.env('USER_EMAIL' => 'user.email')        # a single variable
+    #   sys.env(/^USER_/ => 'user.info')             # matching variables into a hash, match removed: USER_NAME => NAME
+    #   sys.env(:downcase, /^USER_/ => 'user.info')  # ... with modifiers: USER_NAME => name
+    #   sys.env('user.info')                         # all variables into a hash
+    #   sys.env(:downcase, 'user.info')              # all variables, with modifiers
+    # A hash can map several sources at once. Modifiers are only allowed when collecting variables with a regex.
+    # Keys are relative to this system. Every source, key and type is checked before anything is implemented.
+    def env(*args)
+      mapping = args.last.is_a?(::Hash) ? args.pop : { ENVProvider::ALL => args.pop }
+      if mapping.empty? || mapping.value?(nil)
+        raise ArgumentError, 'env needs a component key, or a hash of ENV variables (or regexes) => component keys'
+      end
+
+      synchronize do
+        raise LockedSystemError, "can't implement ENV components in a locked system" if locked?
+
+        builders = mapping.map do |source, ckey|
+          target = node(ckey)
+          [target, ENVProvider.new(source, *args).builder_for(target)]
+        end
+        builders.each do |target, builder|
+          target.implement!(Implementation.from_block([], implementer: self, mode: :singleton) { build(builder) })
+        end
+        self
+      end
     end
 
     # Build an Injector for components under this system, by relative key.
@@ -395,13 +432,38 @@ module Sourced
       end
     end
 
-    private def implement(ckey, deps, mode, &block)
+    # deps_or_provider: deps, or a provider when there are no deps (#component!('clock', -> { Time }))
+    private def implement(ckey, deps_or_provider, provider, mode, &block)
+      deps = deps_or_provider
+      unless deps.is_a?(::Array)
+        raise ArgumentError, "#{ckey}: deps must be an Array, got #{deps.inspect}" if provider
+
+        deps = []
+        provider = deps_or_provider
+      end
+      raise ArgumentError, "#{ckey}: pass either a provider or a block, not both" if provider && block
+
       synchronize do
         raise LockedSystemError, "can't implement #{ckey} in a locked system" if locked?
 
-        node(ckey).implement!(Implementation.from_block(deps, implementer: self, mode:, &block))
+        target = node(ckey)
+        implementation = if provider
+                           builder = builder_from(target, provider)
+                           Implementation.from_block(deps, implementer: self, mode:) { build(builder) }
+                         else
+                           Implementation.from_block(deps, implementer: self, mode:, &block)
+                         end
+        target.implement!(implementation)
         self
       end
+    end
+
+    # The build step for a node, from a provider: a callable, or an object with #builder_for(node)
+    private def builder_from(target, provider)
+      return provider.builder_for(target) if provider.respond_to?(:builder_for)
+      return provider if provider.respond_to?(:call)
+
+      raise ArgumentError, "#{target.path}: a provider must respond to #call or #builder_for(node), got #{provider.inspect}"
     end
 
     # Walk a key's intermediate segments from this system, creating namespace nodes owned by it.

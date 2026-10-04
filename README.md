@@ -88,7 +88,7 @@ Declaring a key twice raises `DeclarationOverrideError`.
 
 ## Implementing components
 
-`#component!(key, deps = [], &block)` implements a declared node as a singleton. Dependencies are keys of other components, and their values are passed to `build`, in order.
+`#component!(key, deps = [], provider = nil, &block)` implements a declared node as a singleton, with a block of lifecycle hooks or a [provider](#providers). Dependencies are keys of other components, and their values are passed to `build`, in order.
 
 ```ruby
 App.component!('db', ['db.url', 'logger']) do
@@ -137,6 +137,89 @@ They're the same as:
 App.component!('with.deps', ['sourced.db']) { build { |db| Foo.new(db) } }
 App.component('now') { build { Time.now } }
 ```
+
+### Providers
+
+Instead of a block, `#component!` and `#component` take a provider that builds the component. A provider is either:
+
+- **a callable**, called with the dependencies' values as the build step:
+
+  ```ruby
+  class DBFactory
+    def self.call(url) = DB.new(url)
+  end
+
+  App.component!('db', ['db.url'], DBFactory)
+  App.component!('clock', -> { Time })                # no dependencies
+  App.component('request_id', -> { SecureRandom.uuid }) # dynamic
+  ```
+
+- **or an object with `#builder_for(node)`**, which returns that callable for the node it's implementing. Use it for providers that need to know about the node, ex. its `type` or `path`. `Sourced::System::ENVProvider` is one:
+
+  ```ruby
+  App.component!('user.email', Sourced::System::ENVProvider.new('USER_EMAIL'))
+  App.component!('user.info', Sourced::System::ENVProvider.new(/^USER_/, :downcase))
+  App.component!('everything', Sourced::System::ENVProvider) # all variables
+  ```
+
+A provider only builds the value: provided components have no other hooks, and their values are still parsed through the declared type. Passing both a provider and a block raises `ArgumentError`, and so does a provider that responds to neither `#call` nor `#builder_for`.
+
+### ENV components
+
+`#env` implements singleton components built from ENV variables. Values are decoded into each declared type with [`Plumb::Codec::Forms`](https://github.com/ismasan/plumb), the codec for string input (`'3000'` → `3000`, `'true'` → `true`, `'1977-11-29'` → a `Date`). It maps ENV variables, or regexes matching them, to component keys:
+
+```ruby
+# ENV: USER_EMAIL=me@example.com USER_NAME=Ismael USER_DOB=1977-11-29 APP_PORT=3000
+
+App.declare('user.email', T::Email)
+App.declare('app.port', Integer)
+App.declare('user.info', T::Data[name: String, dob: Date])
+
+# Single variables
+App.env('USER_EMAIL' => 'user.email', 'APP_PORT' => 'app.port')
+
+# Variables matching a regex, collected into a hash and decoded into a struct
+App.env(:downcase, /^USER_/ => 'user.info')
+
+App.start!
+App['user.email'] # => "me@example.com"
+App['app.port']   # => 3000
+App['user.info']  # => #<User name="Ismael" dob=1977-11-29>
+```
+
+| Call | Reads |
+| --- | --- |
+| `env('USER_EMAIL' => 'user.email')` | the `USER_EMAIL` variable |
+| `env(/^USER_/ => 'user.info')` | variables matching the regex, into a hash, with the match removed: `USER_NAME` → `NAME` |
+| `env(:downcase, /^USER_/ => 'user.info')` | the same, with modifiers applied to the names: `USER_NAME` → `name` |
+| `env('user.info')` | all variables, into a hash |
+| `env(:downcase, 'user.info')` | all variables, with modifiers |
+
+- **Collecting into a hash:**
+  - The matched part is removed from each name, then modifiers are applied (only `:downcase` so far). Names left empty are skipped.
+  - The hash is decoded into the declared type, and variables that aren't attributes are ignored. Keys come out as the type expects them: symbols for `Data` structs, `Hash[name: …]` schemas and `Hash[Symbol, …]` maps, and strings for `Hash[String, …]` maps and string-keyed schemas.
+  - **The declared type must take a hash:** a `Hash` schema or map, or a `Data` struct, including nullable ones, ones with defaults, or unions with a hash branch. This is checked when `#env` is called, so `env(/^USER_/ => 'user.email')` with a `String` type raises `ArgumentError` right away, suggesting a single variable instead.
+- **Modifiers only apply when collecting** with a regex, or all variables. Using one with a single variable raises `ArgumentError`, and so does an unknown modifier.
+- **Prefer a regex to collecting everything.** ENV is shared by the whole process, so `env(:downcase, 'user.info')` would read a `user` or `home` attribute from the system's `USER` or `HOME`.
+- **One call can map several sources,** ex. `env(:downcase, /^USER_/ => 'user.info', /^APP_/ => 'app.settings')`. Every source, key and type is checked before any component is implemented.
+- **ENV is read on `#build!`,** not when `#env` is called.
+- **Keys are relative to the system** `#env` is called on, like `#component!`. An app can implement a mounted library's components from ENV: `App.env('DB_URL' => 'my_lib.db.url')`.
+- **Untyped components** (declared without a type, so `Any`) get raw strings: the variable's value, or a hash of them with string keys.
+- **Missing or invalid variables fail the build** with `Sourced::System::ENVProvider::Error` (a `Plumb::ParseError`) naming the component and each variable. Values are left out of the message, since ENV often holds secrets. Use a nullable type, an optional attribute or a default if a variable may be absent.
+
+  ```
+  invalid ENV for user.email: USER_EMAIL is missing
+
+  invalid ENV for user.info:
+    USER_DOB is invalid: Must match /\A\d{4}-\d{2}-\d{2}\z/
+    email is missing from ENV variables matching /^USER_/
+  ```
+
+  If a missing attribute matches a variable in a different case, the message suggests `:downcase`.
+
+Under the hood, `#env` implements components with [`ENVProvider`](#providers), which can also be used directly, ex. for a dynamic component that reads ENV on every read: `App.component('flag', Sourced::System::ENVProvider.new('FLAG'))`.
+
+See [examples/env.rb](examples/env.rb).
 
 ## Reading values
 

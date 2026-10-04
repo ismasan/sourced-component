@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'date'
 
 RSpec.describe Sourced::System do
   def new_system = described_class.new
@@ -274,6 +275,92 @@ RSpec.describe Sourced::System do
       expect(sys.node('b').implementation.deps).to eq(['a'])
     end
 
+    describe 'providers' do
+      it 'builds components with callables, called with the deps values' do
+        factory = Class.new { def self.call(url) = "DB(#{url})" }
+        sys = new_system
+        sys.declare('db.url', String) { 'sqlite://' }
+        sys.declare('db', String)
+        sys.declare('clock')
+        sys.component!('db', ['db.url'], factory)
+        sys.component!('clock', -> { Time }) # no deps
+        sys.build!
+
+        expect(sys['db']).to eq('DB(sqlite://)')
+        expect(sys['clock']).to be(Time)
+        expect(sys.node('db').implementation).to have_attributes(mode: :singleton, deps: ['db.url'], implementer: sys)
+      end
+
+      it 'builds dynamic components with callables' do
+        counter = 0
+        sys = new_system
+        sys.declare('id', Integer)
+        sys.component('id', -> { counter += 1 })
+        sys.build!
+
+        expect(sys.node('id').implementation.mode).to eq(:dynamic)
+        expect([sys['id'], sys['id']]).to eq([1, 2])
+      end
+
+      it 'sets up providers with #builder_for(node)' do
+        provider = Class.new do
+          def self.builder_for(node) = ->(prefix) { "#{prefix} #{node.path} #{node.type.inspect}" }
+        end
+        sys = new_system
+        sys.declare('prefix', String) { 'built' }
+        sys.declare('a.b', String)
+        sys.component!('a.b', ['prefix'], provider)
+        sys.build!
+
+        expect(sys['a.b']).to eq('built a.b String')
+      end
+
+      it 'accepts ENV providers' do
+        previous = ENV['SYS_TEST_NAME']
+        ENV['SYS_TEST_NAME'] = 'Joe'
+        sys = new_system
+        sys.declare('name', String)
+        sys.declare('all', Plumb::Types::Hash[SYS_TEST_NAME: String])
+        sys.component!('name', described_class::ENVProvider.new('SYS_TEST_NAME'))
+        sys.component!('all', described_class::ENVProvider) # all variables
+        sys.build!
+
+        expect(sys['name']).to eq('Joe')
+        expect(sys['all']).to eq(SYS_TEST_NAME: 'Joe')
+      ensure
+        previous.nil? ? ENV.delete('SYS_TEST_NAME') : ENV['SYS_TEST_NAME'] = previous
+      end
+
+      it 'checks ENV providers against the node type' do
+        sys = new_system.declare('name', String)
+
+        expect { sys.component!('name', described_class::ENVProvider.new(/^USER_/)) }.to raise_error(ArgumentError, /doesn't take one/)
+        expect(sys.node('name').implementation).to be_nil
+      end
+
+      it 'parses provided values through the declared type' do
+        sys = new_system.declare('n', Integer)
+        sys.component!('n', -> { 'nope' })
+
+        expect { sys.build! }.to raise_error(Plumb::ParseError, 'n: Must be a Integer')
+      end
+
+      it 'raises for providers that are not callable' do
+        sys = new_system.declare('a')
+
+        expect { sys.component!('a', Object.new) }.to raise_error(ArgumentError, /a: a provider must respond to #call or #builder_for/)
+        expect { sys.component!('a', 'b') }.to raise_error(ArgumentError, /a provider must respond/)
+      end
+
+      it 'raises when given both a provider and a block, or deps that are not an array' do
+        sys = new_system.declare('a')
+
+        expect { sys.component!('a', -> { 1 }) { build { 2 } } }.to raise_error(ArgumentError, /either a provider or a block/)
+        expect { sys.component!('a', ['b'], -> { 1 }) { build { 2 } } }.to raise_error(ArgumentError, /either a provider or a block/)
+        expect { sys.component!('a', 'b', -> { 1 }) }.to raise_error(ArgumentError, /deps must be an Array/)
+      end
+    end
+
     it 'raises for unknown implementation modes' do
       expect {
         described_class::Implementation.new([], implementer: new_system, mode: :lazy, hooks: {})
@@ -365,6 +452,279 @@ RSpec.describe Sourced::System do
       sys.declare('a') { 1 }
       sys.prepare!
       expect { sys.config('a') { 2 } }.to raise_error(described_class::LockedSystemError)
+    end
+  end
+
+  describe '#env' do
+    let(:user) { Plumb::Types::Data[name: String, dob: Date] }
+
+    # Set ENV variables for the block, restoring previous values afterwards
+    def with_env(vars)
+      previous = vars.keys.to_h { |k| [k, ENV[k]] }
+      vars.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
+      yield
+    ensure
+      previous.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
+    end
+
+    def build(sys)
+      sys.build!
+      sys
+    end
+
+    def env_error = described_class::ENVProvider::Error
+
+    describe 'single variables' do
+      it 'decodes a variable into the declared type' do
+        with_env('USER_EMAIL' => 'me@example.com', 'APP_PORT' => '3000') do
+          sys = new_system.declare('user.email', Plumb::Types::Email).declare('app.port', Integer)
+          expect(sys.env('USER_EMAIL' => 'user.email', 'APP_PORT' => 'app.port')).to be(sys)
+
+          expect(build(sys)['user.email']).to eq('me@example.com')
+          expect(sys['app.port']).to eq(3000)
+        end
+      end
+
+      it 'names the variable when it is missing or invalid, without its value' do
+        with_env('USER_EMAIL' => nil) do
+          sys = new_system.declare('user.email', Plumb::Types::Email).env('USER_EMAIL' => 'user.email')
+          expect { sys.build! }.to raise_error(env_error, 'invalid ENV for user.email: USER_EMAIL is missing')
+        end
+
+        with_env('USER_EMAIL' => 'secret-nope') do
+          sys = new_system.declare('user.email', Plumb::Types::Email).env('USER_EMAIL' => 'user.email')
+          expect { sys.build! }.to raise_error(Plumb::ParseError) { |e|
+            expect(e).to be_a(env_error)
+            expect(e.message).to start_with('invalid ENV for user.email: USER_EMAIL is invalid: Must match')
+            expect(e.message).not_to include('secret-nope')
+          }
+        end
+      end
+
+      it 'allows missing variables for nullable types' do
+        with_env('USER_EMAIL' => nil) do
+          sys = new_system.declare('user.email', Plumb::Types::Email.nullable).env('USER_EMAIL' => 'user.email')
+          expect(build(sys)['user.email']).to be_nil
+        end
+      end
+
+      it "doesn't allow modifiers" do
+        sys = new_system.declare('user.email')
+        expect { sys.env(:downcase, 'USER_EMAIL' => 'user.email') }.to raise_error(ArgumentError, /only be used when collecting variables with a regex/)
+        expect(sys.node('user.email').implementation).to be_nil
+      end
+    end
+
+    describe 'collecting variables with a regex' do
+      it 'collects matching variables into a hash, removing the match, and decodes it' do
+        with_env('NAME' => 'root', 'USER_NAME' => 'Ismael', 'USER_DOB' => '1977-11-29') do
+          sys = new_system.declare('user.info', Plumb::Types::Hash[NAME: String, DOB: Date])
+          sys.env(/^USER_/ => 'user.info')
+
+          expect(build(sys)['user.info']).to eq(NAME: 'Ismael', DOB: Date.new(1977, 11, 29))
+        end
+      end
+
+      it 'decodes names into the keys the type expects: symbols for schemas and symbol maps, strings for string maps' do
+        with_env('APP_HOST' => 'localhost', 'APP_PORT' => '3000') do
+          sys = new_system
+          sys.declare('strings', Plumb::Types::Hash[String, String])
+          sys.declare('symbols', Plumb::Types::Hash[Symbol, String])
+          sys.declare('schema', Plumb::Types::Hash['HOST' => String, 'PORT' => Integer])
+          # separate calls: the same regex twice in one hash literal would be one key
+          %w[strings symbols schema].each { |key| sys.env(/^APP_/ => key) }
+          sys.build!
+
+          expect(sys['strings']).to include('HOST' => 'localhost', 'PORT' => '3000')
+          expect(sys['symbols']).to include(HOST: 'localhost', PORT: '3000')
+          expect(sys['schema']).to eq('HOST' => 'localhost', 'PORT' => 3000)
+        end
+      end
+
+      it 'applies modifiers to collected names' do
+        with_env('USER_NAME' => 'Ismael', 'USER_DOB' => '1977-11-29') do
+          sys = new_system.declare('user.info', user).env(:downcase, /^USER_/ => 'user.info')
+
+          expect(build(sys)['user.info']).to be_a(user).and have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
+        end
+      end
+
+      it 'names invalid variables, and missing attributes, hinting at modifiers' do
+        with_env('USER_NAME' => 'Ismael', 'USER_DOB' => 'not-a-date', 'USER_EMAIL' => nil) do
+          type = Plumb::Types::Data[name: String, dob: Date, email: String]
+          sys = new_system.declare('user.info', type).env(:downcase, /^USER_/ => 'user.info')
+
+          expect { sys.build! }.to raise_error(env_error, <<~MSG.chomp)
+            invalid ENV for user.info:
+              USER_DOB is invalid: Must match /\\A\\d{4}-\\d{2}-\\d{2}\\z/
+              email is missing from ENV variables matching /^USER_/
+          MSG
+        end
+
+        with_env('USER_NAME' => 'Ismael', 'USER_DOB' => '1977-11-29') do
+          sys = new_system.declare('user.info', user).env(/^USER_/ => 'user.info')
+
+          expect { sys.build! }.to raise_error(
+            env_error, /name is missing from ENV variables matching \/\^USER_\/ \(found USER_NAME, try :downcase\)/
+          )
+        end
+      end
+
+      it 'checks that the declared type takes a hash' do
+        person = Class.new(Plumb::Types::Data) { attribute :name, String }
+        takes_hash = [
+          Plumb::Types::Any,
+          Plumb::Types::Hash,
+          Plumb::Types::Hash[name: String],
+          Plumb::Types::Hash[String, String],
+          user,
+          person,
+          user.nullable,
+          Plumb::Types::Hash[name: String].default({}.freeze),
+          Plumb::Types::String | Plumb::Types::Hash
+        ]
+        takes_hash.each do |type|
+          sys = new_system.declare('user.info', type)
+          expect { sys.env(/^USER_/ => 'user.info') }.not_to raise_error, "expected #{type.inspect} to be accepted"
+        end
+
+        [Plumb::Types::String, Plumb::Types::Email, Integer, Plumb::Types::Array[String], Plumb::Types::String.nullable].each do |type|
+          sys = new_system.declare('user.info', type)
+          expect { sys.env(/^USER_/ => 'user.info') }.to raise_error(
+            ArgumentError, /user.info: ENV variables matching \/\^USER_\/ are collected into a hash, but .+ doesn't take one/
+          ), "expected #{type.inspect} to be rejected"
+          expect(sys.node('user.info').implementation).to be_nil
+        end
+      end
+
+      it 'checks types when collecting all variables, and with a provider directly' do
+        sys = new_system.declare('user.email', String)
+
+        expect { sys.env('user.email') }.to raise_error(ArgumentError, /doesn't take one/)
+        expect { described_class::ENVProvider.new(/^USER_/).check!(sys.node('user.email')) }.to raise_error(ArgumentError, /doesn't take one/)
+        expect { sys.env('USER_EMAIL' => 'user.email') }.not_to raise_error # single variables take any type
+      end
+
+      it 'supports optional attributes and defaults' do
+        with_env('USER_NAME' => 'Ismael', 'USER_DOB' => nil) do
+          optional = new_system.declare('user.info', Plumb::Types::Data[name: String, dob?: Date])
+          optional.env(:downcase, /^USER_/ => 'user.info')
+          defaulted = new_system.declare('user.info', Plumb::Types::Data[name: String, dob: Plumb::Types::Date.default(Date.new(2000, 1, 1).freeze)])
+          defaulted.env(:downcase, /^USER_/ => 'user.info')
+
+          expect(build(optional)['user.info']).to have_attributes(name: 'Ismael', dob: nil)
+          expect(build(defaulted)['user.info'].dob).to eq(Date.new(2000, 1, 1))
+        end
+      end
+
+      it 'rejects unknown modifiers' do
+        expect { new_system.declare('a').env(:upcase, /^A_/ => 'a') }.to raise_error(ArgumentError, /unknown ENV modifiers: upcase/)
+      end
+    end
+
+    describe 'collecting all variables' do
+      it 'collects every variable when given only a component key' do
+        with_env('NAME' => 'Ismael', 'DOB' => '1977-11-29') do
+          sys = new_system.declare('user.info', Plumb::Types::Hash[NAME: String, DOB: Date]).env('user.info')
+
+          expect(build(sys)['user.info']).to eq(NAME: 'Ismael', DOB: Date.new(1977, 11, 29))
+        end
+      end
+
+      it 'applies modifiers' do
+        with_env('NAME' => 'Ismael', 'DOB' => '1977-11-29') do
+          sys = new_system.declare('user.info', user).env(:downcase, 'user.info')
+
+          expect(build(sys)['user.info']).to have_attributes(name: 'Ismael', dob: Date.new(1977, 11, 29))
+        end
+      end
+
+      it 'is what a provider with no source does' do
+        expect(described_class::ENVProvider.new.source).to eq(described_class::ENVProvider::ALL)
+      end
+    end
+
+    it 'reads raw strings into untyped (Any) components' do
+      with_env('USER_EMAIL' => 'me@example.com', 'USER_NAME' => 'Ismael') do
+        sys = new_system.declare('user.email').declare('user.info')
+        sys.env('USER_EMAIL' => 'user.email', /^USER_/ => 'user.info')
+        sys.build!
+
+        expect(sys['user.email']).to eq('me@example.com')
+        expect(sys['user.info']).to include('NAME' => 'Ismael', 'EMAIL' => 'me@example.com')
+      end
+    end
+
+    it 'reads ENV when components are built, not when they are implemented' do
+      sys = new_system.declare('user.email', String).env('USER_EMAIL' => 'user.email')
+
+      with_env('USER_EMAIL' => 'later@example.com') do
+        expect(build(sys)['user.email']).to eq('later@example.com')
+      end
+    end
+
+    it 'implements singleton components, replacing previous implementations' do
+      with_env('USER_EMAIL' => 'me@example.com') do
+        sys = new_system.declare('user.email', String) { 'default' }
+        sys.env('USER_EMAIL' => 'user.email')
+
+        expect(sys.node('user.email').implementation).to have_attributes(mode: :singleton, implementer: sys, deps: [])
+        expect(build(sys)['user.email']).to eq('me@example.com')
+      end
+    end
+
+    it 'validates every source, key and type before implementing any' do
+      sys = new_system.declare('a').declare('b', String)
+
+      expect { sys.env('A' => 'a', 42 => 'b') }.to raise_error(ArgumentError, /must be a variable name or a regex/)
+      expect { sys.env('A' => 'a', /^B_/ => 'b') }.to raise_error(ArgumentError, /doesn't take one/)
+      expect { sys.env('A' => 'a', 'B' => 'nope') }.to raise_error(described_class::UndeclaredComponentError)
+      expect { sys.env }.to raise_error(ArgumentError, /needs a component key/)
+      expect(sys.node('a').implementation).to be_nil
+    end
+
+    it "can't implement components in a locked system" do
+      sys = new_system.declare('a') { 1 }
+      sys.prepare!
+
+      expect { sys.env('A' => 'a') }.to raise_error(described_class::LockedSystemError)
+    end
+
+    it 'takes keys relative to the system' do
+      with_env('DB_URL' => 'sqlite://') do
+        sys = new_system.declare('sourced.db.url', String)
+        sys.node('sourced').env('DB_URL' => 'db.url')
+
+        expect(sys.node('sourced.db.url').implementation.implementer).to be(sys.node('sourced'))
+        expect(build(sys)['sourced.db.url']).to eq('sqlite://')
+      end
+    end
+
+    it 'names the full path of components in mounted systems, even if implemented before mounting' do
+      with_env('DB_PORT' => 'nope') do
+        lib = new_system.declare('db.port', Integer).env('DB_PORT' => 'db.port')
+        app = new_system
+        app.mount('sourced', lib)
+
+        expect { app.build! }.to raise_error(env_error, /\Ainvalid ENV for sourced\.db\.port: DB_PORT is invalid/)
+      end
+    end
+
+    it 'lets an app implement components of a mounted system from ENV' do
+      with_env('DB_PORT' => '5432') do
+        lib = new_system.declare('db.port', Integer) { 3306 }
+        app = new_system
+        app.mount('sourced', lib)
+        app.env('DB_PORT' => 'sourced.db.port')
+
+        expect(build(app)['sourced.db.port']).to eq(5432)
+        expect(lib['db.port']).to eq(5432)
+      end
+    end
+
+    it 'shows sources and modifiers when inspecting' do
+      expect(described_class::ENVProvider.new('USER_EMAIL').inspect).to eq('#<Sourced::System::ENVProvider "USER_EMAIL">')
+      expect(described_class::ENVProvider.new(/^USER_/, :downcase).inspect).to eq('#<Sourced::System::ENVProvider /^USER_/ downcase>')
     end
   end
 
