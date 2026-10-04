@@ -1617,6 +1617,208 @@ RSpec.describe Sourced::System do
     end
   end
 
+  describe '#tree' do
+    def app_with_library
+      require 'logger'
+      lib = new_system
+      lib.declare('logger', Plumb::Types::Interface[:info]) { Logger.new(nil) }
+      lib.declare('db', String)
+      lib.config!('db', ['logger']) { 'lib db' }
+      lib.declare('settings.retries', Integer) { 3 }
+
+      app = new_system
+      app.declare('logger') { 2 }
+      app.mount('libs.sourced', lib)
+      app.config!('libs.sourced.db', ['logger']) { 'app db' }
+      app.declare('cache.redis', String) { 'redis://' }
+      app.declare('cache.redis.pool', Integer)
+      [app, lib]
+    end
+
+    it 'renders the tree of systems, with mounted systems and overrides' do
+      app, = app_with_library
+
+      expect(app.tree.to_s).to eq(<<~TREE.chomp)
+        (root)
+        ├── logger Any (singleton, open)
+        ├── libs
+        │   └── sourced [mounted]
+        │       ├── logger Interface[info] (singleton, open)
+        │       ├── db String (singleton, open) implemented by (root)
+        │       └── settings
+        │           └── retries Integer (singleton, open)
+        └── cache
+            └── redis String (singleton, open)
+                └── pool Integer (not implemented, open)
+      TREE
+    end
+
+    it 'shows statuses' do
+      app, = app_with_library
+      app.config!('cache.redis.pool') { 5 }
+      app.start!
+
+      expect(app.tree.status).to eq(:started)
+      expect(app.tree.to_s).to include('pool Integer (singleton, started)')
+    end
+
+    it 'describes the nodes' do
+      app, lib = app_with_library
+      root = app.tree.root
+
+      expect(root).to have_attributes(key: nil, path: nil, namespace: true, mounted: false, owner: nil)
+      expect(root.children.map(&:key)).to eq(%w[logger libs cache])
+
+      sourced = root.children[1].children.first
+      expect(sourced).to have_attributes(key: 'sourced', path: 'libs.sourced', mounted: true, namespace: true, owner: 'libs.sourced')
+
+      db = sourced.children[1]
+      expect(db).to be_a(described_class::Tree::Node)
+      expect(db).to have_attributes(
+        key: 'db',
+        path: 'libs.sourced.db',
+        type: Plumb::Composable.wrap(String),
+        type_name: 'String',
+        namespace: false,
+        mounted: false,
+        implemented: true,
+        mode: :singleton,
+        status: :open,
+        owner: 'libs.sourced',
+        implementer: nil,
+        children: []
+      )
+      expect(db).to be_overridden
+      expect(sourced.children.first).not_to be_overridden # the library's own implementation
+      expect(lib.node('db').path).to eq(db.path)
+    end
+
+    it 'converts to nested hashes' do
+      app, = app_with_library
+      hash = app.tree.to_h
+
+      expect(hash[:status]).to eq(:open)
+      expect(hash[:root][:children].map { |c| c[:key] }).to eq(%w[logger libs cache])
+      expect(hash.dig(:root, :children, 2, :children, 0, :children, 0)).to include(key: 'pool', path: 'cache.redis.pool', implemented: false, children: [])
+    end
+
+    it 'renders the tree under a mounted system' do
+      _app, lib = app_with_library
+
+      expect(lib.tree.to_s).to eq(<<~TREE.chomp)
+        libs.sourced [mounted]
+        ├── logger Interface[info] (singleton, open)
+        ├── db String (singleton, open) implemented by (root)
+        └── settings
+            └── retries Integer (singleton, open)
+      TREE
+    end
+
+    it 'names implementers by path' do
+      lib = new_system
+      lib.declare('db') { 1 }
+      app = new_system
+      app.mount('libs.sourced', lib)
+      app.node('libs').config!('sourced.db') { 2 }
+
+      expect(app.tree.to_s).to include('db Any (singleton, open) implemented by libs')
+    end
+
+    it 'shows implemented namespaces as components with children' do
+      sys = new_system
+      sys.declare('db.url', String) { 'sqlite://' }
+      sys.config!('db', ['db.url']) { |url| url }
+
+      expect(sys.tree.to_s).to eq(<<~TREE.chomp)
+        (root)
+        └── db Any (singleton, open)
+            └── url String (singleton, open)
+      TREE
+    end
+
+    it 'renders an empty system' do
+      expect(new_system.tree.to_s).to eq('(root)')
+    end
+
+    describe '#to_mermaid' do
+      def classdefs = described_class::Tree::MERMAID_CLASSES.map { |name, style| "  classDef #{name} #{style}" }.join("\n")
+
+      it 'draws a top-down tree, with systems, namespaces, components and overrides' do
+        app, = app_with_library
+        app.declare('request_id', String)
+        app.config('request_id') { 'x' }
+
+        expect(app.tree.to_mermaid).to eq(<<~MERMAID.chomp)
+          flowchart TD
+            n0{{"(root)"}}:::system
+            n1["logger<br/>Any<br/><i>singleton, open</i>"]:::open
+            n2("libs"):::namespace
+            n3{{"sourced"}}:::system
+            n4["logger<br/>Interface[info]<br/><i>singleton, open</i>"]:::open
+            n5["db<br/>String<br/><i>singleton, open</i><br/><i>implemented by (root)</i>"]:::open
+            n6("settings"):::namespace
+            n7["retries<br/>Integer<br/><i>singleton, open</i>"]:::open
+            n8("cache"):::namespace
+            n9["redis<br/>String<br/><i>singleton, open</i>"]:::open
+            n10["pool<br/>Integer<br/><i>not implemented</i>"]:::unimplemented
+            n11(["request_id<br/>String<br/><i>dynamic, open</i>"]):::open
+            n0 --> n1
+            n0 --> n2
+            n2 --> n3
+            n3 --> n4
+            n3 --> n5
+            n3 --> n6
+            n6 --> n7
+            n0 --> n8
+            n8 --> n9
+            n9 --> n10
+            n0 --> n11
+          #{classdefs}
+        MERMAID
+      end
+
+      it 'styles nodes by status' do
+        sys = new_system
+        sys.declare('a') { 1 }
+        sys.start!
+
+        expect(sys.tree.to_mermaid.lines[2].strip).to eq('n1["a<br/>Any<br/><i>singleton, started</i>"]:::started')
+      end
+
+      it 'draws the tree under a mounted system, from its full path' do
+        _app, lib = app_with_library
+
+        expect(lib.tree.to_mermaid.lines.first(3).map(&:strip)).to eq([
+          'flowchart TD',
+          'n0{{"libs.sourced"}}:::system',
+          'n1["logger<br/>Interface[info]<br/><i>singleton, open</i>"]:::open'
+        ])
+      end
+
+      it 'draws implemented systems as hexagons, styled by status' do
+        lib = new_system
+        lib.declare('x') { 1 }
+        app = new_system
+        app.mount('lib', lib)
+        app.config!('lib', ['lib.x']) { |x| x }
+
+        expect(app.tree.to_mermaid.lines[2].strip).to eq('n1{{"lib<br/>Any<br/><i>singleton, open</i><br/><i>implemented by (root)</i>"}}:::open')
+      end
+
+      it 'escapes labels' do
+        node = described_class::Tree::Node.new(
+          key: 'a"b', path: 'a"b', type: nil, type_name: 'Hash<String> & more', namespace: false, mounted: false,
+          implemented: false, mode: nil, status: :open, owner: nil, implementer: nil, children: []
+        )
+        tree = described_class::Tree.new(status: :open, root: node.with(key: nil, path: nil, namespace: true, children: [node]))
+
+        expect(tree.to_mermaid.lines[2].strip).to eq(
+          'n1["a#quot;b<br/>Hash#lt;String#gt; #amp; more<br/><i>not implemented</i>"]:::unimplemented'
+        )
+      end
+    end
+  end
+
   describe '#inspect' do
     it 'describes the node' do
       sys = new_system

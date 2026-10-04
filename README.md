@@ -441,6 +441,85 @@ node.children        # => { segment => System }
 node.namespace?      # => no type and no implementation
 ```
 
+### `#tree`
+
+Returns a `Sourced::System::Tree` of the systems under a system: how components are nested, which systems are mounted, and who declared and implemented each one. (`#graph`, below, shows how components depend on each other instead.)
+
+```ruby
+puts App.tree
+```
+
+```
+(root)
+├── db DB (singleton, started)
+├── my_lib [mounted]
+│   ├── logger Interface[info] (singleton, started)
+│   └── store Store (singleton, started) implemented by (root)
+└── cache
+    └── redis String (singleton, started)
+        └── pool Integer (not implemented, open)
+```
+
+- **Mounted systems** are marked `[mounted]`, and namespaces (no type, no implementation) are shown by their key alone.
+- **`implemented by`** marks components implemented by a system other than the one that declared them, ex. an app overriding a library's component. `(root)` is the root of the tree.
+- **Called on a mounted system,** it renders only the tree under it: `MyLib.system.tree`.
+
+`tree.root` is a `Tree::Node`, with `#children`, and `tree.to_h` returns nested hashes:
+
+```ruby
+tree = App.tree
+tree.status # => :started, the root's status
+tree.root.children.map(&:key) # => ["db", "my_lib", "cache"]
+
+store = tree.root.children[1].children[1]
+store.key          # => "store"
+store.path         # => "my_lib.store"
+store.type         # => the declared type
+store.type_name    # => "Store"
+store.namespace    # => false
+store.mounted      # => false, true for mounted systems
+store.implemented  # => true
+store.mode         # => :singleton
+store.status       # => :started
+store.owner        # => "my_lib", the full path of the system that declared it (nil for the root)
+store.implementer  # => nil, the full path of the system that implemented it (nil for the root)
+store.overridden?  # => true: implemented by a system other than its owner
+store.children     # => []
+```
+
+`Tree#to_mermaid` returns a top-down [Mermaid](https://mermaid.js.org) flowchart of the tree:
+
+```ruby
+puts App.tree.to_mermaid
+```
+
+```mermaid
+flowchart TD
+  n0{{"(root)"}}:::system
+  n1["db<br/>DB<br/><i>singleton, started</i>"]:::started
+  n2{{"my_lib"}}:::system
+  n3["logger<br/>Interface[info]<br/><i>singleton, started</i>"]:::started
+  n4["store<br/>Store<br/><i>singleton, started</i><br/><i>implemented by (root)</i>"]:::started
+  n5("cache"):::namespace
+  n6["redis<br/>String<br/><i>singleton, started</i>"]:::started
+  n7["pool<br/>Integer<br/><i>not implemented</i>"]:::unimplemented
+  n0 --> n1
+  n0 --> n2
+  n2 --> n3
+  n2 --> n4
+  n0 --> n5
+  n5 --> n6
+  n6 --> n7
+  classDef started fill:#dcfce7,stroke:#16a34a
+  classDef unimplemented fill:#fef9c3,stroke:#ca8a04,stroke-dasharray:4 3
+  classDef namespace fill:#ffffff,stroke:#a1a1aa
+  classDef system fill:#fafafa,stroke:#18181b,stroke-width:2px
+```
+
+- **Edges point from each node to its children.**
+- **Systems** (the root of the tree, and mounted systems) are hexagons, and **namespaces** are rounded and plain.
+- **Components** are drawn like in `Graph#to_mermaid`: singletons are rectangles, dynamic components are rounded, colored by status, and unimplemented ones are yellow and dashed. Components implemented by another system say which one.
+
 ### `#graph`
 
 Returns a `Sourced::System::Graph` describing the components under a system, useful for tooling, visualisation or debugging. Components are listed by their full path from the root, in dependency order once the tree is prepared, and in declaration order before that. Namespaces without an implementation are left out.

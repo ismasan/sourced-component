@@ -9,9 +9,11 @@ require_relative 'system/dsl'
 require_relative 'system/implementation'
 require_relative 'system/injector'
 require_relative 'system/env_provider'
+require_relative 'system/mermaid'
 require_relative 'system/graph'
 require_relative 'system/events'
 require_relative 'system/notifier'
+require_relative 'system/tree'
 
 module Sourced
   # A tree of systems. Every node is a System: it can declare a type, be implemented with
@@ -356,6 +358,34 @@ module Sourced
 
         Graph.new(status: root.boot_status, components:)
       end
+    end
+
+    # A System::Tree of the systems under this one, as nested nodes: how components are nested,
+    # which systems are mounted, and who declared and implemented each one. See #graph for dependencies.
+    #   puts App.tree
+    #   (root)
+    #   ├── logger Interface[info] (singleton, built)
+    #   └── sourced [mounted]
+    #       └── db DB (singleton, built) implemented by (root)
+    def tree
+      synchronize { Tree.new(status: root.boot_status, root: tree_node) }
+    end
+
+    protected def tree_node
+      Tree::Node.new(
+        key:,
+        path:,
+        type:,
+        type_name:,
+        namespace: namespace?,
+        mounted: !root? && owner.equal?(self),
+        implemented: !implementation.nil?,
+        mode: implementation&.mode,
+        status:,
+        owner: owner.equal?(self) ? path : owner.path,
+        implementer: implementation&.implementer&.path,
+        children: children.values.map { |child| child.tree_node }
+      )
     end
 
     # Nodes in dependency order. Available after #prepare!

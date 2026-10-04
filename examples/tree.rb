@@ -175,6 +175,10 @@ end
 App.start!
 puts App.ordered_nodes.map(&:inspect)
 
+puts "\n== Tree\n\n"
+puts App.tree
+puts App.tree.to_mermaid
+
 puts "\n== Graph (paste into https://mermaid.live)\n\n"
 puts App.graph.to_mermaid
 
