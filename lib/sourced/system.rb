@@ -10,6 +10,8 @@ require_relative 'system/implementation'
 require_relative 'system/injector'
 require_relative 'system/env_provider'
 require_relative 'system/graph'
+require_relative 'system/events'
+require_relative 'system/notifier'
 
 module Sourced
   # A tree of systems. Every node is a System: it can declare a type, be implemented with
@@ -37,7 +39,10 @@ module Sourced
     # index: every descendant, by relative key, ex. { 'sourced' => <System>, 'sourced.db' => <System> }
     attr_reader :key, :parent, :owner, :type, :implementation, :status, :value, :children, :index, :boot_status
 
-    def initialize(owner: nil, type: Plumb::Undefined)
+    # notifier: receives lifecycle events. See System::Notifier and System::Events.
+    # The root's notifier receives the events of the whole tree, so a mounted system uses its root's.
+    def initialize(owner: nil, type: Plumb::Undefined, notifier: Notifier.new)
+      @notifier = NotifierInterface.parse(notifier)
       @key = nil
       @parent = nil
       @owner = owner || self
@@ -58,6 +63,9 @@ module Sourced
 
     def root = parent ? parent.root : self
     def root? = parent.nil?
+
+    # The notifier lifecycle events are published to: the root's, for every system in the tree
+    def notifier = root? ? @notifier : root.notifier
 
     # Full key from the root, ex. 'sourced.db'. nil for the root
     def path
@@ -93,8 +101,9 @@ module Sourced
         else
           node.declare_type!(type) # an implicit namespace this system created, now with a type
         end
+        emit(Events::ComponentDeclared, key: node.path, type_name: node.type_name)
 
-        node.implement!(Implementation.from_block([], implementer: self, mode: :singleton) { build(&default) }) if default
+        implement_node(node, Implementation.from_block([], implementer: self, mode: :singleton) { build(&default) }) if default
         self
       end
     end
@@ -168,7 +177,7 @@ module Sourced
           [target, provider, provider.builder_for(target)]
         end
         builders.each do |target, provider, builder|
-          target.implement!(Implementation.from_builder(builder, [], implementer: self, mode: :singleton, provider:))
+          implement_node(target, Implementation.from_builder(builder, [], implementer: self, mode: :singleton, provider:))
         end
         self
       end
@@ -246,14 +255,18 @@ module Sourced
 
     # ---- Lifecycle. Only the root drives it ----------------------------------------
 
+    # Each step publishes system.<stage>ing and system.<stage>ed events (or system.failed),
+    # and component events for every component whose hooks run. See System::Events
     def prepare!
       raise_mounted!
       synchronize do
         return self if past?(:prepared)
 
-        @order = resolve_order
-        @order.each { |n| n.prepare_node! }
-        @boot_status = :prepared
+        instrument_system(:prepare) do
+          @order = resolve_order
+          @order.each { |n| instrument_component(n, :prepare) { n.prepare_node! } }
+          @boot_status = :prepared
+        end
         self
       end
     end
@@ -264,9 +277,11 @@ module Sourced
         prepare!
         return self if past?(:built)
 
-        @order.each { |n| n.build_node! }
-        @boot_status = :built
-        @readable = true
+        instrument_system(:build) do
+          @order.each { |n| instrument_component(n, :build) { n.build_node! } }
+          @boot_status = :built
+          @readable = true
+        end
         self
       end
     end
@@ -279,10 +294,10 @@ module Sourced
         build!
         return self if past?(:started)
 
-        begin
-          @order.each { |n| n.start_node!(context) }
+        instrument_system(:start) do
+          @order.each { |n| instrument_component(n, :start) { n.start_node!(context) } }
           @boot_status = :started
-        rescue Exception # rubocop:disable Lint/RescueException
+        rescue Exception # rubocop:disable Lint/RescueException -- any error (incl. Interrupt) must tear down what was started. Always re-raised
           teardown_nodes
           @boot_status = :toredown
           raise
@@ -297,53 +312,51 @@ module Sourced
       synchronize do
         return self unless boot_status == :started
 
-        errors = teardown_nodes
-        @boot_status = :toredown
-        raise errors.first if errors.any?
-
+        instrument_system(:teardown) do
+          errors = teardown_nodes
+          @boot_status = :toredown
+          raise errors.first if errors.any?
+        end
         self
       end
     end
 
-# A System::Graph describing the components under this system, by full path from the root.
-# Components are listed in dependency order once the tree is prepared, and in declaration order before that.
-# Namespaces without an implementation are left out.
-#   graph = sys.graph
-#   graph.status         # => :built, the root's status
-#   graph.components     # => [{ key: 'logger', type:, type_name:, implemented:, mode:, status:, deps:, missing:, dependents:, provider: }, ...]
-#   graph.to_mermaid     # => a Mermaid flowchart
-# See System::Graph
-def graph
-  synchronize do
-    nodes = index.values.reject(&:namespace?)
-    nodes = (root.order & nodes) | nodes if root.order
+    # A System::Graph describing the components under this system, by full path from the root.
+    # Components are listed in dependency order once the tree is prepared, and in declaration order before that.
+    # Namespaces without an implementation are left out.
+    #   graph = sys.graph
+    #   graph.status         # => :built, the root's status
+    #   graph.components     # => [{ key: 'logger', type:, type_name:, implemented:, mode:, status:, deps:, missing:, dependents:, provider: }, ...]
+    #   graph.to_mermaid     # => a Mermaid flowchart
+    # See System::Graph
+    def graph
+      synchronize do
+        nodes = index.values.reject(&:namespace?)
+        nodes = (root.order & nodes) | nodes if root.order
 
-    described = nodes.map { |n| [n, *graph_deps(n)] }
-    dependents = Hash.new { |h, k| h[k] = [] }
-    described.each { |n, deps, _| deps.each { |dep| dependents[dep] << n.path } }
+        described = nodes.map { |n| [n, *graph_deps(n)] }
+        dependents = Hash.new { |h, k| h[k] = [] }
+        described.each { |n, deps, _| deps.each { |dep| dependents[dep] << n.path } }
 
-    components = described.map do |n, deps, missing|
-      impl = n.implementation
-      {
-        key: n.path,
-        type: n.type,
-        type_name: n.type_name,
-        implemented: !impl.nil?,
-        mode: impl&.mode,
-        status: n.status,
-        deps:,
-        missing:,
-        dependents: dependents[n.path],
-        provider: impl&.provider
-      }
+        components = described.map do |n, deps, missing|
+          impl = n.implementation
+          {
+            key: n.path,
+            type: n.type,
+            type_name: n.type_name,
+            implemented: !impl.nil?,
+            mode: impl&.mode,
+            status: n.status,
+            deps:,
+            missing:,
+            dependents: dependents[n.path],
+            provider: impl&.provider
+          }
+        end
+
+        Graph.new(status: root.boot_status, components:)
+      end
     end
-
-    Graph.new(status: root.boot_status, components:)
-  end
-end
-
-# Ordered nodes, with deps' values, ex. for an implementation's own #inspect
-
 
     # Nodes in dependency order. Available after #prepare!
     def ordered_nodes
@@ -437,7 +450,7 @@ end
     end
 
     # Whether moving to new_status would run hooks. Only started nodes can be torn down.
-    private def pending?(new_status)
+    protected def pending?(new_status)
       return status == :started if new_status == :toredown
 
       STATUSES.index(status) < STATUSES.index(new_status)
@@ -484,11 +497,72 @@ end
 
     private def teardown_nodes
       @order.reverse.each_with_object([]) do |n, errors|
-        n.teardown_node!
+        instrument_component(n, :teardown) { n.teardown_node! }
       rescue StandardError => e
         errors << e
       end
     end
+
+    # ---- Telemetry ------------------------------------------------------------------
+
+    # Publish system.<stage>ing, run the block, and publish system.<stage>ed with its duration,
+    # or system.failed if it raises.
+    private def instrument_system(stage)
+      before, after = SYSTEM_EVENTS.fetch(stage)
+      emit(before)
+      started_at = now
+      begin
+        yield
+      rescue Exception => e # rubocop:disable Lint/RescueException -- re-raised
+        emit(Events::SystemFailed, stage:, **error_attributes(e))
+        raise
+      end
+      emit(after, duration: now - started_at)
+    end
+
+    # Same as #instrument_system for a component, but only if the stage would run its hooks.
+    # Dynamic components aren't built by the system, so they don't publish build events.
+    private def instrument_component(node, stage)
+      return yield unless node.pending?(STAGES.fetch(stage))
+      return yield if stage == :build && node.implementation.dynamic?
+
+      before, after = COMPONENT_EVENTS.fetch(stage)
+      emit(before, key: node.path)
+      started_at = now
+      begin
+        yield
+      rescue Exception => e # rubocop:disable Lint/RescueException -- re-raised
+        emit(Events::ComponentFailed, key: node.path, stage:, **error_attributes(e))
+        raise
+      end
+      emit(after, key: node.path, duration: now - started_at)
+    end
+
+    # Errors as JSON-friendly values. See System::Event
+    private def error_attributes(error)
+      {
+        error_class: error.class.name || error.class.inspect,
+        error_message: error.message.to_s,
+        backtrace: error.backtrace || []
+      }
+    end
+
+    # Publish an event to the root's notifier, with the process, thread and fiber it was published from
+    private def emit(event_class, **attrs)
+      event = event_class.new(
+        payload: {
+          pid: Process.pid,
+          thread_id: Thread.current.object_id,
+          fiber_id: Fiber.current.object_id,
+          **attrs
+        }
+      )
+      raise ArgumentError, "invalid #{event_class.type} event: #{event.errors}" unless event.valid?
+
+      notifier.publish(event)
+    end
+
+    private def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
     # deps_or_provider: deps, or a provider when there are no deps (#component!('clock', -> { Time }))
     private def implement(ckey, deps_or_provider, provider, mode, &block)
@@ -510,9 +584,22 @@ end
                          else
                            Implementation.from_block(deps, implementer: self, mode:, &block)
                          end
-        target.implement!(implementation)
+        implement_node(target, implementation)
         self
       end
+    end
+
+    private def implement_node(target, implementation)
+      override = !target.implementation.nil?
+      target.implement!(implementation)
+      emit(
+        Events::ComponentImplemented,
+        key: target.path,
+        mode: implementation.mode,
+        deps: implementation.deps,
+        implementer: implementation.implementer.path,
+        override:
+      )
     end
 
     # The builder for a node, from a provider: the provider itself if it's callable,
@@ -529,22 +616,22 @@ end
       raise ArgumentError, "#{target.path}: a provider must respond to #call or #builder_for(node), got #{provider.inspect}"
     end
 
-# A node's deps, as full paths, and the ones that don't resolve to a component
-private def graph_deps(node)
-  impl = node.implementation
-  return [[], []] unless impl
+    # A node's deps, as full paths, and the ones that don't resolve to a component
+    private def graph_deps(node)
+      impl = node.implementation
+      return [[], []] unless impl
 
-  impl.deps.each_with_object([[], []]) do |dep, (deps, missing)|
-    target = impl.implementer.index[dep]
-    if target && !target.namespace?
-      deps << target.path
-    else
-      full = [impl.implementer.path, dep].compact.join('.')
-      deps << full
-      missing << full
+      impl.deps.each_with_object([[], []]) do |dep, (deps, missing)|
+        target = impl.implementer.index[dep]
+        if target && !target.namespace?
+          deps << target.path
+        else
+          full = [impl.implementer.path, dep].compact.join('.')
+          deps << full
+          missing << full
+        end
+      end
     end
-  end
-end
 
     # Walk a key's intermediate segments from this system, creating namespace nodes owned by it.
     # Returns the branch node and the last segment.

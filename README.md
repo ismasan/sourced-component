@@ -499,6 +499,114 @@ flowchart LR
 - **Nodes are colored by status.** Declared but unimplemented components (yellow) and dependencies that aren't declared (red) have dashed borders, so problems that `#prepare!` would reject are visible in the diagram. In a mounted system's graph, dependencies outside it are drawn with a light dashed border.
 - **Label text is escaped,** so type names with brackets, pipes or quotes are safe.
 
+## Events
+
+Declaring, implementing and every lifecycle step publish an event to the root's notifier, ex. for telemetry:
+
+```ruby
+App.notifier.subscribe('components.built') do |event|
+  Metrics.timing("boot.#{event.payload.key}", event.payload.duration)
+end
+```
+
+### Event types
+
+| Type | When | Payload |
+| --- | --- | --- |
+| `components.declared` | `#declare` | `key`, `type_name` |
+| `components.implemented` | a component is implemented, or re-implemented | `key`, `mode`, `deps`, `implementer`, `override` |
+| `components.preparing` / `components.prepared` | around a component's `prepare` hooks | `key`, and `duration` when finished |
+| `components.building` / `components.built` | around a **singleton**'s `build` hooks | `key`, and `duration` when finished |
+| `components.starting` / `components.started` | around a component's `start` hooks | `key`, and `duration` when finished |
+| `components.tearing_down` / `components.toredown` | around a component's `teardown` hooks | `key`, and `duration` when finished |
+| `components.failed` | a component's hook (or type check) raised | `key`, `stage`, `error_class`, `error_message`, `backtrace` |
+| `system.preparing` / `system.prepared` | around `#prepare!` | `duration` when finished |
+| `system.building` / `system.built` | around `#build!` | `duration` when finished |
+| `system.starting` / `system.started` | around `#start!` | `duration` when finished |
+| `system.tearing_down` / `system.toredown` | around `#teardown!` | `duration` when finished |
+| `system.failed` | a lifecycle step raised | `stage`, `error_class`, `error_message`, `backtrace` |
+
+- **Every payload also has `pid`, `thread_id` and `fiber_id`:** the process, thread and fiber the event was published from (`Process.pid`, `Thread.current.object_id`, `Fiber.current.object_id`). Lifecycle events are published by whatever runs that step, so `components.started` shows where a component started.
+- **`key`** is the component's full path from the root, ex. `sourced.db`.
+- **`deps`** are relative to the `implementer`, the full path of the system that implemented the component (`nil` for the root).
+- **`duration`** is in seconds, measured with a monotonic clock.
+- **`stage`** is one of `:prepare`, `:build`, `:start` or `:teardown`.
+- **Errors are described, not attached:** `error_class`, `error_message` and `backtrace` are strings, so events stay serializable (see below). The error itself is re-raised to the caller of the lifecycle method.
+
+A few rules:
+
+- **Build events are only published for singletons.** Dynamic components are built on every read, and publishing each one would be too noisy.
+- **Events are only published for steps that run.** Repeat calls to `#prepare!`, `#build!` and friends are silent.
+- **Failures are published before the error is re-raised.** A failed `#start!` publishes, in order: `components.failed` for the failing component, the teardown events from the rollback, then `system.failed`.
+
+  ```
+  system.starting
+  components.starting a → components.started a
+  components.starting b → components.failed b
+  components.tearing_down a → components.toredown a
+  system.failed
+  ```
+
+### Event classes
+
+Events are [`Sourced::Message`](https://github.com/ismasan/sourced-message) structs, all subclasses of `Sourced::System::Event`:
+
+```
+Sourced::Message
+└── Sourced::System::Event                        # payload: pid, thread_id, fiber_id
+    ├── Sourced::System::Events::SystemEvent      # system.*
+    └── Sourced::System::Events::ComponentEvent   # components.*, adds key
+```
+
+Each event type is a class, ex. `Sourced::System::Events::ComponentBuilt`, with the usual message attributes (`id`, `type`, `created_at`, `metadata`, `payload`, ...). They're registered in `Sourced::System::Event.registry`, which is also visible from `Sourced::Message.registry`:
+
+```ruby
+Sourced::System::Event.registry['components.built'] # => Sourced::System::Events::ComponentBuilt
+```
+
+So events can be serialized with Sourced::Message codecs, ex. to ship them to another process:
+
+```ruby
+codec = Sourced::Message::JSONCodec.default.compile!
+App.notifier.subscribe(Sourced::System::Event) { |event| queue << JSON.dump(codec.encode(event)) }
+```
+
+That's also why payloads only hold JSON-friendly values: `JSONCodec#compile!` checks every message type in the process, these events included.
+
+### The default notifier
+
+`Sourced::System.new` creates a `Sourced::System::Notifier`. Every system in a tree publishes to its root's notifier, so `App.notifier` and `MyLib.system.notifier` are the same once `MyLib` is mounted. Events published by a system before it's mounted (ex. a library's declarations) go to its own notifier, so subscribe on the root before mounting and declaring, or before booting for lifecycle events.
+
+```ruby
+# by type string (or symbol)
+App.notifier.subscribe('system.started') { |event| ... }
+
+# by class. Also matches subclasses
+App.notifier.subscribe(Sourced::System::Events::ComponentStarted) { |event| ... }
+App.notifier.subscribe(Sourced::System::Events::ComponentEvent) { |event| ... } # all component events
+App.notifier.subscribe(Sourced::System::Event) { |event| ... }                  # everything
+```
+
+- **Unknown type strings raise `ArgumentError`,** so a typo can't silently subscribe to nothing.
+- **Handlers run synchronously,** in the order they subscribed. They run in the thread or fiber performing the lifecycle step, while it holds the system lock. Keep handlers fast, or hand the work off to a queue.
+- **Errors raised by handlers propagate.** A handler that raises during `#start!` fails the boot and triggers the rollback.
+- **Subscribing is thread safe,** and it can happen at any time, including after the system is locked.
+
+### Custom notifiers
+
+Pass any object that responds to `#publish(event)` and `#subscribe(event_class_or_type, &block)` to the root:
+
+```ruby
+class OTelNotifier
+  def publish(event) = Tracer.add_event(event.type, attributes: event.payload.to_h)
+  def subscribe(...) = raise(NotImplementedError)
+end
+
+App = Sourced::System.new(notifier: OTelNotifier.new)
+```
+
+The notifier is checked when the system is created. An object without these methods raises `Plumb::ParseError`.
+
 ## Errors
 
 All errors inherit from `Sourced::System::SystemError`, except type mismatches, which raise `Plumb::ParseError` naming the component (without the value, which can hold secrets):

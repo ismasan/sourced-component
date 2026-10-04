@@ -155,6 +155,17 @@ end
 puts "\n== Index"
 puts App.index.keys.join(', ')
 
+# Lifecycle events go to the root's notifier, for every system in the tree
+App.notifier.subscribe('components.built') do |event|
+  puts format('built %-26s (%.3fms)', event.payload.key, event.payload.duration * 1000)
+end
+App.notifier.subscribe('components.failed') do |event|
+  puts "failed #{event.payload.key} (#{event.payload.stage}): #{event.payload.error_class}: #{event.payload.error_message}"
+end
+App.notifier.subscribe('components.toredown') do |event|
+  puts format('toredown %-26s (%.3fms)', event.payload.key, event.payload.duration * 1000)
+end
+
 puts "\n== Boot"
 begin
   Library.start!

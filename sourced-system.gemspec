@@ -34,6 +34,7 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency "plumb", "~> 0.4"
   spec.add_dependency "tsort", "~> 0.2"
+  spec.add_dependency 'sourced-message'
 
   # For more information and examples about making a new gem, check out our
   # guide at: https://guides.rubygems.org/make-your-own-gem/
