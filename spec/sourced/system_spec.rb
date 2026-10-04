@@ -368,6 +368,132 @@ RSpec.describe Sourced::System do
     end
   end
 
+  describe '#inject' do
+    def injectable_system
+      new_system.tap do |s|
+        s.declare('logger') { 'the logger' }
+        s.declare('sourced.store') { 'the store' }
+        counter = 0
+        s.declare('counter', Integer)
+        s.config('counter') { counter += 1 }
+      end
+    end
+
+    it 'injects components as kwargs with readers, defaulting to system values' do
+      sys = injectable_system
+      sys.build!
+      klass = Class.new { include sys.inject('logger') }
+
+      expect(klass.new.logger).to eq('the logger')
+      expect(klass.new(logger: 'custom').logger).to eq('custom')
+      expect(klass.new(logger: nil).logger).to be_nil
+    end
+
+    it 'names kwargs after the last segment of dotted keys, and takes multiple keys' do
+      sys = injectable_system
+      sys.build!
+      klass = Class.new { include sys.inject('logger', 'sourced.store') }
+      obj = klass.new(store: 'custom store')
+
+      expect(obj.logger).to eq('the logger')
+      expect(obj.store).to eq('custom store')
+    end
+
+    it 'aliases keys to custom kwargs with a hash' do
+      sys = injectable_system
+      sys.build!
+      klass = Class.new { include sys.inject('logger', 'sourced.store' => 'st') }
+
+      expect(klass.new.st).to eq('the store')
+      expect(klass.new(st: 'custom').st).to eq('custom')
+      expect(klass.new).not_to respond_to(:store)
+    end
+
+    it "composes multiple injections with the class' own #initialize" do
+      sys = injectable_system
+      sys.build!
+      klass = Class.new do
+        include sys.inject('logger')
+        include sys.inject('sourced.store')
+        attr_reader :args
+
+        def initialize(name, age: 1)
+          @args = [name, age]
+        end
+      end
+      obj = klass.new('joe', age: 40, store: 'custom')
+
+      expect(obj.args).to eq(['joe', 40])
+      expect(obj.logger).to eq('the logger')
+      expect(obj.store).to eq('custom')
+    end
+
+    it 'is inherited by subclasses' do
+      sys = injectable_system
+      sys.build!
+      parent = Class.new { include sys.inject('logger') }
+      child = Class.new(parent) { include sys.inject('sourced.store') }
+      obj = child.new(logger: 'custom')
+
+      expect(obj.logger).to eq('custom')
+      expect(obj.store).to eq('the store')
+    end
+
+    it 'reads values on instantiation, so classes can be defined before the system is built' do
+      sys = injectable_system
+      klass = Class.new { include sys.inject('counter') }
+      expect { klass.new }.to raise_error(described_class::NotBuiltError)
+
+      sys.build!
+      expect(klass.new.counter).to eq(1)
+      expect(klass.new.counter).to eq(2)
+    end
+
+    it 'injects by keys relative to the system' do
+      sys = injectable_system
+      sys.build!
+      klass = Class.new { include sys.node('sourced').inject('store') }
+
+      expect(klass.new.store).to eq('the store')
+    end
+
+    it "gives classes injecting from a library's system the overrides of the app that mounts it" do
+      lib = new_system
+      lib.declare('store', String) { 'lib store' }
+      klass = Class.new { include lib.inject('store') } # defined before the library is mounted
+
+      app = new_system
+      app.mount('sourced', lib)
+      app.config!('sourced.store') { 'app store' }
+
+      expect { klass.new }.to raise_error(described_class::NotBuiltError)
+      app.build!
+      expect(klass.new.store).to eq('app store')
+    end
+
+    it 'describes the injection' do
+      sys = injectable_system
+
+      expect(sys.inject('logger', 'sourced.store' => 'st').inspect)
+        .to eq('#<Sourced::System::Injector logger => logger, sourced.store => st>')
+    end
+
+    it 'raises on undeclared components' do
+      sys = injectable_system
+
+      expect { sys.inject('nope') }.to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
+    end
+
+    it 'raises on duplicate names' do
+      sys = injectable_system
+      sys.declare('other.logger')
+      expect { sys.inject('logger', 'other.logger') }.to raise_error(ArgumentError, /duplicate injected names: logger/)
+
+      klass = Class.new { include sys.inject('logger') }
+      expect { klass.include(sys.inject('other.logger')) }.to raise_error(ArgumentError, /already injects logger/)
+    end
+  end
+
   describe '#mount' do
     it 'attaches a standalone system as a branch, indexing its nodes' do
       lib = new_system

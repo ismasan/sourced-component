@@ -7,6 +7,7 @@ require_relative 'system/version'
 require_relative 'system/errors'
 require_relative 'system/dsl'
 require_relative 'system/implementation'
+require_relative 'system/injector'
 
 module Sourced
   # A tree of systems. Every node is a System: it can declare a type, be implemented with
@@ -127,6 +128,27 @@ module Sourced
       raise ArgumentError, "config #{ckey} needs a block to build its value" unless build_block
 
       implement(ckey, deps, :dynamic) { build(&build_block) }
+    end
+
+    # Build an Injector for components under this system, by relative key.
+    # Keys map to kwargs named after their last segment ('sourced.store' => :store),
+    # and a Hash maps keys to custom kwarg names ('sourced.store' => 'st').
+    #   class Dispatcher
+    #     include Sys.inject('logger', 'sourced.store' => 'st')
+    #   end
+    # Values are read when objects are instantiated, so classes can be defined before the system is built.
+    def inject(*keys)
+      names = keys.each_with_object({}) do |arg, map|
+        pairs = arg.is_a?(::Hash) ? arg : { arg => arg.to_s.split('.').last }
+        pairs.each do |key, name|
+          map[key.to_s] = name.to_sym
+        end
+      end
+
+      duplicates = names.values.tally.select { |_, count| count > 1 }.keys
+      raise ArgumentError, "duplicate injected names: #{duplicates.join(', ')}" if duplicates.any?
+
+      Injector.new(names.to_h { |key, _| [key, node(key)] }, names)
     end
 
     # Attach an existing standalone system as a branch. It keeps owning its declarations,

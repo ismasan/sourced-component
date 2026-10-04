@@ -121,6 +121,14 @@ App.config('request_id') { "req-#{counter += 1}" }
 # The library can still declare more after being mounted; App's index picks them up
 Library.declare('settings.retries', Integer) { 3 }
 
+# The library's classes inject from the library's own system.
+# Defined before the system is built: values are read on instantiation
+class Dispatcher
+  include Library.inject('db', 'settings.retries')
+
+  def dispatch(event) = db.insert(event)
+end
+
 # Long-running components. The ticker depends on the worker, so it starts after it and is torn down before it
 App.declare('worker', Worker)
 App.component!('worker', ['sourced.db', 'logger']) do
@@ -161,6 +169,9 @@ puts "App['sourced.db'].name      => #{App['sourced.db'].name}"
 puts "Library['db'].name          => #{Library['db'].name} (the app's override, seen by the library)"
 puts "same object                 => #{App['sourced.db'].equal?(Library['db'])}"
 puts "Library['db'].logger        => #{Library['db'].logger.progname}"
+puts "Dispatcher.new.db.name      => #{Dispatcher.new.db.name} (injected from the library's system)"
+puts "Dispatcher.new.retries      => #{Dispatcher.new.retries}"
+puts "Dispatcher.new(db: ...).db  => #{Dispatcher.new(db: :fake).db}"
 puts "App['sourced.settings.retries'] => #{App['sourced.settings.retries']}"
 puts "App['cache.redis.pool']     => #{App['cache.redis.pool']}"
 puts "App['request_id'] x2        => #{App['request_id']}, #{App['request_id']}"

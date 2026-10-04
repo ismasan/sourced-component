@@ -23,8 +23,13 @@ end
 # 3. Boot
 App.start!
 
-# 4. Read values
+# 4. Read values, or inject them into your classes
 App['db'] # => #<DB ...>
+
+class Repo
+  include App.inject('db')
+end
+Repo.new.db # => #<DB ...>
 
 # 5. Shut down
 App.teardown!
@@ -263,6 +268,46 @@ The root of the tree owns the lifecycle. Booting a mounted system directly (`MyL
 
 `#mount` raises if the system is already mounted somewhere, is the root of the tree it's being mounted into, isn't open, or if the key is taken.
 
+## Dependency injection
+
+`#inject(*keys)` builds a module that injects components into a class, as keyword arguments to `#initialize` with readers. Each one defaults to the component's value, read when the object is instantiated.
+
+```ruby
+class Dispatcher
+  include App.inject('logger', 'my_lib.store')
+
+  def dispatch(event)
+    store.append(event)
+    logger.info("dispatched #{event}")
+  end
+end
+
+Dispatcher.new.store                   # => App['my_lib.store']
+Dispatcher.new(store: FakeStore.new)   # any dependency can be passed explicitly, ex. in tests
+```
+
+- Kwargs are named after the last segment of each key (`'my_lib.store'` => `store`). A hash gives them custom names: `App.inject('my_lib.store' => 'st')`.
+- Keys are relative to the system `#inject` is called on: `App.node('my_lib').inject('store')`.
+- Injections compose: a class can include several, and keep its own `#initialize` (positional and keyword arguments are passed through). Subclasses inherit them.
+- Values are read on instantiation, so classes can be defined before the system is built, and dynamic components give each object a fresh value. Instantiating before the system is built raises `NotBuiltError`.
+- Injecting an undeclared key raises `UndeclaredComponentError`, and injecting two components under the same name raises `ArgumentError`.
+
+Injectors hold on to the nodes themselves, so a library's classes can inject from the library's own system, and get the overrides of the application that mounts it:
+
+```ruby
+module MyLib
+  class Dispatcher
+    include MyLib.system.inject('store')
+  end
+end
+
+App.mount('my_lib', MyLib.system)
+App.component!('my_lib.store', ['db']) { build { |db| DBStore.new(db) } }
+App.start!
+
+MyLib::Dispatcher.new.store # => #<DBStore ...>, the app's override
+```
+
 ## Inspecting the tree
 
 ```ruby
@@ -307,7 +352,7 @@ Plumb::ParseError: user: {age: "Must be a Integer"}
 
 ## Thread safety
 
-Declaring, implementing, mounting and lifecycle methods are synchronized with a `Monitor` on the root of the tree (mounted systems share their host's). A system can be booted from multiple threads: concurrent callers wait for the first one to finish, and then no-op. Reads take no lock, as values are immutable once built.
+Declaring, implementing, mounting and lifecycle methods are synchronized with a `Monitor` on the root of the tree (mounted systems share their host's). A system can be booted from multiple threads: concurrent callers wait for the first one to finish, and then no-op. Reads (including injected defaults) take no lock, as values are immutable once built.
 
 ## Development
 
