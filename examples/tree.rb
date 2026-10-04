@@ -86,7 +86,7 @@ end
 Library = Sourced::System.new
 Library.declare('logger', T::Interface[:info]) { Logger.new($stdout, progname: 'sourced') }
 Library.declare('db', FakeDB)
-Library.component('db', ['logger']) do
+Library.component!('db', ['logger']) do
   build { |logger| FakeDB.new('sourced-db', logger:) }
   start { |db, _| db.connect }
   teardown { |db| db.disconnect }
@@ -99,7 +99,7 @@ App.declare('logger', T::Interface[:info]) { Logger.new($stdout, progname: 'app'
 App.mount('sourced', Library)
 
 # Re-implement the library's db, with the app's own logger. Deps are relative to App
-App.component('sourced.db', ['logger']) do
+App.component!('sourced.db', ['logger']) do
   build { |logger| FakeDB.new('app-db', logger:) }
   start { |db, _| db.connect }
   teardown { |db| db.disconnect }
@@ -112,21 +112,21 @@ App.declare('cache.redis.pool', Integer) { 5 }
 # A dynamic component, built on each read
 counter = 0
 App.declare('request_id', String)
-App.component('request_id', mode: :dynamic) { build { "req-#{counter += 1}" } }
+App.component('request_id') { build { "req-#{counter += 1}" } }
 
 # The library can still declare more after being mounted; App's index picks them up
 Library.declare('settings.retries', Integer) { 3 }
 
 # Long-running components. The ticker depends on the worker, so it starts after it and is torn down before it
 App.declare('worker', Worker)
-App.component('worker', ['sourced.db', 'logger']) do
+App.component!('worker', ['sourced.db', 'logger']) do
   build { |db, logger| Worker.new(db, logger:) }
   start { |worker, _| worker.start }
   teardown { |worker| worker.stop }
 end
 
 App.declare('ticker', Ticker)
-App.component('ticker', ['worker', 'logger']) do
+App.component!('ticker', ['worker', 'logger']) do
   # Read the dynamic request_id on each tick: a fresh value every time
   build { |worker, logger| Ticker.new(worker, interval: 0.5, logger:) { "job #{App['request_id']}" } }
   start { |ticker, _| ticker.start }

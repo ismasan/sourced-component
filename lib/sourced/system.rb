@@ -12,7 +12,7 @@ module Sourced
   # A tree of systems. Every node is a System: it can declare a type, be implemented with
   # dependencies and lifecycle hooks, have its own lifecycle status, and have sub-systems.
   #   app.declare('sourced.db', DB)                 # builds the 'sourced' > 'db' branch
-  #   app.component('sourced.db', ['logger']) { build { |logger| DB.new(logger:) } }
+  #   app.component!('sourced.db', ['logger']) { build { |logger| DB.new(logger:) } }
   #   app.mount('payments', Payments)               # attach an existing system as a branch
   # Systems own their declarations and the sub-trees under them: an ancestor can implement
   # (or re-implement) any node below it, but can only declare under nodes it declared itself.
@@ -93,21 +93,23 @@ module Sourced
       end
     end
 
-    # Implement (or re-implement) a node anywhere under this system. The last implementation wins.
+    # Implement (or re-implement) a node anywhere under this system as a singleton,
+    # built once on #build! and memoized. The last implementation wins.
     # Deps are keys relative to this system.
-    #   sys.component('sourced.db', ['logger']) do
+    #   sys.component!('sourced.db', ['logger']) do
     #     prepare { require 'sequel' }
     #     build { |logger| Sequel.sqlite(logger:) }
     #     start { |db, context| }
     #     teardown { |db| db.disconnect }
     #   end
-    def component(ckey, deps = [], mode: :singleton, &block)
-      synchronize do
-        raise LockedSystemError, "can't implement #{ckey} in a locked system" if locked?
+    def component!(ckey, deps = [], &block)
+      implement(ckey, deps, :singleton, &block)
+    end
 
-        node(ckey).implement!(Implementation.from_block(deps, implementer: self, mode:, &block))
-        self
-      end
+    # Same as #component!, but built on every read, ex. a per-request value.
+    #   sys.component('request_id') { build { SecureRandom.uuid } }
+    def component(ckey, deps = [], &block)
+      implement(ckey, deps, :dynamic, &block)
     end
 
     # Attach an existing standalone system as a branch. It keeps owning its declarations,
@@ -344,6 +346,15 @@ module Sourced
         n.teardown_node!
       rescue StandardError => e
         errors << e
+      end
+    end
+
+    private def implement(ckey, deps, mode, &block)
+      synchronize do
+        raise LockedSystemError, "can't implement #{ckey} in a locked system" if locked?
+
+        node(ckey).implement!(Implementation.from_block(deps, implementer: self, mode:, &block))
+        self
       end
     end
 

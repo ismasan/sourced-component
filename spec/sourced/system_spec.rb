@@ -98,7 +98,7 @@ RSpec.describe Sourced::System do
       sys = new_system
       sys.declare('db.url', String) { 'sqlite://' }
       sys.declare('db', String)
-      sys.component('db', ['db.url']) { build { |url| "DB(#{url})" } }
+      sys.component!('db', ['db.url']) { build { |url| "DB(#{url})" } }
       sys.build!
 
       expect(sys.node('db').implicit?).to be(false)
@@ -152,7 +152,7 @@ RSpec.describe Sourced::System do
     end
 
     it "lets an ancestor implement a mounted system's nodes" do
-      app.component('sourced.db') { build { 'app db' } }
+      app.component!('sourced.db') { build { 'app db' } }
       app.build!
 
       expect(app['sourced.db']).to eq('app db')
@@ -164,7 +164,7 @@ RSpec.describe Sourced::System do
       sys = new_system
       sys.declare('url', String) { 'sqlite://' }
       sys.declare('db', String)
-      sys.component('db', ['url']) do
+      sys.component!('db', ['url']) do
         build { |url| "DB(#{url})" }
       end
       sys.build!
@@ -178,7 +178,7 @@ RSpec.describe Sourced::System do
     it 'accepts a block with the DSL as an argument' do
       sys = new_system
       sys.declare('a', Integer)
-      sys.component('a') { |c| c.build { 1 } }
+      sys.component!('a') { |c| c.build { 1 } }
       sys.build!
 
       expect(sys['a']).to eq(1)
@@ -187,7 +187,7 @@ RSpec.describe Sourced::System do
     it 'accepts callables as hooks' do
       sys = new_system
       sys.declare('a', Integer)
-      sys.component('a') { build(-> { 2 }) }
+      sys.component!('a') { build(-> { 2 }) }
       sys.build!
 
       expect(sys['a']).to eq(2)
@@ -197,7 +197,7 @@ RSpec.describe Sourced::System do
       lib = new_system
       lib.declare('logger', String) { 'lib logger' }
       lib.declare('db', String)
-      lib.component('db', ['logger']) { build { |logger| "db with #{logger}" } }
+      lib.component!('db', ['logger']) { build { |logger| "db with #{logger}" } }
 
       app = new_system
       app.declare('logger', String) { 'app logger' }
@@ -211,12 +211,12 @@ RSpec.describe Sourced::System do
       lib = new_system
       lib.declare('logger', String) { 'lib logger' }
       lib.declare('db', String)
-      lib.component('db', ['logger']) { build { |logger| "db with #{logger}" } }
+      lib.component!('db', ['logger']) { build { |logger| "db with #{logger}" } }
 
       app = new_system
       app.declare('logger', String) { 'app logger' }
       app.mount('sourced', lib)
-      app.component('sourced.db', ['logger']) { build { |logger| "app db with #{logger}" } }
+      app.component!('sourced.db', ['logger']) { build { |logger| "app db with #{logger}" } }
       app.build!
 
       expect(app['sourced.db']).to eq('app db with app logger')
@@ -231,7 +231,7 @@ RSpec.describe Sourced::System do
       app = new_system
       app.mount('sourced', lib)
       app.declare('db', String)
-      app.component('db', ['sourced.logger']) { build { |logger| "db with #{logger}" } }
+      app.component!('db', ['sourced.logger']) { build { |logger| "db with #{logger}" } }
       app.build!
 
       expect(app['db']).to eq('db with lib logger')
@@ -240,7 +240,7 @@ RSpec.describe Sourced::System do
     it 'replaces previous implementations' do
       sys = new_system
       sys.declare('a', Integer) { 1 }
-      sys.component('a') { build { 2 } }
+      sys.component!('a') { build { 2 } }
       sys.build!
 
       expect(sys['a']).to eq(2)
@@ -249,7 +249,7 @@ RSpec.describe Sourced::System do
     it 'can implement a namespace node' do
       sys = new_system
       sys.declare('ns.x', Integer) { 1 }
-      sys.component('ns', ['ns.x']) { build { |x| x + 1 } }
+      sys.component!('ns', ['ns.x']) { build { |x| x + 1 } }
       sys.build!
 
       expect(sys['ns']).to eq(2)
@@ -259,14 +259,25 @@ RSpec.describe Sourced::System do
     it 'raises for undeclared keys' do
       sys = new_system
 
-      expect { sys.component('nope') { build { 1 } } }.to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
+      expect { sys.component!('nope') { build { 1 } } }.to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
     end
 
-    it 'raises for unknown modes' do
+    it 'implements singletons with #component! and dynamic components with #component' do
       sys = new_system
       sys.declare('a')
+      sys.declare('b')
+      sys.component!('a') { build { 1 } }
+      sys.component('b', ['a']) { build { |a| a + 1 } }
 
-      expect { sys.component('a', mode: :lazy) { build { 1 } } }.to raise_error(ArgumentError, /unknown mode/)
+      expect(sys.node('a').implementation.mode).to eq(:singleton)
+      expect(sys.node('b').implementation.mode).to eq(:dynamic)
+      expect(sys.node('b').implementation.deps).to eq(['a'])
+    end
+
+    it 'raises for unknown implementation modes' do
+      expect {
+        described_class::Implementation.new([], implementer: new_system, mode: :lazy, hooks: {})
+      }.to raise_error(ArgumentError, /unknown mode/)
     end
   end
 
@@ -373,7 +384,7 @@ RSpec.describe Sourced::System do
       calls = []
       lib = new_system
       lib.declare('logger', String)
-      lib.component('logger') do
+      lib.component!('logger') do
         prepare { calls << [:prepare, 'logger'] }
         build { calls << [:build, 'logger']; 'logger' }
         start { |value, context| calls << [:start, 'logger', value, context] }
@@ -382,7 +393,7 @@ RSpec.describe Sourced::System do
 
       app = new_system
       app.declare('db', String)
-      app.component('db', ['sourced.logger']) do
+      app.component!('db', ['sourced.logger']) do
         prepare { calls << [:prepare, 'db'] }
         build { |logger| calls << [:build, 'db', logger]; 'db' }
         start { |value, context| calls << [:start, 'db', value, context] }
@@ -426,7 +437,7 @@ RSpec.describe Sourced::System do
       context = nil
       sys = new_system
       sys.declare('a')
-      sys.component('a') { start { |_, ctx| context = ctx } }
+      sys.component!('a') { start { |_, ctx| context = ctx } }
       sys.start!
 
       expect(context).to be(Thread.current)
@@ -436,7 +447,7 @@ RSpec.describe Sourced::System do
       builds = 0
       sys = new_system
       sys.declare('a', Integer)
-      sys.component('a') { build { builds += 1 } }
+      sys.component!('a') { build { builds += 1 } }
 
       sys.start!
       sys.start!
@@ -450,7 +461,7 @@ RSpec.describe Sourced::System do
       torn = false
       sys = new_system
       sys.declare('a')
-      sys.component('a') { teardown { torn = true } }
+      sys.component!('a') { teardown { torn = true } }
       sys.build!
       sys.teardown!
 
@@ -462,7 +473,7 @@ RSpec.describe Sourced::System do
       sys = new_system
       sys.declare('b', Integer)
       sys.declare('a', Integer) { 1 }
-      sys.component('b', ['a']) { build { |a| a + 1 } }
+      sys.component!('b', ['a']) { build { |a| a + 1 } }
 
       expect { sys.ordered_nodes }.to raise_error(described_class::NotBuiltError)
       sys.prepare!
@@ -474,7 +485,7 @@ RSpec.describe Sourced::System do
       lib.declare('x', Integer) { 1 }
       app = new_system
       app.mount('lib', lib)
-      app.component('lib', ['lib.x']) { build { |x| x * 10 } }
+      app.component!('lib', ['lib.x']) { build { |x| x * 10 } }
       app.build!
 
       expect(app['lib']).to eq(10)
@@ -495,7 +506,7 @@ RSpec.describe Sourced::System do
 
       expect { app.declare('a') }.to raise_error(described_class::LockedSystemError)
       expect { lib.declare('a') }.to raise_error(described_class::LockedSystemError)
-      expect { app.component('lib') { build { 1 } } }.to raise_error(described_class::LockedSystemError)
+      expect { app.component!('lib') { build { 1 } } }.to raise_error(described_class::LockedSystemError)
       expect { app.mount('other', new_system) }.to raise_error(described_class::LockedSystemError)
       expect(lib.locked?).to be(true)
     end
@@ -521,7 +532,7 @@ RSpec.describe Sourced::System do
       it 'raises for missing deps, with full keys' do
         lib = new_system
         lib.declare('x', Integer)
-        lib.component('x', ['nope']) { build { 1 } }
+        lib.component!('x', ['nope']) { build { 1 } }
         app = new_system
         app.mount('libs.lib', lib)
 
@@ -535,7 +546,7 @@ RSpec.describe Sourced::System do
         sys = new_system
         sys.declare('ns.x', Integer) { 1 }
         sys.declare('a', Integer)
-        sys.component('a', ['ns']) { build { 1 } }
+        sys.component!('a', ['ns']) { build { 1 } }
 
         expect { sys.prepare! }.to raise_error(described_class::MissingDependencyError, /a depends on ns, which is not implemented/)
       end
@@ -543,7 +554,7 @@ RSpec.describe Sourced::System do
       it "can't reach outside the implementer's tree" do
         lib = new_system
         lib.declare('x', Integer)
-        lib.component('x', ['logger']) { build { 1 } }
+        lib.component!('x', ['logger']) { build { 1 } }
         app = new_system
         app.declare('logger') { 'app logger' }
         app.mount('lib', lib)
@@ -555,8 +566,8 @@ RSpec.describe Sourced::System do
         sys = new_system
         sys.declare('a', Integer)
         sys.declare('b', Integer)
-        sys.component('a', ['b']) { build { |b| b } }
-        sys.component('b', ['a']) { build { |a| a } }
+        sys.component!('a', ['b']) { build { |b| b } }
+        sys.component!('b', ['a']) { build { |a| a } }
 
         expect { sys.prepare! }.to raise_error(described_class::CircularDependencyError, /between a, b/)
       end
@@ -564,7 +575,7 @@ RSpec.describe Sourced::System do
       it 'raises for self dependencies' do
         sys = new_system
         sys.declare('a', Integer)
-        sys.component('a', ['a']) { build { |a| a } }
+        sys.component!('a', ['a']) { build { |a| a } }
 
         expect { sys.prepare! }.to raise_error(described_class::CircularDependencyError, /between a/)
       end
@@ -572,7 +583,7 @@ RSpec.describe Sourced::System do
       it 'resolves deps declared after the component' do
         sys = new_system
         sys.declare('b', Integer)
-        sys.component('b', ['a']) { build { |a| a + 1 } }
+        sys.component!('b', ['a']) { build { |a| a + 1 } }
         sys.declare('a', Integer) { 1 }
         sys.build!
 
@@ -587,9 +598,9 @@ RSpec.describe Sourced::System do
         sys.declare('a') { 1 }
         sys.declare('b') { 2 }
         sys.declare('c')
-        sys.component('a') { start { calls << :start_a }; teardown { calls << :teardown_a } }
-        sys.component('b', ['a']) { start { calls << :start_b }; teardown { calls << :teardown_b } }
-        sys.component('c', ['b']) { start { raise 'boom' }; teardown { calls << :teardown_c } }
+        sys.component!('a') { start { calls << :start_a }; teardown { calls << :teardown_a } }
+        sys.component!('b', ['a']) { start { calls << :start_b }; teardown { calls << :teardown_b } }
+        sys.component!('c', ['b']) { start { raise 'boom' }; teardown { calls << :teardown_c } }
 
         expect { sys.start! }.to raise_error(RuntimeError, 'boom')
         expect(calls).to eq(%i[start_a start_b teardown_b teardown_a])
@@ -605,9 +616,9 @@ RSpec.describe Sourced::System do
         sys.declare('a') { 1 }
         sys.declare('b')
         sys.declare('c')
-        sys.component('a') { teardown { calls << :a } }
-        sys.component('b', ['a']) { teardown { calls << :b; raise 'b failed' } }
-        sys.component('c', ['b']) { teardown { calls << :c; raise 'c failed' } }
+        sys.component!('a') { teardown { calls << :a } }
+        sys.component!('b', ['a']) { teardown { calls << :b; raise 'b failed' } }
+        sys.component!('c', ['b']) { teardown { calls << :c; raise 'c failed' } }
         sys.start!
 
         expect { sys.teardown! }.to raise_error(RuntimeError, 'c failed')
@@ -651,7 +662,7 @@ RSpec.describe Sourced::System do
       sys = new_system
       sys.declare('prefix', String) { 'req' }
       sys.declare('request_id', String)
-      sys.component('request_id', ['prefix'], mode: :dynamic) { build { |prefix| "#{prefix}-#{counter += 1}" } }
+      sys.component('request_id', ['prefix']) { build { |prefix| "#{prefix}-#{counter += 1}" } }
       sys.build!
 
       expect(sys['request_id']).to eq('req-1')
@@ -662,9 +673,9 @@ RSpec.describe Sourced::System do
       counter = 0
       sys = new_system
       sys.declare('id', Integer)
-      sys.component('id', mode: :dynamic) { build { counter += 1 } }
+      sys.component('id') { build { counter += 1 } }
       sys.declare('first', Integer)
-      sys.component('first', ['id']) { build { |id| id } }
+      sys.component!('first', ['id']) { build { |id| id } }
       sys.build!
 
       expect(sys['first']).to eq(1)
@@ -675,7 +686,7 @@ RSpec.describe Sourced::System do
     it 'parses dynamic values through the declared type' do
       sys = new_system
       sys.declare('n', Integer)
-      sys.component('n', mode: :dynamic) { build { 'nope' } }
+      sys.component('n') { build { 'nope' } }
       sys.build!
 
       expect { sys['n'] }.to raise_error(Plumb::ParseError)
@@ -707,7 +718,7 @@ RSpec.describe Sourced::System do
       sys = new_system
       sys.declare('ns.a', Integer) { 1 }
       sys.declare('ns.b', String)
-      sys.component('ns.b', mode: :dynamic) { build { 'b' } }
+      sys.component('ns.b') { build { 'b' } }
       sys.declare('ns.c', String)
 
       expect(sys.inspect).to eq('#<Sourced::System (root) (namespace)>')
@@ -723,7 +734,7 @@ RSpec.describe Sourced::System do
       builds = 0
       sys = new_system
       sys.declare('a', Integer)
-      sys.component('a') do
+      sys.component!('a') do
         build do
           sleep 0.01
           builds += 1

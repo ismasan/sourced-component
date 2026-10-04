@@ -14,7 +14,7 @@ App.declare('db.url', String) { 'sqlite://app.db' } # with a default implementat
 App.declare('db', DB)
 
 # 2. Implement components, with dependencies and lifecycle hooks
-App.component('db', ['db.url']) do
+App.component!('db', ['db.url']) do
   build { |url| DB.new(url) }
   start { |db, _context| db.connect }
   teardown { |db| db.disconnect }
@@ -53,7 +53,7 @@ App.declare('cache', T::Interface[:get, :set].nullable) # optional, by type
 App.declare('anything')                                 # Any
 ```
 
-A block is a default implementation: a singleton built once, with no dependencies. It can be replaced with `#component`.
+A block is a default implementation: a singleton built once, with no dependencies. It can be replaced with `#component!` or `#component`.
 
 ```ruby
 App.declare('logger', T::Interface[:info]) { Logger.new($stdout) }
@@ -76,17 +76,17 @@ A system can keep declaring under the nodes it created, and can give a namespace
 ```ruby
 App.declare('db.url', String) { 'sqlite://app.db' }
 App.declare('db', DB) # 'db' was a namespace, now it's a component too
-App.component('db', ['db.url']) { build { |url| DB.new(url) } }
+App.component!('db', ['db.url']) { build { |url| DB.new(url) } }
 ```
 
 Declaring a key twice raises `DeclarationOverrideError`.
 
 ## Implementing components
 
-`#component(key, deps = [], mode: :singleton, &block)` implements a declared node. Dependencies are keys of other components, and their values are passed to `build`, in order.
+`#component!(key, deps = [], &block)` implements a declared node as a singleton. Dependencies are keys of other components, and their values are passed to `build`, in order.
 
 ```ruby
-App.component('db', ['db.url', 'logger']) do
+App.component!('db', ['db.url', 'logger']) do
   prepare { require 'sequel' }                   # before anything is built
   build { |url, logger| Sequel.connect(url, logger:) } # returns the component's value
   start { |db, context| }                        # after everything is built
@@ -97,20 +97,20 @@ end
 All hooks are optional. Hooks can also be any callable, and the block can take the DSL as an argument instead of being evaluated in it:
 
 ```ruby
-App.component('clock') { build(-> { Time }) }
-App.component('db', ['db.url']) { |c| c.build { |url| DB.new(url) } }
+App.component!('clock') { build(-> { Time }) }
+App.component!('db', ['db.url']) { |c| c.build { |url| DB.new(url) } }
 ```
 
 Implementing a node again replaces its implementation (the last one wins), including declared defaults. Dependencies can be declared after the component that uses them: they're resolved when the system is prepared.
 
-### Modes
+### Singleton and dynamic components
 
-- `:singleton` (the default): built once on `#build!`, and memoized.
-- `:dynamic`: built on every read, ex. a per-request value. Dynamic components still go through `prepare`, `start` and `teardown`, with a `nil` value.
+- `#component!` implements a singleton: built once on `#build!`, and memoized.
+- `#component` implements a dynamic component: built on every read, ex. a per-request value. Dynamic components take the same deps and hooks, and still go through `prepare`, `start` and `teardown`, with a `nil` value.
 
 ```ruby
 App.declare('request_id', String)
-App.component('request_id', mode: :dynamic) { build { SecureRandom.uuid } }
+App.component('request_id') { build { SecureRandom.uuid } }
 
 App['request_id'] # => "8d1c..."
 App['request_id'] # => "f30a..."
@@ -167,7 +167,7 @@ Once prepared, the tree is locked: declaring, implementing or mounting anything 
 
 ```ruby
 App.declare('worker', Worker)
-App.component('worker', ['db']) do
+App.component!('worker', ['db']) do
   build { |db| Worker.new(db) }
   start { |worker, _context| worker.start } # spawns a thread and returns
   teardown { |worker| worker.stop }         # signals the thread, and joins it
@@ -200,7 +200,7 @@ module MyLib
     @system ||= Sourced::System.new.tap do |s|
       s.declare('logger', T::Interface[:info]) { Logger.new($stdout, progname: 'my_lib') }
       s.declare('store', Store)
-      s.component('store', ['logger']) { build { |logger| MemoryStore.new(logger:) } }
+      s.component!('store', ['logger']) { build { |logger| MemoryStore.new(logger:) } }
     end
   end
 end
@@ -213,7 +213,7 @@ App.declare('db', DB) { DB.new }
 App.mount('my_lib', MyLib.system)
 
 # Override the library's store, with the app's db
-App.component('my_lib.store', ['db']) { build { |db| DBStore.new(db) } }
+App.component!('my_lib.store', ['db']) { build { |db| DBStore.new(db) } }
 
 App.start!
 App['my_lib.store']    # => #<DBStore ...>
@@ -226,10 +226,10 @@ Keys can be nested (`App.mount('libs.my_lib', MyLib.system)`), systems can mount
 
 ### Dependencies are relative to the implementing system
 
-Dependency keys are resolved from the system that called `#component`:
+Dependency keys are resolved from the system that called `#component!` (or `#component`):
 
-- The library's `component('store', ['logger'])` depends on `my_lib.logger`.
-- The app's `component('my_lib.store', ['db'])` depends on the app's `db`.
+- The library's `component!('store', ['logger'])` depends on `my_lib.logger`.
+- The app's `component!('my_lib.store', ['db'])` depends on the app's `db`.
 
 So a library's implementations can only depend on components in its own tree, and an application wires library components to its own components by overriding them.
 
@@ -262,7 +262,7 @@ node.parent          # => the my_lib system
 node.root            # => App
 node.owner           # => the system that declared it
 node.type            # => the declared type
-node.implementation  # => deps, mode and the implementing system
+node.implementation  # => deps, mode (:singleton or :dynamic) and the implementing system
 node.children        # => { segment => System }
 node.namespace?      # => no type and no implementation
 ```

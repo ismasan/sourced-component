@@ -4,7 +4,7 @@ module Sourced
   class System
     MODES = %i[singleton dynamic].freeze
 
-    # How a node is built. Deps are keys relative to the implementer: the system that called #component.
+    # How a node is built. Deps are keys relative to the implementer: the system that called #component! or #component.
     #   prepare:  hooks run with no arguments
     #   build:    hooks run with dep values. The last result is the node's value
     #   start:    hooks run with (value, context)
