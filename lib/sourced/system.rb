@@ -4,6 +4,9 @@ require 'monitor'
 require 'tsort'
 require 'plumb'
 require_relative 'system/version'
+require_relative 'system/errors'
+require_relative 'system/dsl'
+require_relative 'system/implementation'
 
 module Sourced
   # A tree of systems. Every node is a System: it can declare a type, be implemented with
@@ -15,77 +18,12 @@ module Sourced
   # (or re-implement) any node below it, but can only declare under nodes it declared itself.
   # The root system drives the lifecycle of the whole tree.
   class System
-    SystemError = Class.new(StandardError)
-    DeclarationOverrideError = Class.new(SystemError)
-    OwnershipError = Class.new(SystemError)
-    LockedSystemError = Class.new(SystemError)
-    SubsystemError = Class.new(SystemError)
-    UndeclaredComponentError = Class.new(SystemError)
-    UnimplementedComponentError = Class.new(SystemError)
-    MissingDependencyError = Class.new(SystemError)
-    CircularDependencyError = Class.new(SystemError)
-    NotBuiltError = Class.new(SystemError)
-
     module T
       include Plumb::Types
     end
 
-    CallableInterface = Plumb::Types::Interface[:call]
-
     # Lifecycle statuses, in order. Shared by the root (boot status) and every node.
     STATUSES = %i[open prepared built started toredown].freeze
-    HOOKS = %i[prepare build start teardown].freeze
-    MODES = %i[singleton dynamic].freeze
-
-    # Records lifecycle hooks from a component block
-    class DSL
-      attr_reader :hooks
-
-      def initialize
-        @hooks = HOOKS.to_h { |name| [name, []] }
-      end
-
-      HOOKS.each do |name|
-        define_method(name) do |callable = nil, &block|
-          @hooks[name] << CallableInterface.parse(callable || block)
-          self
-        end
-      end
-    end
-
-    # How a node is built. Deps are keys relative to the implementer: the system that called #component.
-    #   prepare:  hooks run with no arguments
-    #   build:    hooks run with dep values. The last result is the node's value
-    #   start:    hooks run with (value, context)
-    #   teardown: hooks run with (value)
-    class Implementation
-      attr_reader :deps, :implementer, :mode
-
-      def self.from_block(deps, implementer:, mode:, &block)
-        dsl = DSL.new
-        if block
-          block.arity > 0 ? block.call(dsl) : dsl.instance_eval(&block)
-        end
-        new(deps, implementer:, mode:, hooks: dsl.hooks)
-      end
-
-      def initialize(deps, implementer:, mode:, hooks:)
-        raise ArgumentError, "unknown mode #{mode.inspect}, expected one of #{MODES.join(', ')}" unless MODES.include?(mode)
-
-        @deps = deps.map { |d| d.to_s.freeze }.freeze
-        @implementer = implementer
-        @mode = mode
-        @hooks = hooks.transform_values(&:freeze).freeze
-      end
-
-      def singleton? = mode == :singleton
-      def dynamic? = mode == :dynamic
-
-      def prepare = @hooks[:prepare].each(&:call)
-      def build(*deps) = @hooks[:build].reduce(nil) { |_, b| b.call(*deps) }
-      def start(value, context) = @hooks[:start].each { |b| b.call(value, context) }
-      def teardown(value) = @hooks[:teardown].each { |b| b.call(value) }
-    end
 
     # key:   local segment, ex. 'db'. nil for a root that isn't mounted anywhere
     # owner: the system that declared this node. Standalone systems own themselves
