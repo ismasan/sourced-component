@@ -138,6 +138,28 @@ App.component!('with.deps', ['sourced.db']) { build { |db| Foo.new(db) } }
 App.component('now') { build { Time.now } }
 ```
 
+### Wildcard dependencies
+
+A dependency ending in `.*` depends on every component directly under that key, so components can be registered under a namespace without listing them anywhere else. Its value is a hash of their values, by key segment:
+
+```ruby
+App.declare('reactors.foo', Foo) { Foo.new }
+App.declare('reactors.bar', Bar) { Bar.new }
+
+App.declare('runner', Runner)
+App.config!('runner', ['logger', 'reactors.*']) do |logger, reactors|
+  Runner.new(logger, reactors) # reactors => { 'foo' => <Foo>, 'bar' => <Bar> }
+end
+```
+
+- The components under the key are dependencies like any other: they're prepared, built and started before the component that depends on them, and torn down after it.
+- Wildcards are resolved on `#prepare!`, once the tree is locked, so components declared after the dependent are included.
+- Only direct children are included. Nested namespaces are skipped (`reactors.nested.deep` isn't included), but implemented components are included even if they have children of their own.
+- If nothing is under the key, the value is an empty hash.
+- Like other dependencies, wildcards are [relative to the implementing component](#dependencies-are-relative-to-the-implementing-component).
+- The wildcard can only be the last segment: `reactors.*.foo` and `reactors.f*` raise `ArgumentError`.
+- A library can let the applications that mount it register components under one of its namespaces: see [Extension points](#extension-points).
+
 ### Providers
 
 Instead of a block, `#component!` and `#component` take a provider that implements the component. A provider is either:
@@ -369,7 +391,7 @@ module MyLib
   def self.to_component = component
 end
 
-App.mount('my_lib', MyLib)
+App.mount('my_lib', MyLib.component)
 ```
 
 `#mount` raises `ArgumentError` for objects that don't respond to `#to_component`, or whose `#to_component` doesn't return a `Sourced::Component`.
@@ -403,6 +425,37 @@ App.declare('my_lib.extra', String)
 The root of the tree owns the lifecycle. Booting a mounted component directly (`MyLib.component.start!`) raises `SubcomponentError`: boot the root.
 
 `#mount` raises if the component (what `#to_component` returns) is already mounted somewhere, is the root of the tree it's being mounted into, isn't open, or if the key is taken.
+
+### Extension points
+
+Ownership is checked against the component `#declare` is called on, not against the code calling it. So an application can add a declaration to a library's tree by declaring it through the library's own component, ex. a reactor that the library collects with a [wildcard dependency](#wildcard-dependencies):
+
+```ruby
+module MyLib
+  def self.component
+    @component ||= Sourced::Component.new.tap do |c|
+      c.declare('runner', Runner)
+      c.config!('runner', ['reactors.*']) { |reactors| Runner.new(reactors) }
+    end
+  end
+
+  # The one place where applications add to MyLib's tree
+  def self.reactor(name, type = Reactor) = component.declare("reactors.#{name}", type)
+end
+
+App.mount('my_lib', MyLib.component)
+MyLib.reactor('emails')                                     # declared in MyLib's tree, so reactors.* includes it
+App.component!('my_lib.reactors.emails', ['mailer']) do     # implemented by the app, with the app's deps
+  build { |mailer| EmailsReactor.new(mailer) }
+end
+```
+
+This should be the exception. A library owns its declarations because only the library knows what to do with them: it decides which components exist, what type they have, and what depends on them. An application declaring arbitrary keys in a library's tree is relying on the library's internals, and can break when they change. So:
+
+- Only declare under namespaces that a library documents as extension points, like `reactors` above, and leave everything else to the library.
+- Prefer a method that the library provides for it (`MyLib.reactor`) over calling `#declare` on its component directly. The library then decides the key and type, and can change how it stores them.
+- Implement the declared components from the application, so they can depend on the application's components. Implementations given to the library's component resolve their dependencies from the library's tree.
+- Declare before the root is prepared. Once it's prepared, the whole tree is locked, including mounted components.
 
 ## Dependency injection
 
@@ -730,6 +783,7 @@ Plumb::ParseError: user: {age: "Must be a Integer"}
 | `MissingDependencyError` | preparing with dependencies that aren't declared or implemented |
 | `CircularDependencyError` | preparing with dependency cycles |
 | `NotBuiltError` | reading values before the component is built |
+| `TornDownError` | starting a component that's torn down |
 
 ## Thread safety
 

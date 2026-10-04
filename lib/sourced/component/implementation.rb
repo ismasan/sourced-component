@@ -9,7 +9,11 @@ module Sourced
     #   build:    hooks run with dep values. The last result is the node's value
     #   start:    hooks run with (value, context)
     #   teardown: hooks run with (value)
+    # A dep ending in '.*' depends on every component directly under that key, and its value is
+    # a hash of their values by key segment, ex. 'reactors.*' => { 'foo' => <Foo>, 'bar' => <Bar> }
     class Implementation
+      WILDCARD = /\A[^.*]+(\.[^.*]+)*\.\*\z/
+
       # provider: the provider the component was implemented with (see Component#component!), the block of
       # Component#config! and #config, or nil for blocks of hooks
       attr_reader :deps, :implementer, :mode, :provider
@@ -40,6 +44,12 @@ module Sourced
         raise ArgumentError, "unknown mode #{mode.inspect}, expected one of #{MODES.join(', ')}" unless MODES.include?(mode)
 
         @deps = deps.map { |d| d.to_s.freeze }.freeze
+        @deps.each do |dep|
+          next unless dep.include?('*')
+          next if dep.match?(WILDCARD)
+
+          raise ArgumentError, "invalid dependency #{dep.inspect}: a wildcard must be the last segment, ex. 'reactors.*'"
+        end
         @implementer = implementer
         @mode = mode
         @provider = provider

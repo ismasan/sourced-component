@@ -53,7 +53,8 @@ module Sourced
       @implementation = nil
       @status = :open
       @value = nil
-      @dep_nodes = [].freeze
+      @deps = [].freeze      # resolved deps: a node, or { segment => node } for a wildcard
+      @dep_nodes = [].freeze # every node in @deps, for sorting
       @children = {}
       @index = {}
       # Only used on the root
@@ -444,9 +445,13 @@ module Sourced
       parent&.index!("#{key}.#{ckey}", node)
     end
 
-    # Resolve deps through the implementer's index. Called on #prepare!, so declaration order doesn't matter
+    # Resolve deps through the implementer's index. Called on #prepare!, so declaration order doesn't matter.
+    # A wildcard dep ('reactors.*') resolves to a hash of the components directly under its key, by segment,
+    # and to an empty hash if there are none.
     protected def resolve_deps!
-      @dep_nodes = implementation.deps.map do |dep|
+      @deps = implementation.deps.map do |dep|
+        next wildcard_nodes(dep) if dep.end_with?('.*')
+
         dep_node = implementation.implementer.index[dep]
         unless dep_node && !dep_node.namespace?
           where = implementation.implementer.path
@@ -456,6 +461,15 @@ module Sourced
 
         dep_node
       end.freeze
+      @dep_nodes = @deps.flat_map { |d| d.is_a?(::Hash) ? d.values : [d] }.freeze
+    end
+
+    # { 'segment' => <Component> } for the components directly under a wildcard dep's key
+    protected def wildcard_nodes(dep)
+      branch = implementation.implementer.index[dep.delete_suffix('.*')]
+      return {}.freeze unless branch
+
+      branch.children.reject { |_, child| child.namespace? }.freeze
     end
 
     protected def prepare_node!
@@ -483,7 +497,8 @@ module Sourced
     #   Plumb::ParseError: db.port: Must be a Integer
     # The value is left out, as it can hold secrets.
     private def build_value
-      result = type.resolve(implementation.build(*@dep_nodes.map { |n| n.current_value }))
+      values = @deps.map { |d| d.is_a?(::Hash) ? d.transform_values { |n| n.current_value } : d.current_value }
+      result = type.resolve(implementation.build(*values))
       return result.value if result.valid?
 
       errors = result.errors.is_a?(::String) ? result.errors : result.errors.inspect
@@ -670,6 +685,11 @@ module Sourced
       return [[], []] unless impl
 
       impl.deps.each_with_object([[], []]) do |dep, (deps, missing)|
+        if dep.end_with?('.*')
+          deps.concat(node.wildcard_nodes(dep).values.map(&:path))
+          next
+        end
+
         target = impl.implementer.index[dep]
         if target && !target.namespace?
           deps << target.path

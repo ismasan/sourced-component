@@ -1320,6 +1320,111 @@ RSpec.describe Sourced::Component do
       end
     end
 
+    describe 'wildcard deps' do
+      it 'depends on every component directly under a key, as a hash by segment' do
+        calls = []
+        comp = new_component
+        comp.declare('runner')
+        comp.component!('runner', ['reactors.*']) do
+          build { |reactors| calls << :build_runner; reactors }
+          start { calls << :start_runner }
+        end
+        comp.declare('reactors.foo')
+        comp.component!('reactors.foo') { build { calls << :build_foo; :foo }; start { calls << :start_foo } }
+        comp.declare('reactors.bar')
+        comp.component!('reactors.bar') { build { calls << :build_bar; :bar }; start { calls << :start_bar } }
+        comp.start!
+
+        expect(comp['runner']).to eq('foo' => :foo, 'bar' => :bar)
+        expect(calls).to eq(%i[build_foo build_bar build_runner start_foo start_bar start_runner])
+      end
+
+      it 'mixes with plain deps' do
+        comp = new_component
+        comp.declare('logger') { :logger }
+        comp.declare('reactors.foo') { :foo }
+        comp.declare('runner')
+        comp.config!('runner', ['logger', 'reactors.*']) { |logger, reactors| [logger, reactors] }
+
+        comp.build!
+        expect(comp['runner']).to eq([:logger, { 'foo' => :foo }])
+      end
+
+      it 'skips nested namespaces, and includes implemented components that have children' do
+        comp = new_component
+        comp.declare('reactors.nested.deep') { :deep }
+        comp.declare('reactors.parent') { :parent }
+        comp.declare('reactors.parent.child') { :child }
+        comp.declare('runner')
+        comp.config!('runner', ['reactors.*']) { |reactors| reactors }
+
+        comp.build!
+        expect(comp['runner']).to eq('parent' => :parent)
+      end
+
+      it 'is an empty hash when nothing is under the key' do
+        comp = new_component
+        comp.declare('runner')
+        comp.config!('runner', ['reactors.*']) { |reactors| reactors }
+
+        comp.build!
+        expect(comp['runner']).to eq({})
+      end
+
+      it 'builds dynamic components on every read' do
+        n = 0
+        comp = new_component
+        comp.declare('reactors.counter')
+        comp.config('reactors.counter') { n += 1 }
+        comp.declare('runner')
+        comp.config('runner', ['reactors.*']) { |reactors| reactors }
+
+        comp.build!
+        expect([comp['runner'], comp['runner']]).to eq([{ 'counter' => 1 }, { 'counter' => 2 }])
+      end
+
+      it 'is relative to the implementer' do
+        lib = new_component
+        lib.declare('reactors.foo') { :lib_foo }
+        lib.declare('runner')
+        lib.config!('runner', ['reactors.*']) { |reactors| reactors }
+        app = new_component
+        app.declare('reactors.foo') { :app_foo }
+        app.mount('lib', lib)
+
+        app.build!
+        expect(app['lib.runner']).to eq('foo' => :lib_foo)
+      end
+
+      it 'raises for circular dependencies through a wildcard' do
+        comp = new_component
+        comp.declare('reactors.foo')
+        comp.config!('reactors.foo', ['reactors.*']) { |reactors| reactors }
+
+        expect { comp.prepare! }.to raise_error(described_class::CircularDependencyError, /between reactors\.foo/)
+      end
+
+      it 'only takes a wildcard as the last segment' do
+        comp = new_component
+        comp.declare('runner')
+
+        %w[* reactors.*.foo reactors* reactors.f*].each do |dep|
+          expect { comp.config!('runner', [dep]) { 1 } }.to raise_error(ArgumentError, /invalid dependency/)
+        end
+      end
+
+      it 'lists the matched components in the graph' do
+        comp = new_component
+        comp.declare('reactors.foo') { :foo }
+        comp.declare('reactors.bar') { :bar }
+        comp.declare('runner')
+        comp.config!('runner', ['reactors.*']) { |reactors| reactors }
+
+        runner = comp.graph.components.find { |c| c[:key] == 'runner' }
+        expect(runner).to include(deps: %w[reactors.foo reactors.bar], missing: [])
+      end
+    end
+
     describe 'start! failures' do
       it 'tears down started nodes, in reverse order, and re-raises' do
         calls = []
