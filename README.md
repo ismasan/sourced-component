@@ -305,6 +305,22 @@ end
 
 Components that depend on others start after them and are torn down before them, so a producer that depends on a worker never pushes work to a stopped worker. See [examples/tree.rb](examples/tree.rb).
 
+### Signal handlers
+
+The lifecycle methods, and anything else that takes the root's lock (declaring, implementing and mounting components, `#graph`, `#tree`), can't be called from a `trap` block: Ruby doesn't allow locking a `Monitor` in trap context, so they raise `ThreadError: can't be called from trap context` and nothing is torn down. Reading values doesn't take the lock.
+
+Instead, have the trap wake up the main thread, and tear down from there, as in the example above:
+
+```ruby
+# Don't: raises ThreadError, and the components keep running
+trap('TERM') { App.teardown! }
+
+# Do: interrupt the main thread, and tear down in its ensure block
+trap('TERM') { Thread.main.raise(Interrupt) }
+```
+
+Any other way out of trap context works too, ex. pushing to a `Queue` or writing to a self-pipe that a thread waits on.
+
 ### Errors while starting and tearing down
 
 - If a `start` hook raises, the components already started are torn down in reverse order, the component is left `:torn_down`, and the error is re-raised.
