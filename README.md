@@ -1,6 +1,6 @@
 # Sourced::Component
 
-A tree of typed components, with dependencies and a managed lifecycle.
+Configuration as a tree of typed components, with dependencies and a managed lifecycle.
 
 Every node in the tree is a `Sourced::Component`. A node can declare a type, be implemented with dependencies and lifecycle hooks (`prepare`, `build`, `start`, `teardown`), and have subcomponents of its own. Libraries declare their own root components; applications mount them under a namespace, and implement or override their subcomponents.
 
