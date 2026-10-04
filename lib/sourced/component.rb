@@ -30,7 +30,7 @@ module Sourced
     end
 
     # Lifecycle statuses, in order. Shared by the root (boot status) and every node.
-    STATUSES = %i[open prepared built started toredown].freeze
+    STATUSES = %i[open prepared built started torn_down].freeze
 
     # What #mount takes: anything that returns a Component from #to_component
     MountableInterface = Plumb::Types::Interface[:to_component]
@@ -297,12 +297,12 @@ module Sourced
     end
 
     # If a start hook raises, nodes already started are torn down (in reverse order),
-    # the component is left :toredown, and the error is re-raised.
-    # :toredown is terminal: starting a torn down component raises TornDownError.
+    # the component is left :torn_down, and the error is re-raised.
+    # :torn_down is terminal: starting a torn down component raises TornDownError.
     def start!(context = Thread.current)
       raise_mounted!
       synchronize do
-        raise TornDownError, "can't start a torn down component" if boot_status == :toredown
+        raise TornDownError, "can't start a torn down component" if boot_status == :torn_down
 
         build!
         return self if past?(:started)
@@ -312,7 +312,7 @@ module Sourced
           @boot_status = :started
         rescue Exception # rubocop:disable Lint/RescueException -- any error (incl. Interrupt) must tear down what was started. Always re-raised
           teardown_nodes
-          @boot_status = :toredown
+          @boot_status = :torn_down
           raise
         end
         self
@@ -327,7 +327,7 @@ module Sourced
 
         instrument_root(:teardown) do
           errors = teardown_nodes
-          @boot_status = :toredown
+          @boot_status = :torn_down
           raise errors.first if errors.any?
         end
         self
@@ -473,7 +473,7 @@ module Sourced
     end
 
     protected def teardown_node!
-      transition(:toredown) { implementation.teardown(value) }
+      transition(:torn_down) { implementation.teardown(value) }
     end
 
     # Without the readable check: deps are read while the component is building, in dependency order
@@ -492,7 +492,7 @@ module Sourced
 
     # Whether moving to new_status would run hooks. Only started nodes can be torn down.
     protected def pending?(new_status)
-      return status == :started if new_status == :toredown
+      return status == :started if new_status == :torn_down
 
       STATUSES.index(status) < STATUSES.index(new_status)
     end

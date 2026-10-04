@@ -162,8 +162,8 @@ end
 App.notifier.subscribe('components.failed') do |event|
   puts "failed #{event.payload.key} (#{event.payload.stage}): #{event.payload.error_class}: #{event.payload.error_message}"
 end
-App.notifier.subscribe('components.toredown') do |event|
-  puts format('toredown %-26s (%.3fms)', event.payload.key, event.payload.duration * 1000)
+App.notifier.subscribe('components.torn_down') do |event|
+  puts format('torn_down %-26s (%.3fms)', event.payload.key, event.payload.duration * 1000)
 end
 
 puts "\n== Boot"

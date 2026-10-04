@@ -10,7 +10,7 @@ module Sourced
         prepared: 'fill:#e0f2fe,stroke:#0284c7',
         built: 'fill:#ede9fe,stroke:#7c3aed',
         started: 'fill:#dcfce7,stroke:#16a34a',
-        toredown: 'fill:#e4e4e7,stroke:#52525b,color:#52525b',
+        torn_down: 'fill:#e4e4e7,stroke:#52525b,color:#52525b',
         unimplemented: 'fill:#fef9c3,stroke:#ca8a04,stroke-dasharray:4 3'
       }.freeze
 

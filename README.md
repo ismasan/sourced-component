@@ -263,9 +263,9 @@ The root component drives the lifecycle of the whole tree. Each step runs the ma
 | `#prepare!` | Checks the tree (see below), sorts components by dependency, runs `prepare` hooks | `:prepared` |
 | `#build!` | Builds singletons and parses their values through their types | `:built` |
 | `#start!(context = Thread.current)` | Runs `start` hooks with `(value, context)` | `:started` |
-| `#teardown!` | Runs `teardown` hooks with `(value)`, in reverse order | `:toredown` |
+| `#teardown!` | Runs `teardown` hooks with `(value)`, in reverse order | `:torn_down` |
 
-Each step runs the ones before it if needed (`#start!` prepares and builds), and is idempotent. `#teardown!` is a no-op unless the component is started. `:toredown` is terminal: `#start!` on a torn down component raises `TornDownError`.
+Each step runs the ones before it if needed (`#start!` prepares and builds), and is idempotent. `#teardown!` is a no-op unless the component is started. `:torn_down` is terminal: `#start!` on a torn down component raises `TornDownError`.
 
 ```ruby
 App.boot_status          # => :started, the root's status
@@ -307,7 +307,7 @@ Components that depend on others start after them and are torn down before them,
 
 ### Errors while starting and tearing down
 
-- If a `start` hook raises, the components already started are torn down in reverse order, the component is left `:toredown`, and the error is re-raised.
+- If a `start` hook raises, the components already started are torn down in reverse order, the component is left `:torn_down`, and the error is re-raised.
 - If `teardown` hooks raise, every component is still torn down, and the first error is re-raised.
 
 ## Mounting components
@@ -605,12 +605,12 @@ end
 | `components.preparing` / `components.prepared` | around a component's `prepare` hooks | `key`, and `duration` when finished |
 | `components.building` / `components.built` | around a **singleton**'s `build` hooks | `key`, and `duration` when finished |
 | `components.starting` / `components.started` | around a component's `start` hooks | `key`, and `duration` when finished |
-| `components.tearing_down` / `components.toredown` | around a component's `teardown` hooks | `key`, and `duration` when finished |
+| `components.tearing_down` / `components.torn_down` | around a component's `teardown` hooks | `key`, and `duration` when finished |
 | `components.failed` | a component's hook (or type check) raised | `key`, `stage`, `error_class`, `error_message`, `backtrace` |
 | `root.preparing` / `root.prepared` | around `#prepare!` | `duration` when finished |
 | `root.building` / `root.built` | around `#build!` | `duration` when finished |
 | `root.starting` / `root.started` | around `#start!` | `duration` when finished |
-| `root.tearing_down` / `root.toredown` | around `#teardown!` | `duration` when finished |
+| `root.tearing_down` / `root.torn_down` | around `#teardown!` | `duration` when finished |
 | `root.failed` | a lifecycle step raised | `stage`, `error_class`, `error_message`, `backtrace` |
 
 - **Every payload also has `pid`, `thread_id` and `fiber_id`:** the process, thread and fiber the event was published from (`Process.pid`, `Thread.current.object_id`, `Fiber.current.object_id`). Lifecycle events are published by whatever runs that step, so `components.started` shows where a component started.
@@ -630,7 +630,7 @@ A few rules:
   root.starting
   components.starting a → components.started a
   components.starting b → components.failed b
-  components.tearing_down a → components.toredown a
+  components.tearing_down a → components.torn_down a
   root.failed
   ```
 

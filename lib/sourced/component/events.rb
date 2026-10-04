@@ -62,7 +62,7 @@ module Sourced
       RootStarting = RootEvent.define('root.starting')
       RootStarted = RootEvent.define('root.started', &Completed)
       RootTearingDown = RootEvent.define('root.tearing_down')
-      RootToredown = RootEvent.define('root.toredown', &Completed)
+      RootTornDown = RootEvent.define('root.torn_down', &Completed)
       RootFailed = RootEvent.define('root.failed', &Failed)
 
       ComponentDeclared = ComponentEvent.define('components.declared') do
@@ -81,25 +81,25 @@ module Sourced
       ComponentStarting = ComponentEvent.define('components.starting')
       ComponentStarted = ComponentEvent.define('components.started', &Completed)
       ComponentTearingDown = ComponentEvent.define('components.tearing_down')
-      ComponentToredown = ComponentEvent.define('components.toredown', &Completed)
+      ComponentTornDown = ComponentEvent.define('components.torn_down', &Completed)
       ComponentFailed = ComponentEvent.define('components.failed', &Failed)
     end
 
     # Lifecycle stages, the status each one moves to, and their events
-    STAGES = { prepare: :prepared, build: :built, start: :started, teardown: :toredown }.freeze
+    STAGES = { prepare: :prepared, build: :built, start: :started, teardown: :torn_down }.freeze
 
     ROOT_EVENTS = {
       prepare: [Events::RootPreparing, Events::RootPrepared],
       build: [Events::RootBuilding, Events::RootBuilt],
       start: [Events::RootStarting, Events::RootStarted],
-      teardown: [Events::RootTearingDown, Events::RootToredown]
+      teardown: [Events::RootTearingDown, Events::RootTornDown]
     }.freeze
 
     COMPONENT_EVENTS = {
       prepare: [Events::ComponentPreparing, Events::ComponentPrepared],
       build: [Events::ComponentBuilding, Events::ComponentBuilt],
       start: [Events::ComponentStarting, Events::ComponentStarted],
-      teardown: [Events::ComponentTearingDown, Events::ComponentToredown]
+      teardown: [Events::ComponentTearingDown, Events::ComponentTornDown]
     }.freeze
   end
 end

@@ -474,7 +474,7 @@ RSpec.describe Sourced::Component do
       comp.start!
       comp.teardown!
 
-      expect(comp.node('a').status).to eq(:toredown)
+      expect(comp.node('a').status).to eq(:torn_down)
       expect(comp['a']).to eq(1)
     end
 
@@ -1129,7 +1129,7 @@ RSpec.describe Sourced::Component do
       comp.start!
       expect([comp.boot_status, node.status]).to eq(%i[started started])
       comp.teardown!
-      expect([comp.boot_status, node.status]).to eq(%i[toredown toredown])
+      expect([comp.boot_status, node.status]).to eq(%i[torn_down torn_down])
       expect(comp.node('a').status).to eq(:open) # namespaces are skipped
     end
 
@@ -1333,7 +1333,7 @@ RSpec.describe Sourced::Component do
 
         expect { comp.start! }.to raise_error(RuntimeError, 'boom')
         expect(calls).to eq(%i[start_a start_b teardown_b teardown_a])
-        expect(comp.boot_status).to eq(:toredown)
+        expect(comp.boot_status).to eq(:torn_down)
         expect(comp.node('c').status).to eq(:built)
         expect { comp.start! }.to raise_error(described_class::TornDownError)
       end
@@ -1349,7 +1349,7 @@ RSpec.describe Sourced::Component do
 
       expect { comp.start! }.to raise_error(described_class::TornDownError)
       expect(calls).to eq(%i[start])
-      expect(comp.boot_status).to eq(:toredown)
+      expect(comp.boot_status).to eq(:torn_down)
     end
 
     describe 'teardown! failures' do
@@ -1366,7 +1366,7 @@ RSpec.describe Sourced::Component do
 
         expect { comp.teardown! }.to raise_error(RuntimeError, 'c failed')
         expect(calls).to eq(%i[c b a])
-        expect(comp.boot_status).to eq(:toredown)
+        expect(comp.boot_status).to eq(:torn_down)
       end
     end
   end
@@ -1922,9 +1922,9 @@ RSpec.describe Sourced::Component do
         'components.starting logger', 'components.started logger',
         'root.started',
         'root.tearing_down',
-        'components.tearing_down logger', 'components.toredown logger',
-        'components.tearing_down output', 'components.toredown output',
-        'root.toredown'
+        'components.tearing_down logger', 'components.torn_down logger',
+        'components.tearing_down output', 'components.torn_down output',
+        'root.torn_down'
       ])
       expect(events).to all(be_valid)
       expect(events).to all(be_a(Sourced::Message))
@@ -2022,7 +2022,7 @@ RSpec.describe Sourced::Component do
         'root.starting',
         'components.starting a', 'components.started a',
         'components.starting b', 'components.failed b',
-        'components.tearing_down a', 'components.toredown a',
+        'components.tearing_down a', 'components.torn_down a',
         'root.failed'
       ])
 
@@ -2045,7 +2045,7 @@ RSpec.describe Sourced::Component do
       expect(summary(events)).to eq([
         'root.tearing_down',
         'components.tearing_down b', 'components.failed b',
-        'components.tearing_down a', 'components.toredown a',
+        'components.tearing_down a', 'components.torn_down a',
         'root.failed'
       ])
       expect(events.last.payload.stage).to eq(:teardown)
