@@ -315,6 +315,64 @@ RSpec.describe Sourced::System do
         expect(sys['a.b']).to eq('built a.b String')
       end
 
+      it "runs the builder's optional prepare, start and teardown hooks" do
+        calls = []
+        pool_provider = Class.new do
+          define_singleton_method(:builder_for) { |node| new(node, calls) }
+          define_method(:initialize) { |node, calls| @node = node; @calls = calls }
+          define_method(:prepare) { @calls << [:prepare, @node.path] }
+          define_method(:call) { |url| @calls << [:build, url]; "pool(#{url})" }
+          define_method(:start) { |pool, context| @calls << [:start, pool, context] }
+          define_method(:teardown) { |pool| @calls << [:teardown, pool] }
+        end
+        sys = new_system
+        sys.declare('db.url', String) { 'sqlite://' }
+        sys.declare('db.pool', String)
+        sys.component!('db.pool', ['db.url'], pool_provider)
+        sys.start!(:ctx)
+        sys.teardown!
+
+        expect(calls).to eq([
+          [:prepare, 'db.pool'],
+          [:build, 'sqlite://'],
+          [:start, 'pool(sqlite://)', :ctx],
+          [:teardown, 'pool(sqlite://)']
+        ])
+      end
+
+      it 'runs hooks implemented by callable providers, and skips the ones they leave out' do
+        calls = []
+        provider = Object.new
+        provider.define_singleton_method(:call) { 'value' }
+        provider.define_singleton_method(:teardown) { |value| calls << [:teardown, value] }
+        sys = new_system.declare('a', String)
+        sys.component!('a', provider)
+        sys.start!
+        sys.teardown!
+
+        expect(calls).to eq([[:teardown, 'value']])
+      end
+
+      it 'runs hooks for dynamic components, with a nil value' do
+        calls = []
+        provider = Object.new
+        provider.define_singleton_method(:call) { 'fresh' }
+        provider.define_singleton_method(:start) { |value, _context| calls << [:start, value] }
+        sys = new_system.declare('a', String)
+        sys.component('a', provider)
+        sys.start!
+
+        expect(calls).to eq([[:start, nil]])
+        expect(sys['a']).to eq('fresh')
+      end
+
+      it 'raises if #builder_for returns something that is not callable' do
+        provider = Class.new { def self.builder_for(_node) = Object.new }
+        sys = new_system.declare('a')
+
+        expect { sys.component!('a', provider) }.to raise_error(ArgumentError, /a: .+\.builder_for must return a callable/)
+      end
+
       it 'accepts ENV providers' do
         previous = ENV['SYS_TEST_NAME']
         ENV['SYS_TEST_NAME'] = 'Joe'

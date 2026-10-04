@@ -140,7 +140,7 @@ App.component('now') { build { Time.now } }
 
 ### Providers
 
-Instead of a block, `#component!` and `#component` take a provider that builds the component. A provider is either:
+Instead of a block, `#component!` and `#component` take a provider that implements the component. A provider is either:
 
 - **a callable**, called with the dependencies' values as the build step:
 
@@ -162,7 +162,22 @@ Instead of a block, `#component!` and `#component` take a provider that builds t
   App.component!('everything', Sourced::System::ENVProvider) # all variables
   ```
 
-A provider only builds the value: provided components have no other hooks, and their values are still parsed through the declared type. Passing both a provider and a block raises `ArgumentError`, and so does a provider that responds to neither `#call` nor `#builder_for`.
+The callable (the provider itself, or what `#builder_for` returns) can also implement any of `#prepare`, `#start(value, context)` and `#teardown(value)`, which become the component's other lifecycle hooks. Hooks it leaves out are skipped, so plain lambdas only build. A provider can supply a whole lifecycle:
+
+```ruby
+class PoolProvider
+  def self.builder_for(node) = new(node)
+
+  def initialize(node) = @node = node
+  def call(url) = Pool.new(url, name: @node.path) # build
+  def start(pool, _context) = pool.connect
+  def teardown(pool) = pool.close
+end
+
+App.component!('db.pool', ['db.url'], PoolProvider)
+```
+
+Provided values are parsed through the declared type, like any other. Passing both a provider and a block raises `ArgumentError`, and so do a provider that responds to neither `#call` nor `#builder_for`, and a `#builder_for` that doesn't return a callable.
 
 ### ENV components
 

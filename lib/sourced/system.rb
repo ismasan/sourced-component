@@ -104,9 +104,11 @@ module Sourced
     #     start { |db, context| }
     #     teardown { |db| db.disconnect }
     #   end
-    # Instead of a block, a provider can build the component:
+    # Instead of a block, a provider can implement the component:
     # - a callable, called with the deps' values, as the build step
     # - or an object with #builder_for(node), which returns that callable for the node (ex. ENVProvider)
+    # The callable can also implement any of #prepare, #start(value, context) and #teardown(value),
+    # which become the component's other hooks.
     #   sys.component!('db', ['db.url'], DBFactory)    # DBFactory.call(url)
     #   sys.component!('clock', -> { Time })           # no deps
     #   sys.component!('user.email', System::ENVProvider.new('USER_EMAIL'))
@@ -158,10 +160,11 @@ module Sourced
 
         builders = mapping.map do |source, ckey|
           target = node(ckey)
-          [target, ENVProvider.new(source, *args).builder_for(target)]
+          provider = ENVProvider.new(source, *args)
+          [target, provider, provider.builder_for(target)]
         end
-        builders.each do |target, builder|
-          target.implement!(Implementation.from_block([], implementer: self, mode: :singleton) { build(builder) })
+        builders.each do |target, provider, builder|
+          target.implement!(Implementation.from_builder(builder, [], implementer: self, mode: :singleton, provider:))
         end
         self
       end
@@ -301,6 +304,7 @@ module Sourced
     protected def readable? = @readable
     protected def lock = @lock
     protected def dep_nodes = @dep_nodes
+    protected def order = @order
 
     private def synchronize(&) = root.lock.synchronize(&)
 
@@ -448,8 +452,7 @@ module Sourced
 
         target = node(ckey)
         implementation = if provider
-                           builder = builder_from(target, provider)
-                           Implementation.from_block(deps, implementer: self, mode:) { build(builder) }
+                           Implementation.from_builder(builder_from(target, provider), deps, implementer: self, mode:)
                          else
                            Implementation.from_block(deps, implementer: self, mode:, &block)
                          end
@@ -458,9 +461,15 @@ module Sourced
       end
     end
 
-    # The build step for a node, from a provider: a callable, or an object with #builder_for(node)
+    # The builder for a node, from a provider: the provider itself if it's callable,
+    # or what its #builder_for(node) returns, which must be callable.
     private def builder_from(target, provider)
-      return provider.builder_for(target) if provider.respond_to?(:builder_for)
+      if provider.respond_to?(:builder_for)
+        builder = provider.builder_for(target)
+        return builder if builder.respond_to?(:call)
+
+        raise ArgumentError, "#{target.path}: #{provider.inspect}.builder_for must return a callable, got #{builder.inspect}"
+      end
       return provider if provider.respond_to?(:call)
 
       raise ArgumentError, "#{target.path}: a provider must respond to #call or #builder_for(node), got #{provider.inspect}"
