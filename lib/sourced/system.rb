@@ -28,6 +28,9 @@ module Sourced
     # Lifecycle statuses, in order. Shared by the root (boot status) and every node.
     STATUSES = %i[open prepared built started toredown].freeze
 
+    # What #mount takes: anything that returns a System from #to_system
+    MountableInterface = Plumb::Types::Interface[:to_system]
+
     # key:   local segment, ex. 'db'. nil for a root that isn't mounted anywhere
     # owner: the system that declared this node. Standalone systems own themselves
     # type:  the declared type. Any for implicit nodes created as intermediate segments (namespaces)
@@ -194,9 +197,16 @@ module Sourced
 
     # Attach an existing standalone system as a branch. It keeps owning its declarations,
     # and this system can implement its nodes.
+    # Takes anything with #to_system, which must return a System, ex. a library module:
     #   app.mount('sourced', Sourced.system)
-    def mount(ckey, sub)
-      raise ArgumentError, "can't mount #{sub.inspect}, it's not a System" unless sub.is_a?(System)
+    #   app.mount('sourced', Sourced) # Sourced.to_system => its System
+    def mount(ckey, mountable)
+      unless MountableInterface === mountable
+        raise ArgumentError, "can't mount #{mountable.inspect}: it must respond to #to_system"
+      end
+
+      sub = mountable.to_system
+      raise ArgumentError, "#{mountable.inspect}.to_system must return a System, got #{sub.inspect}" unless sub.is_a?(System)
 
       synchronize do
         raise LockedSystemError, "can't mount #{ckey} in a locked system" if locked?
@@ -213,6 +223,9 @@ module Sourced
         self
       end
     end
+
+    # The mountable interface (see #mount)
+    def to_system = self
 
     # A node under this system, by relative key
     def node(ckey)

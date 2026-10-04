@@ -967,8 +967,43 @@ RSpec.describe Sourced::System do
       expect(middle.node('inner.late')).to be(inner.node('late'))
     end
 
-    it 'raises if not given a System' do
-      expect { new_system.mount('x', Object.new) }.to raise_error(ArgumentError, /not a System/)
+    it 'mounts anything that implements #to_system' do
+      lib_system = new_system.declare('db', String) { 'lib db' }
+      lib = Module.new
+      lib.define_singleton_method(:to_system) { lib_system }
+
+      app = new_system
+      expect(app.mount('sourced', lib)).to be(app)
+      app.build!
+
+      expect(app.node('sourced')).to be(lib_system)
+      expect(app['sourced.db']).to eq('lib db')
+    end
+
+    it 'is implemented by systems, returning themselves' do
+      sys = new_system
+
+      expect(sys.to_system).to be(sys)
+    end
+
+    it 'raises if not given something that implements #to_system' do
+      expect { new_system.mount('x', Object.new) }.to raise_error(ArgumentError, /must respond to #to_system/)
+    end
+
+    it 'raises if #to_system does not return a System' do
+      fake = Object.new
+      fake.define_singleton_method(:to_system) { Object.new }
+
+      expect { new_system.mount('x', fake) }.to raise_error(ArgumentError, /to_system must return a System/)
+    end
+
+    it 'applies the same checks to the returned system' do
+      lib_system = new_system
+      new_system.mount('a', lib_system)
+      lib = Module.new
+      lib.define_singleton_method(:to_system) { lib_system }
+
+      expect { new_system.mount('b', lib) }.to raise_error(described_class::SubsystemError, /already mounted/)
     end
 
     it 'raises if the system is already mounted' do

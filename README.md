@@ -326,7 +326,7 @@ module MyLib
 end
 ```
 
-An application mounts it under a namespace with `#mount(key, system)`, which attaches the library's system as a branch of the app's tree. The app reads its components under the namespace, and can implement (or re-implement) them:
+An application mounts it under a namespace with `#mount(key, mountable)`, which attaches the library's system as a branch of the app's tree. The app reads its components under the namespace, and can implement (or re-implement) them:
 
 ```ruby
 App.declare('db', DB) { DB.new }
@@ -343,6 +343,20 @@ MyLib.system['store']  # => the same object
 Mounted systems aren't copied. The tree is made of the same node objects, so the library reads the app's overrides through its own keys, ex. from classes that only know about `MyLib.system`.
 
 Keys can be nested (`App.mount('libs.my_lib', MyLib.system)`), systems can mount other systems, and a mounted system can keep declaring components: every ancestor indexes them.
+
+### Mountables
+
+`#mount` takes anything that implements `#to_system`, returning a `Sourced::System`. Systems implement it, returning themselves, and a library can implement it so apps mount the library itself:
+
+```ruby
+module MyLib
+  def self.to_system = system
+end
+
+App.mount('my_lib', MyLib)
+```
+
+`#mount` raises `ArgumentError` for objects that don't respond to `#to_system`, or whose `#to_system` doesn't return a `Sourced::System`.
 
 ### Dependencies are relative to the implementing system
 
@@ -364,7 +378,7 @@ App.declare('my_lib.extra', String)
 
 The root of the tree owns the lifecycle. Booting a mounted system directly (`MyLib.system.start!`) raises `SubsystemError`: boot the root.
 
-`#mount` raises if the system is already mounted somewhere, is the root of the tree it's being mounted into, isn't open, or if the key is taken.
+`#mount` raises if the system (what `#to_system` returns) is already mounted somewhere, is the root of the tree it's being mounted into, isn't open, or if the key is taken.
 
 ## Dependency injection
 
