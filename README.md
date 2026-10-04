@@ -286,7 +286,12 @@ node.namespace?      # => no type and no implementation
 
 ## Errors
 
-All errors inherit from `Sourced::System::SystemError`, except type mismatches, which raise `Plumb::ParseError`.
+All errors inherit from `Sourced::System::SystemError`, except type mismatches, which raise `Plumb::ParseError` naming the component (without the value, which can hold secrets):
+
+```
+Plumb::ParseError: db.port: Must be a Integer
+Plumb::ParseError: user: {age: "Must be a Integer"}
+```
 
 | Error | Raised when |
 | --- | --- |

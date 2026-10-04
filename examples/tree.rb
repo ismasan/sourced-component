@@ -106,13 +106,17 @@ App.component!('sourced.db', ['logger']) do
 end
 
 # Nested declarations: App owns 'cache' and 'cache.redis', so it can keep declaring under them
-App.declare('cache.redis', String) { 'redis://localhost' }
-App.declare('cache.redis.pool', Integer) { 5 }
+App.declare('cache.redis', String)
+App.declare('cache.redis.pool', Integer)
 
-# A dynamic component, built on each read
+# Configs: components with only a build step. config! is a singleton
+App.config!('cache.redis') { 'redis://localhost' }
+App.config!('cache.redis.pool', ['sourced.settings.retries']) { |retries| retries + 2 }
+
+# A dynamic config, built on each read
 counter = 0
 App.declare('request_id', String)
-App.component('request_id') { build { "req-#{counter += 1}" } }
+App.config('request_id') { "req-#{counter += 1}" }
 
 # The library can still declare more after being mounted; App's index picks them up
 Library.declare('settings.retries', Integer) { 3 }

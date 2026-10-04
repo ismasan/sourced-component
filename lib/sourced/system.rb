@@ -308,8 +308,15 @@ module Sourced
     # Without the readable check: deps are read while the system is building, in dependency order
     protected def current_value = implementation.singleton? ? value : build_value
 
+    # Parse the built value through the declared type. Type errors name the component, ex.
+    #   Plumb::ParseError: db.port: Must be a Integer
+    # The value is left out, as it can hold secrets.
     private def build_value
-      type.parse(implementation.build(*@dep_nodes.map { |n| n.current_value }))
+      result = type.resolve(implementation.build(*@dep_nodes.map { |n| n.current_value }))
+      return result.value if result.valid?
+
+      errors = result.errors.is_a?(::String) ? result.errors : result.errors.inspect
+      raise Plumb::ParseError, "#{path || '(root)'}: #{errors}"
     end
 
     # Whether moving to new_status would run hooks. Only started nodes can be torn down.

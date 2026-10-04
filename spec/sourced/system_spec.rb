@@ -338,7 +338,7 @@ RSpec.describe Sourced::System do
       sys.declare('a', Integer)
       sys.config!('a') { 'nope' }
 
-      expect { sys.build! }.to raise_error(Plumb::ParseError)
+      expect { sys.build! }.to raise_error(Plumb::ParseError, 'a: Must be a Integer')
     end
 
     it 'replaces previous implementations' do
@@ -582,7 +582,36 @@ RSpec.describe Sourced::System do
       sys = new_system
       sys.declare('n', Integer) { 'nope' }
 
-      expect { sys.build! }.to raise_error(Plumb::ParseError)
+      expect { sys.build! }.to raise_error(Plumb::ParseError, 'n: Must be a Integer')
+    end
+
+    it 'names the full path of the component in type errors' do
+      lib = new_system
+      lib.declare('db.port', Integer) { 'nope' }
+      app = new_system
+      app.mount('libs.sourced', lib)
+
+      expect { app.build! }.to raise_error(Plumb::ParseError, 'libs.sourced.db.port: Must be a Integer')
+      expect(app.boot_status).to eq(:prepared)
+    end
+
+    it 'includes structured errors, without the value' do
+      sys = new_system
+      sys.declare('user', Plumb::Types::Hash[name: String, age: Integer]) { { name: 'Joe', age: 'secret' } }
+
+      expect { sys.build! }.to raise_error(Plumb::ParseError) { |e|
+        expect(e.message).to start_with('user: {')
+        expect(e.message).to include('age')
+        expect(e.message).not_to include('secret')
+      }
+    end
+
+    it 'stores the parsed value' do
+      sys = new_system
+      sys.declare('port', Plumb::Types::Lax::Integer) { '3000' }
+      sys.build!
+
+      expect(sys['port']).to eq(3000)
     end
 
     it 'locks the tree once prepared' do
@@ -776,7 +805,7 @@ RSpec.describe Sourced::System do
       sys.component('n') { build { 'nope' } }
       sys.build!
 
-      expect { sys['n'] }.to raise_error(Plumb::ParseError)
+      expect { sys['n'] }.to raise_error(Plumb::ParseError, 'n: Must be a Integer')
     end
 
     it 'raises for undeclared keys and namespaces' do
