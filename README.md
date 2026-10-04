@@ -116,6 +116,23 @@ App['request_id'] # => "8d1c..."
 App['request_id'] # => "f30a..."
 ```
 
+### Configs
+
+`#config!` and `#config` are shortcuts for components that only have a build step. The block builds the value, and gets the dependencies' values:
+
+```ruby
+App.config!('foo.bar') { 10 }                                # singleton
+App.config!('with.deps', ['sourced.db']) { |db| Foo.new(db) } # singleton, with deps
+App.config('now') { Time.now }                               # dynamic: built on every read
+```
+
+They're the same as:
+
+```ruby
+App.component!('with.deps', ['sourced.db']) { build { |db| Foo.new(db) } }
+App.component('now') { build { Time.now } }
+```
+
 ## Reading values
 
 `#[]` reads a component's value by key, once the system is built.

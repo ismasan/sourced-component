@@ -281,6 +281,93 @@ RSpec.describe Sourced::System do
     end
   end
 
+  describe '#config! and #config' do
+    it 'implements singletons with only a build step' do
+      builds = 0
+      sys = new_system
+      sys.declare('foo.bar', Integer)
+      sys.config!('foo.bar') { builds += 1; 10 }
+      sys.build!
+
+      expect(sys.node('foo.bar').implementation.mode).to eq(:singleton)
+      expect(sys['foo.bar']).to eq(10)
+      expect(sys['foo.bar']).to eq(10)
+      expect(builds).to eq(1)
+    end
+
+    it 'implements dynamic components with only a build step' do
+      counter = 0
+      sys = new_system
+      sys.declare('counter', Integer)
+      sys.config('counter') { counter += 1 }
+      sys.build!
+
+      expect(sys.node('counter').implementation.mode).to eq(:dynamic)
+      expect(sys['counter']).to eq(1)
+      expect(sys['counter']).to eq(2)
+    end
+
+    it 'passes dependency values to the block, relative to the implementing system' do
+      lib = new_system
+      lib.declare('db', String) { 'lib db' }
+      app = new_system
+      app.mount('sourced', lib)
+      app.declare('with.deps', String)
+      app.declare('dynamic', String)
+      app.config!('with.deps', ['sourced.db']) { |db| "with #{db}" }
+      app.config('dynamic', ['sourced.db', 'with.deps']) { |db, with| "#{db} / #{with}" }
+      app.build!
+
+      expect(app['with.deps']).to eq('with lib db')
+      expect(app['dynamic']).to eq('lib db / with lib db')
+    end
+
+    it 'runs no other hooks' do
+      sys = new_system
+      sys.declare('a', Integer)
+      sys.config!('a') { 1 }
+      sys.start!
+      sys.teardown!
+
+      expect(sys.node('a').status).to eq(:toredown)
+      expect(sys['a']).to eq(1)
+    end
+
+    it 'parses values through the declared type' do
+      sys = new_system
+      sys.declare('a', Integer)
+      sys.config!('a') { 'nope' }
+
+      expect { sys.build! }.to raise_error(Plumb::ParseError)
+    end
+
+    it 'replaces previous implementations' do
+      sys = new_system
+      sys.declare('a', Integer) { 1 }
+      sys.config!('a') { 2 }
+      sys.build!
+
+      expect(sys['a']).to eq(2)
+    end
+
+    it 'requires a block' do
+      sys = new_system
+      sys.declare('a')
+
+      expect { sys.config!('a') }.to raise_error(ArgumentError, /needs a block/)
+      expect { sys.config('a') }.to raise_error(ArgumentError, /needs a block/)
+    end
+
+    it 'raises for undeclared keys and locked systems' do
+      sys = new_system
+
+      expect { sys.config!('nope') { 1 } }.to raise_error(described_class::UndeclaredComponentError)
+      sys.declare('a') { 1 }
+      sys.prepare!
+      expect { sys.config('a') { 2 } }.to raise_error(described_class::LockedSystemError)
+    end
+  end
+
   describe '#mount' do
     it 'attaches a standalone system as a branch, indexing its nodes' do
       lib = new_system

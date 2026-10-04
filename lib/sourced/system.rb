@@ -112,6 +112,23 @@ module Sourced
       implement(ckey, deps, :dynamic, &block)
     end
 
+    # A singleton component with only a build step. The block gets the deps' values.
+    #   sys.config!('db.url') { 'sqlite://app.db' }
+    #   sys.config!('db', ['db.url']) { |url| DB.new(url) }
+    def config!(ckey, deps = [], &build_block)
+      raise ArgumentError, "config! #{ckey} needs a block to build its value" unless build_block
+
+      implement(ckey, deps, :singleton) { build(&build_block) }
+    end
+
+    # Same as #config!, but built on every read
+    #   sys.config('now') { Time.now }
+    def config(ckey, deps = [], &build_block)
+      raise ArgumentError, "config #{ckey} needs a block to build its value" unless build_block
+
+      implement(ckey, deps, :dynamic) { build(&build_block) }
+    end
+
     # Attach an existing standalone system as a branch. It keeps owning its declarations,
     # and this system can implement its nodes.
     #   app.mount('sourced', Sourced.system)
