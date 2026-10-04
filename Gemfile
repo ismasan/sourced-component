@@ -2,15 +2,10 @@
 
 source "https://rubygems.org"
 
-# gem "rails"
+# Specify your gem's dependencies in sourced-system.gemspec
+gemspec
 
-gem "plumb", "~> 0.4"
+gem "irb"
+gem "rake", "~> 13.0"
 
-gem "tsort", "~> 0.2.0"
-
-gem "rspec", "~> 3.13"
-
-gem "debug", "~> 1.11"
-
-# test: fiber scheduler for concurrency specs
-gem "async", "~> 2.46"
+gem "rspec", "~> 3.0"

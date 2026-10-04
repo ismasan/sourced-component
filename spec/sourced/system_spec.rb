@@ -2,14 +2,12 @@
 
 require 'spec_helper'
 
-# sub2.rb defines a top-level System, like system.rb (loaded by spec_helper).
-# Load it wrapped in a module, so it becomes Sub2::System and both can be tested in the same process.
-module Sub2
-  load File.expand_path('../sub2.rb', __dir__), self
-end
-
-RSpec.describe Sub2::System do
+RSpec.describe Sourced::System do
   def new_system = described_class.new
+
+  it 'has a version number' do
+    expect(Sourced::System::VERSION).not_to be_nil
+  end
 
   describe '#declare' do
     it 'builds a tree of nodes from dot-separated keys, with intermediate namespaces' do
@@ -712,11 +710,11 @@ RSpec.describe Sub2::System do
       sys.component('ns.b', mode: :dynamic) { build { 'b' } }
       sys.declare('ns.c', String)
 
-      expect(sys.inspect).to eq('#<Sub2::System (root) (namespace)>')
-      expect(sys.node('ns').inspect).to eq('#<Sub2::System ns (namespace)>')
-      expect(sys.node('ns.a').inspect).to eq('#<Sub2::System ns.a Integer (singleton, open)>')
-      expect(sys.node('ns.b').inspect).to eq('#<Sub2::System ns.b String (dynamic, open)>')
-      expect(sys.node('ns.c').inspect).to eq('#<Sub2::System ns.c String (not implemented, open)>')
+      expect(sys.inspect).to eq('#<Sourced::System (root) (namespace)>')
+      expect(sys.node('ns').inspect).to eq('#<Sourced::System ns (namespace)>')
+      expect(sys.node('ns.a').inspect).to eq('#<Sourced::System ns.a Integer (singleton, open)>')
+      expect(sys.node('ns.b').inspect).to eq('#<Sourced::System ns.b String (dynamic, open)>')
+      expect(sys.node('ns.c').inspect).to eq('#<Sourced::System ns.c String (not implemented, open)>')
     end
   end
 
