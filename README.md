@@ -480,6 +480,7 @@ Dispatcher.new(store: FakeStore.new)   # any dependency can be passed explicitly
 - Injections compose: a class can include several, and keep its own `#initialize` (positional and keyword arguments are passed through). Subclasses inherit them.
 - Values are read on instantiation, so classes can be defined before the component is built, and dynamic components give each object a fresh value. Instantiating before the component is built raises `NotBuiltError`.
 - Injecting an undeclared key raises `UndeclaredComponentError`, and injecting two components under the same name raises `ArgumentError`.
+- Injections never overwrite methods: including one raises `InjectionError` if the class already has a method with an injected name, defined in the class or inherited, including private ones like `Kernel#format`. Inject under another name instead: `App.inject('logger' => 'app_logger')`. Methods defined after the include are the class' own, and replace the reader as usual.
 
 Injectors hold on to the nodes themselves, so a library's classes can inject from the library's own root component, and get the overrides of the application that mounts it:
 
@@ -784,6 +785,7 @@ Plumb::ParseError: user: {age: "Must be a Integer"}
 | `CircularDependencyError` | preparing with dependency cycles |
 | `NotBuiltError` | reading values before the component is built |
 | `TornDownError` | starting a component that's torn down |
+| `InjectionError` | including an injector in a class that already has a method with an injected name, or already injects it |
 
 ## Thread safety
 

@@ -7,6 +7,7 @@ module Sourced
     #   include App.inject('logger', 'sourced.store' => 'st')
     # Each include prepends its own #initialize, which takes its kwargs and passes the rest on to super,
     # so multiple injections (and the class' own #initialize) compose.
+    # Including it raises InjectionError if the class already has a method named like an injected reader.
     # Values are read from the nodes themselves, so a class injecting from a library's component
     # gets the overrides of the application that mounts it.
     class Injector < Module
@@ -30,10 +31,23 @@ module Sourced
           end
         end
 
-        define_singleton_method(:included) do |base|
+        # Checked before the module is added to the class, so a refused include leaves the class untouched
+        define_singleton_method(:append_features) do |base|
           taken = (base.ancestors.grep(Injector) - [self]).flat_map { |i| i.names.values } & names.values
-          raise ArgumentError, "#{base} already injects #{taken.join(', ')}" if taken.any?
+          raise InjectionError, "#{base} already injects #{taken.join(', ')}" if taken.any?
 
+          # Readers would silently replace these, including private ones (ex. Kernel#format)
+          defined = names.values.select { |name| base.method_defined?(name) || base.private_method_defined?(name) }
+          if defined.any?
+            methods = defined.map { |name| "##{name} (from #{base.instance_method(name).owner})" }
+            raise InjectionError, "#{base} already defines #{methods.join(', ')}: " \
+                                  "inject under another name instead, ex. inject('key' => 'other_name')"
+          end
+
+          super(base)
+        end
+
+        define_singleton_method(:included) do |base|
           base.prepend(initializer)
           base.attr_reader(*names.values)
         end

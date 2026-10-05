@@ -908,7 +908,43 @@ RSpec.describe Sourced::Component do
       expect { comp.inject('logger', 'other.logger') }.to raise_error(ArgumentError, /duplicate injected names: logger/)
 
       klass = Class.new { include comp.inject('logger') }
-      expect { klass.include(comp.inject('other.logger')) }.to raise_error(ArgumentError, /already injects logger/)
+      expect { klass.include(comp.inject('other.logger')) }.to raise_error(described_class::InjectionError, /already injects logger/)
+    end
+
+    it "refuses to overwrite the class' existing methods" do
+      comp = injectable_component
+      klass = Class.new do
+        def logger = 'own logger'
+      end
+
+      expect { klass.include(comp.inject('logger')) }.to raise_error(
+        described_class::InjectionError,
+        /already defines #logger \(from #<Class:.*>\): inject under another name instead/
+      )
+      expect(klass.new.logger).to eq('own logger')
+      expect(klass.ancestors.grep(described_class::Injector)).to be_empty
+    end
+
+    it 'refuses to overwrite inherited and private methods' do
+      comp = injectable_component
+      comp.declare('format')
+      parent = Class.new { def store = 'parent store' }
+      child = Class.new(parent)
+
+      expect { child.include(comp.inject('sourced.store')) }.to raise_error(described_class::InjectionError, /#store/)
+      expect { Class.new.include(comp.inject('format')) }.to raise_error(described_class::InjectionError, /#format \(from Kernel\)/)
+    end
+
+    it 'can inject under another name instead' do
+      comp = injectable_component
+      comp.build!
+      klass = Class.new do
+        include comp.inject('logger' => 'app_logger')
+
+        def logger = 'own logger'
+      end
+
+      expect([klass.new.logger, klass.new.app_logger]).to eq(['own logger', 'the logger'])
     end
   end
 
