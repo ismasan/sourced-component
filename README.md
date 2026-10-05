@@ -2,7 +2,7 @@
 
 Configuration as a tree of typed components, with dependencies and a managed lifecycle.
 
-Every node in the tree is a `Sourced::Component`. A node can declare a type, be implemented with dependencies and lifecycle hooks (`prepare`, `build`, `start`, `teardown`), and have subcomponents of its own. Libraries declare their own root components; applications mount them under a namespace, and implement or override their subcomponents.
+Every node in the tree is a `Sourced::Component`. A node can declare a type, be implemented with dependencies and lifecycle hooks (`prepare`, `build`, `start`, `stop`, `teardown`), and have subcomponents of its own. Libraries declare their own root components; applications mount them under a namespace, and implement or override their subcomponents.
 
 ```ruby
 require 'sourced/component'
@@ -95,9 +95,12 @@ App.component!('db', ['db.url', 'logger']) do
   prepare { require 'sequel' }                   # before anything is built
   build { |url, logger| Sequel.connect(url, logger:) } # returns the component's value
   start { |db, context| }                        # after everything is built
-  teardown { |db| db.disconnect }                # on shutdown, in reverse order
+  stop { |db| }                                  # when it's stopped, and on shutdown, in reverse order
+  teardown { |db| db.disconnect }                # once, on shutdown, after stop
 end
 ```
+
+`start` and `stop` pair up, and can run more than once for the same value when a component is [stopped and started again by key](#deferred-components-and-starting-and-stopping-by-key). `teardown` runs once, when the root is torn down.
 
 All hooks are optional. Hooks can also be any callable, and the block can take the DSL as an argument instead of being evaluated in it:
 
@@ -184,7 +187,7 @@ Instead of a block, `#component!` and `#component` take a provider that implemen
   App.component!('everything', Sourced::Component::ENVProvider) # all variables
   ```
 
-The callable (the provider itself, or what `#builder_for` returns) can also implement any of `#prepare`, `#start(value, context)` and `#teardown(value)`, which become the component's other lifecycle hooks. Hooks it leaves out are skipped, so plain lambdas only build. A provider can supply a whole lifecycle:
+The callable (the provider itself, or what `#builder_for` returns) can also implement any of `#prepare`, `#start(value, context)`, `#stop(value)` and `#teardown(value)`, which become the component's other lifecycle hooks. Hooks it leaves out are skipped, so plain lambdas only build. A provider can supply a whole lifecycle:
 
 ```ruby
 class PoolProvider
@@ -285,7 +288,7 @@ The root component drives the lifecycle of the whole tree. Each step runs the ma
 | `#prepare!` | Checks the tree (see below), sorts components by dependency, runs `prepare` hooks | `:prepared` |
 | `#build!` | Builds singletons and parses their values through their types | `:built` |
 | `#start!(context = Thread.current)` | Runs `start` hooks with `(value, context)` | `:started` |
-| `#teardown!` | Runs `teardown` hooks with `(value)`, in reverse order | `:torn_down` |
+| `#teardown!` | Runs `stop` hooks on started components, then `teardown` hooks, with `(value)`, in reverse order | `:torn_down` |
 
 Each step runs the ones before it if needed (`#start!` prepares and builds), and is idempotent. `#teardown!` is a no-op unless the component is started. `:torn_down` is terminal: `#start!` on a torn down component raises `TornDownError`.
 
@@ -326,6 +329,39 @@ end
 ```
 
 Components that depend on others start after them and are torn down before them, so a producer that depends on a worker never pushes work to a stopped worker. See [examples/tree.rb](examples/tree.rb).
+
+### Deferred components, and starting and stopping by key
+
+`#defer(key)` makes the root's `#start!` skip a component, along with every component that depends on it, directly or not, since they can't start before it. Start it by key instead, when it should run, and stop it by key when it shouldn't, any number of times, ex. workers that only run while their process holds a leader lock:
+
+```ruby
+App.defer('sourced.dispatcher')
+App.start!(task) # everything but the dispatcher, and whatever depends on it
+
+elector.on_promote { App.start_component!('sourced.dispatcher', task) }
+elector.on_demote { App.stop_component!('sourced.dispatcher') }
+```
+
+Starting and stopping follow the dependency graph:
+
+- **`#start_component!(key, context = Thread.current)`** starts any of the component's dependencies that aren't running, in dependency order, then the component, then the components depending on it that aren't running, once all their dependencies are. A no-op for a component already running.
+- **`#stop_component!(key)`** stops every running component that depends on it, directly or not, in reverse dependency order, then the component. Its own dependencies keep running. Each one runs its `stop` hooks and keeps its value, so it can be started again: the value must support it.
+- **`#restart_component!(key, context = Thread.current)`** stops, then starts.
+
+```
+db <- store <- dispatcher <- monitor
+
+App.stop_component!('dispatcher')   # stops monitor, then dispatcher
+App.start_component!('dispatcher')  # starts dispatcher, then monitor
+```
+
+- **A component stopped by key stays stopped** until it's started by key: starting one of its dependencies again doesn't start it, nor does the root. The components its stop stopped start again with it. A deferred component is the same, until its first start.
+- **Statuses:** a deferred component is `:built` until it's started. A stopped one is `:stopped`. `#tree` and `#graph` show both, and which components are deferred.
+- **Keys are relative to the component** the methods are called on, like `#component!`, and the root must be started, or starting: a `start` hook can start a deferred component, ex. right away when its process is already leader. Before that they raise `NotStartedError`, and `TornDownError` once the root is torn down.
+- **Deferring belongs to the node,** not to its implementation, so implementing a deferred component again keeps it deferred. Any component can defer a node below it, like implementing one, ex. an app deferring a mounted library's component. Like declaring and implementing, it's only allowed before the tree is prepared.
+- **If a `start` hook raises,** the components that call started are stopped again, in reverse order, and the error is re-raised. The rest of the tree is left as it was, and the root stays started.
+- **If `stop` hooks raise,** every component is still stopped, and the first error is re-raised.
+- **`#teardown!`** runs `stop` on the started components and `teardown` on all of them, deferred or stopped ones included.
 
 ### Signal handlers
 
@@ -675,7 +711,9 @@ end
 | `components.preparing` / `components.prepared` | around a component's `prepare` hooks | `key`, and `duration` when finished |
 | `components.building` / `components.built` | around a **singleton**'s `build` hooks | `key`, and `duration` when finished |
 | `components.starting` / `components.started` | around a component's `start` hooks | `key`, and `duration` when finished |
+| `components.stopping` / `components.stopped` | around a component's `stop` hooks, when stopped by key (on `#teardown!`, they're part of tearing down) | `key`, and `duration` when finished |
 | `components.tearing_down` / `components.torn_down` | around a component's `teardown` hooks | `key`, and `duration` when finished |
+| `components.deferred` | `#defer` | `key`, `deferrer` (the full path of the component that deferred it, `nil` for the root) |
 | `components.failed` | a component's hook (or type check) raised | `key`, `stage`, `error_class`, `error_message`, `backtrace` |
 | `root.preparing` / `root.prepared` | around `#prepare!` | `duration` when finished |
 | `root.building` / `root.built` | around `#build!` | `duration` when finished |
@@ -687,7 +725,7 @@ end
 - **`key`** is the component's full path from the root, ex. `sourced.db`.
 - **`deps`** are relative to the `implementer`, the full path of the component that implemented the component (`nil` for the root).
 - **`duration`** is in seconds, measured with a monotonic clock.
-- **`stage`** is one of `:prepare`, `:build`, `:start` or `:teardown`.
+- **`stage`** is one of `:prepare`, `:build`, `:start`, `:stop` or `:teardown`.
 - **Errors are described, not attached:** `error_class`, `error_message` and `backtrace` are strings, so events stay serializable (see below). The error itself is re-raised to the caller of the lifecycle method.
 
 A few rules:
@@ -780,11 +818,12 @@ Plumb::ParseError: user: {age: "Must be a Integer"}
 | `LockedComponentError` | changing the tree after it's prepared, or mounting a component that isn't open |
 | `SubcomponentError` | booting a mounted component, or mounting a component that's already mounted |
 | `UndeclaredComponentError` | implementing or reading an undeclared key, or reading a namespace |
-| `UnimplementedComponentError` | preparing with declared components that have no implementation |
+| `UnimplementedComponentError` | preparing with declared (or deferred) components that have no implementation |
 | `MissingDependencyError` | preparing with dependencies that aren't declared or implemented |
 | `CircularDependencyError` | preparing with dependency cycles |
 | `NotBuiltError` | reading values before the component is built |
-| `TornDownError` | starting a component that's torn down |
+| `TornDownError` | starting a component that's torn down, or starting or stopping a component by key once its root is torn down |
+| `NotStartedError` | starting or stopping a component by key before its root is started |
 | `InjectionError` | including an injector in a class that already has a method with an injected name, or already injects it |
 
 ## Thread safety

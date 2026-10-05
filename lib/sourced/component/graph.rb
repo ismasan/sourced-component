@@ -33,7 +33,7 @@ module Sourced
         lines = ['flowchart LR']
 
         components.each do |node|
-          details = Mermaid.details(node[:implemented], node[:mode], node[:status])
+          details = Mermaid.details(node[:implemented], node[:mode], node[:status], node[:deferred])
           label = "#{Mermaid.escape(node[:key])}<br/>#{Mermaid.escape(node[:type_name])}<br/><i>#{details}</i>"
           open, close = Mermaid.component_shape(node[:mode])
           css_class = node[:implemented] ? node[:status] : :unimplemented

@@ -13,6 +13,7 @@ module Sourced
     CircularDependencyError = Class.new(ComponentError)
     NotBuiltError = Class.new(ComponentError)
     TornDownError = Class.new(ComponentError)
+    NotStartedError = Class.new(ComponentError)
     InjectionError = Class.new(ComponentError)
   end
 end

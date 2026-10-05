@@ -15,10 +15,11 @@ module Sourced
       # path:        the full path from the root, ex. 'sourced.db'. nil for the root of a tree
       # namespace:   whether it has no type and no implementation
       # mounted:     whether it's a component mounted here (it owns itself)
+      # deferred:    whether the root's start! skips it (see Component#defer)
       # owner:       the full path of the component that declared it. nil for the root
       # implementer: the full path of the component that implemented it. nil for the root, or if not implemented
       class Node < Data.define(
-        :key, :path, :type, :type_name, :namespace, :mounted, :implemented, :mode, :status, :owner, :implementer, :children
+        :key, :path, :type, :type_name, :namespace, :mounted, :implemented, :mode, :status, :deferred, :owner, :implementer, :children
       )
         # Whether it's implemented by a component other than the one that declared it, ex. an app overriding a library's component
         def overridden? = implemented && owner != implementer
@@ -77,7 +78,7 @@ module Sourced
         lines = [Mermaid.escape(name)]
         unless node.namespace
           lines << Mermaid.escape(node.type_name)
-          lines << "<i>#{Mermaid.details(node.implemented, node.mode, node.status)}</i>"
+          lines << "<i>#{Mermaid.details(node.implemented, node.mode, node.status, node.deferred)}</i>"
         end
         lines << "<i>implemented by #{Mermaid.escape(node.implementer || '(root)')}</i>" if node.overridden?
         label = lines.join('<br/>')
@@ -106,7 +107,7 @@ module Sourced
         parts << '[mounted]' if node.mounted
         unless node.namespace
           parts << node.type_name
-          parts << "(#{node.implemented ? node.mode : 'not implemented'}, #{node.status})"
+          parts << "(#{[node.implemented ? node.mode : 'not implemented', node.status, ('deferred' if node.deferred)].compact.join(', ')})"
         end
         parts << "implemented by #{node.implementer || '(root)'}" if node.overridden?
         parts.join(' ')

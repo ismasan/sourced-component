@@ -49,7 +49,7 @@ module Sourced
 
       Completed = proc { attribute :duration, Float }
       Failed = proc do
-        attribute :stage, Symbol # :prepare, :build, :start or :teardown
+        attribute :stage, Symbol # :prepare, :build, :start, :stop or :teardown
         attribute :error_class, String
         attribute :error_message, String
         attribute :backtrace, Plumb::Types::Array[String]
@@ -74,19 +74,24 @@ module Sourced
         attribute :implementer, Plumb::Types::String.nullable # the implementer's full path. nil for the root
         attribute :override, Plumb::Types::Boolean # whether it replaced a previous implementation
       end
+      ComponentDeferred = ComponentEvent.define('components.deferred') do
+        attribute :deferrer, Plumb::Types::String.nullable # the full path of the component that deferred it. nil for the root
+      end
       ComponentPreparing = ComponentEvent.define('components.preparing')
       ComponentPrepared = ComponentEvent.define('components.prepared', &Completed)
       ComponentBuilding = ComponentEvent.define('components.building')
       ComponentBuilt = ComponentEvent.define('components.built', &Completed)
       ComponentStarting = ComponentEvent.define('components.starting')
       ComponentStarted = ComponentEvent.define('components.started', &Completed)
+      ComponentStopping = ComponentEvent.define('components.stopping')
+      ComponentStopped = ComponentEvent.define('components.stopped', &Completed)
       ComponentTearingDown = ComponentEvent.define('components.tearing_down')
       ComponentTornDown = ComponentEvent.define('components.torn_down', &Completed)
       ComponentFailed = ComponentEvent.define('components.failed', &Failed)
     end
 
     # Lifecycle stages, the status each one moves to, and their events
-    STAGES = { prepare: :prepared, build: :built, start: :started, teardown: :torn_down }.freeze
+    STAGES = { prepare: :prepared, build: :built, start: :started, stop: :stopped, teardown: :torn_down }.freeze
 
     ROOT_EVENTS = {
       prepare: [Events::RootPreparing, Events::RootPrepared],
@@ -99,6 +104,7 @@ module Sourced
       prepare: [Events::ComponentPreparing, Events::ComponentPrepared],
       build: [Events::ComponentBuilding, Events::ComponentBuilt],
       start: [Events::ComponentStarting, Events::ComponentStarted],
+      stop: [Events::ComponentStopping, Events::ComponentStopped],
       teardown: [Events::ComponentTearingDown, Events::ComponentTornDown]
     }.freeze
   end

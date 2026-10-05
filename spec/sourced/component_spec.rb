@@ -1512,6 +1512,373 @@ RSpec.describe Sourced::Component do
     end
   end
 
+  describe 'deferred components, and starting and stopping by key' do
+    let(:calls) { [] }
+
+    # db <- store <- dispatcher <- monitor, and cache, which nothing depends on
+    def chain
+      log = calls
+      comp = new_component
+      %w[db store dispatcher monitor cache].each { |key| comp.declare(key) }
+      hooks = lambda do |name, deps = []|
+        comp.component!(name, deps) do
+          build { |*| name }
+          start { |value, context| log << [:start, value, context] }
+          stop { |value| log << [:stop, value] }
+          teardown { |value| log << [:teardown, value] }
+        end
+      end
+      hooks.('db')
+      hooks.('store', ['db'])
+      hooks.('dispatcher', ['store'])
+      hooks.('monitor', ['dispatcher'])
+      hooks.('cache')
+      comp
+    end
+
+    def statuses(comp) = %w[db store dispatcher monitor cache].to_h { |key| [key, comp.node(key).status] }
+
+    it "is skipped by the root's start!, along with everything that depends on it" do
+      comp = chain
+      comp.defer('dispatcher')
+      comp.start!(:ctx)
+
+      expect(calls).to eq([[:start, 'db', :ctx], [:start, 'store', :ctx], [:start, 'cache', :ctx]])
+      expect(statuses(comp)).to eq(
+        'db' => :started, 'store' => :started, 'dispatcher' => :built, 'monitor' => :built, 'cache' => :started
+      )
+      expect(comp.node('dispatcher')).to be_deferred
+      expect(comp.node('monitor')).not_to be_deferred
+    end
+
+    it 'starts by key, then the components depending on it, in dependency order' do
+      comp = chain
+      comp.defer('dispatcher')
+      comp.start!(:boot)
+      calls.clear
+
+      expect(comp.start_component!('dispatcher', :later)).to be(comp)
+
+      expect(calls).to eq([[:start, 'dispatcher', :later], [:start, 'monitor', :later]])
+      expect(statuses(comp)).to include('dispatcher' => :started, 'monitor' => :started)
+    end
+
+    it 'starts the dependencies that are not running first' do
+      comp = chain
+      comp.defer('store')
+      comp.start!
+      calls.clear
+
+      comp.start_component!('monitor', :ctx)
+
+      expect(calls).to eq([[:start, 'store', :ctx], [:start, 'dispatcher', :ctx], [:start, 'monitor', :ctx]])
+    end
+
+    it 'is a no-op for a component that is running' do
+      comp = chain
+      comp.start!
+      calls.clear
+
+      comp.start_component!('dispatcher')
+
+      expect(calls).to be_empty
+    end
+
+    it 'stops by key: dependents first, keeping values and dependencies' do
+      comp = chain
+      comp.start!
+      dispatcher = comp['dispatcher']
+      calls.clear
+
+      expect(comp.stop_component!('dispatcher')).to be(comp)
+
+      expect(calls).to eq([[:stop, 'monitor'], [:stop, 'dispatcher']])
+      expect(statuses(comp)).to eq(
+        'db' => :started, 'store' => :started, 'dispatcher' => :stopped, 'monitor' => :stopped, 'cache' => :started
+      )
+      expect(comp['dispatcher']).to be(dispatcher)
+    end
+
+    it 'starts again the dependents its stop stopped, but not ones stopped by key themselves' do
+      comp = chain
+      log = calls
+      comp.declare('audit')
+      comp.component!('audit', ['dispatcher']) { start { |_, _| log << [:start, 'audit'] } }
+      comp.start!
+      comp.stop_component!('audit')
+      comp.stop_component!('dispatcher')
+      calls.clear
+
+      comp.start_component!('dispatcher', :ctx)
+
+      expect(calls).to eq([[:start, 'dispatcher', :ctx], [:start, 'monitor', :ctx]])
+      expect(comp.node('audit').status).to eq(:stopped)
+    end
+
+    it 'leaves a component stopped by key stopped when one of its dependencies starts again' do
+      comp = chain
+      comp.start!
+      comp.stop_component!('monitor')
+      comp.stop_component!('store') # stops dispatcher too
+      calls.clear
+
+      comp.start_component!('store', :ctx)
+
+      expect(calls).to eq([[:start, 'store', :ctx], [:start, 'dispatcher', :ctx]])
+      expect(comp.node('monitor').status).to eq(:stopped)
+    end
+
+    it 'restarts by key: stops, then starts, following the dependencies' do
+      comp = chain
+      comp.start!
+      calls.clear
+
+      comp.restart_component!('dispatcher', :again)
+
+      expect(calls).to eq([
+        [:stop, 'monitor'], [:stop, 'dispatcher'],
+        [:start, 'dispatcher', :again], [:start, 'monitor', :again]
+      ])
+    end
+
+    it 'can be started and stopped any number of times' do
+      comp = chain
+      comp.defer('monitor')
+      comp.start!
+      3.times do
+        comp.start_component!('monitor')
+        comp.stop_component!('monitor')
+      end
+
+      expect(calls.count { |c| c[0..1] == [:start, 'monitor'] }).to eq(3)
+      expect(calls.count([:stop, 'monitor'])).to eq(3)
+    end
+
+    describe 'when a start hook raises' do
+      it 'stops what the call started, in reverse order, and re-raises, leaving the rest as it was' do
+        comp = chain
+        comp.component!('monitor', ['dispatcher']) { start { raise 'boom' } }
+        comp.defer('store')
+        comp.start!
+        calls.clear
+
+        expect { comp.start_component!('store', :ctx) }.to raise_error(RuntimeError, 'boom')
+
+        expect(calls).to eq([
+          [:start, 'store', :ctx], [:start, 'dispatcher', :ctx],
+          [:stop, 'dispatcher'], [:stop, 'store']
+        ])
+        expect(statuses(comp)).to include('db' => :started, 'store' => :stopped, 'cache' => :started)
+        expect(comp.boot_status).to eq(:started)
+      end
+
+      it 'leaves the component waiting to be started by key again' do
+        comp = chain
+        attempts = 0
+        comp.component!('dispatcher', ['store']) { start { raise 'boom' if (attempts += 1) == 1 } }
+        comp.defer('dispatcher')
+        comp.start!
+
+        expect { comp.start_component!('dispatcher') }.to raise_error(RuntimeError, 'boom')
+        comp.stop_component!('store')
+        comp.start_component!('store')
+        expect(comp.node('dispatcher').status).to eq(:built) # still deferred: not started with store
+
+        comp.start_component!('dispatcher')
+        expect(comp.node('dispatcher').status).to eq(:started)
+      end
+    end
+
+    it 'stops every component even if stop hooks raise, and re-raises the first error' do
+      comp = chain
+      comp.component!('monitor', ['dispatcher']) { stop { raise 'monitor failed' } }
+      comp.start!
+      calls.clear
+
+      expect { comp.stop_component!('dispatcher') }.to raise_error(RuntimeError, 'monitor failed')
+      expect(calls).to eq([[:stop, 'dispatcher']])
+      expect(statuses(comp)).to include('dispatcher' => :stopped, 'monitor' => :stopped)
+    end
+
+    it 'can start a deferred component from a start hook, while the root starts' do
+      comp = chain
+      comp.defer('dispatcher')
+      comp.declare('runner')
+      comp.component!('runner', ['cache']) do
+        start { |_, context| comp.start_component!('dispatcher', context) }
+      end
+      comp.start!(:ctx)
+
+      expect(calls.count { |c| c[0..1] == [:start, 'dispatcher'] }).to eq(1)
+      expect(statuses(comp)).to include('dispatcher' => :started, 'monitor' => :started)
+    end
+
+    it 'takes keys relative to the component it is called on' do
+      lib = new_component
+      lib.declare('worker') { 'worker' }
+      app = new_component
+      app.mount('lib', lib)
+      app.defer('lib.worker')
+      app.start!
+
+      lib.start_component!('worker')
+      expect(app.node('lib.worker').status).to eq(:started)
+
+      app.stop_component!('lib.worker')
+      expect(lib.node('worker').status).to eq(:stopped)
+    end
+
+    describe 'teardown!' do
+      it 'stops started components, then tears every component down, in reverse order' do
+        comp = chain
+        comp.defer('monitor')
+        comp.start!
+        comp.stop_component!('dispatcher')
+        calls.clear
+
+        comp.teardown!
+
+        expect(calls).to eq([
+          [:stop, 'cache'], [:teardown, 'cache'], [:teardown, 'monitor'], [:teardown, 'dispatcher'],
+          [:stop, 'store'], [:teardown, 'store'], [:stop, 'db'], [:teardown, 'db']
+        ])
+        expect(statuses(comp).values).to all(eq(:torn_down))
+      end
+
+      it 'runs the teardown hooks even if the stop hooks raise' do
+        log = calls
+        comp = new_component
+        comp.declare('a')
+        comp.component!('a') do
+          stop { |_| log << :stop; raise 'stop failed' }
+          teardown { |_| log << :teardown }
+        end
+        comp.start!
+
+        expect { comp.teardown! }.to raise_error(RuntimeError, 'stop failed')
+        expect(calls).to eq(%i[stop teardown])
+      end
+    end
+
+    describe 'errors' do
+      it 'raises before the root is started' do
+        comp = chain
+        comp.build!
+
+        expect { comp.start_component!('dispatcher') }.to raise_error(described_class::NotStartedError, /dispatcher/)
+        expect { comp.stop_component!('dispatcher') }.to raise_error(described_class::NotStartedError)
+      end
+
+      it 'raises after the root is torn down' do
+        comp = chain
+        comp.start!
+        comp.teardown!
+
+        expect { comp.start_component!('dispatcher') }.to raise_error(described_class::TornDownError)
+      end
+
+      it 'raises for undeclared keys and namespaces' do
+        comp = chain
+        comp.declare('a.b') { 1 }
+        comp.start!
+
+        expect { comp.start_component!('nope') }.to raise_error(described_class::UndeclaredComponentError)
+        expect { comp.stop_component!('a') }.to raise_error(described_class::UndeclaredComponentError, /namespace/)
+      end
+
+      it "can't defer once prepared" do
+        comp = chain
+        comp.prepare!
+
+        expect { comp.defer('dispatcher') }.to raise_error(described_class::LockedComponentError)
+      end
+
+      it "can't defer a namespace" do
+        comp = new_component
+        comp.declare('a.b') { 1 }
+        comp.defer('a')
+
+        expect { comp.prepare! }.to raise_error(described_class::UnimplementedComponentError, /deferred but not implemented: a/)
+      end
+    end
+
+    it 'keeps a deferral when the component is implemented again' do
+      comp = chain
+      comp.defer('dispatcher')
+      comp.config!('dispatcher', ['store']) { |_| 'another' }
+      comp.start!
+
+      expect(comp.node('dispatcher').status).to eq(:built)
+    end
+
+    it 'can be deferred by any component above it, ex. an app deferring a library component' do
+      lib = new_component
+      lib.declare('worker') { 'worker' }
+      app = new_component
+      app.mount('lib', lib)
+
+      app.defer('lib.worker')
+      app.start!
+
+      expect(lib.node('worker')).to be_deferred
+      expect(lib.node('worker').status).to eq(:built)
+    end
+
+    it 'runs a provider\'s #stop as its stop hook' do
+      provider = Class.new do
+        def initialize(log) = @log = log
+        def call = 'value'
+        def stop(value) = @log << [:stop, value]
+      end.new(calls)
+      comp = new_component
+      comp.declare('a')
+      comp.component!('a', provider)
+      comp.start!
+      comp.stop_component!('a')
+
+      expect(calls).to eq([[:stop, 'value']])
+    end
+
+    it 'publishes events' do
+      comp = chain
+      types = []
+      comp.notifier.subscribe(described_class::Event) { |event| types << [event.type, event.payload.to_h[:key]] }
+      comp.defer('dispatcher')
+      comp.start!
+      types.clear
+
+      comp.start_component!('dispatcher')
+      comp.stop_component!('dispatcher')
+
+      expect(types).to eq([
+        ['components.starting', 'dispatcher'], ['components.started', 'dispatcher'],
+        ['components.starting', 'monitor'], ['components.started', 'monitor'],
+        ['components.stopping', 'monitor'], ['components.stopped', 'monitor'],
+        ['components.stopping', 'dispatcher'], ['components.stopped', 'dispatcher']
+      ])
+    end
+
+    it 'publishes components.deferred' do
+      comp = chain
+      events = []
+      comp.notifier.subscribe('components.deferred') { |event| events << event.payload.to_h.slice(:key, :deferrer) }
+      comp.defer('dispatcher')
+
+      expect(events).to eq([{ key: 'dispatcher', deferrer: nil }])
+    end
+
+    it 'shows deferred and stopped components in the tree and the graph' do
+      comp = chain
+      comp.defer('monitor')
+      comp.start!
+      comp.stop_component!('dispatcher')
+
+      expect(comp.tree.to_s).to include('dispatcher Any (singleton, stopped)', 'monitor Any (singleton, built, deferred)')
+      expect(comp.graph.components.find { |c| c[:key] == 'monitor' }).to include(status: :built, deferred: true)
+      expect(comp.graph.to_mermaid).to include('<i>singleton, built, deferred</i>', 'classDef stopped')
+    end
+  end
+
   describe 'reading values' do
     it 'raises until the component is built' do
       comp = new_component
@@ -1621,6 +1988,7 @@ RSpec.describe Sourced::Component do
         implemented: true,
         mode: :dynamic,
         status: :open,
+        deferred: false,
         deps: ['logger.output'],
         missing: [],
         dependents: ['app'],
@@ -1634,6 +2002,7 @@ RSpec.describe Sourced::Component do
         implemented: false,
         mode: nil,
         status: :open,
+        deferred: false,
         deps: [],
         missing: [],
         dependents: [],
@@ -1997,7 +2366,7 @@ RSpec.describe Sourced::Component do
       it 'escapes labels' do
         node = described_class::Tree::Node.new(
           key: 'a"b', path: 'a"b', type: nil, type_name: 'Hash<String> & more', namespace: false, mounted: false,
-          implemented: false, mode: nil, status: :open, owner: nil, implementer: nil, children: []
+          implemented: false, mode: nil, status: :open, deferred: false, owner: nil, implementer: nil, children: []
         )
         tree = described_class::Tree.new(status: :open, root: node.with(key: nil, path: nil, namespace: true, children: [node]))
 

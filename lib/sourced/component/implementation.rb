@@ -7,8 +7,9 @@ module Sourced
     # How a node is built. Deps are keys relative to the implementer: the component that called #component! or #component.
     #   prepare:  hooks run with no arguments
     #   build:    hooks run with dep values. The last result is the node's value
-    #   start:    hooks run with (value, context)
-    #   teardown: hooks run with (value)
+    #   start:    hooks run with (value, context). Again after each stop, for a component started by key
+    #   stop:     hooks run with (value), when a started component is stopped, or torn down
+    #   teardown: hooks run with (value), once, when the root is torn down
     # A dep ending in '.*' depends on every component directly under that key, and its value is
     # a hash of their values by key segment, ex. 'reactors.*' => { 'foo' => <Foo>, 'bar' => <Bar> }
     class Implementation
@@ -27,10 +28,10 @@ module Sourced
       end
 
       # Hooks that a provider's builder can implement, besides #call (the build step)
-      OPTIONAL_HOOKS = %i[prepare start teardown].freeze
+      OPTIONAL_HOOKS = %i[prepare start stop teardown].freeze
 
       # From a provider's builder: #call(*deps) is the build step, and it can also implement
-      # #prepare, #start(value, context) and #teardown(value).
+      # #prepare, #start(value, context), #stop(value) and #teardown(value).
       def self.from_builder(builder, deps, implementer:, mode:, provider: nil)
         dsl = DSL.new
         dsl.build(builder)
@@ -62,6 +63,7 @@ module Sourced
       def prepare = @hooks[:prepare].each(&:call)
       def build(*deps) = @hooks[:build].reduce(nil) { |_, b| b.call(*deps) }
       def start(value, context) = @hooks[:start].each { |b| b.call(value, context) }
+      def stop(value) = @hooks[:stop].each { |b| b.call(value) }
       def teardown(value) = @hooks[:teardown].each { |b| b.call(value) }
     end
   end

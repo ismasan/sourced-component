@@ -30,7 +30,9 @@ module Sourced
     end
 
     # Lifecycle statuses, in order. Shared by the root (boot status) and every node.
-    STATUSES = %i[open prepared built started torn_down].freeze
+    # Only nodes are ever :stopped: a started node stopped by key (see #stop_component!),
+    # which can be started again.
+    STATUSES = %i[open prepared built started stopped torn_down].freeze
 
     # What #mount takes: anything that returns a Component from #to_component
     MountableInterface = Plumb::Types::Interface[:to_component]
@@ -53,6 +55,8 @@ module Sourced
       @implementation = nil
       @status = :open
       @value = nil
+      @deferred = false # skipped by the root's #start!, see #defer
+      @held = false     # not started with the tree or its dependencies: deferred, or stopped by key
       @deps = [].freeze      # resolved deps: a node, or { segment => node } for a wildcard
       @dep_nodes = [].freeze # every node in @deps, for sorting
       @children = {}
@@ -60,6 +64,7 @@ module Sourced
       # Only used on the root
       @boot_status = :open
       @readable = false
+      @starting = false
       @order = nil
       @lock = Monitor.new
     end
@@ -79,10 +84,13 @@ module Sourced
 
     def implicit? = @implicit
     def namespace? = implicit? && implementation.nil?
+
+    # Whether the root's #start! skips it (see #defer)
+    def deferred? = @deferred
     def locked? = root.boot_status != :open
 
     def inspect
-      details = namespace? ? '(namespace)' : "#{type_name} (#{implementation&.mode || 'not implemented'}, #{status})"
+      details = namespace? ? '(namespace)' : "#{type_name} (#{[implementation&.mode || 'not implemented', status, ('deferred' if deferred?)].compact.join(', ')})"
       "#<#{self.class} #{path || '(root)'} #{details}>"
     end
 
@@ -190,6 +198,25 @@ module Sourced
         builders.each do |target, provider, builder|
           implement_node(target, Implementation.from_builder(builder, [], implementer: self, mode: :singleton, provider:))
         end
+        self
+      end
+    end
+
+    # Defer a node under this component: the root's #start! skips it, and every component that
+    # depends on it, directly or not, since they can't start before it. Start it by key instead,
+    # ex. when its process is elected to run it (see #start_component!).
+    #   app.defer('sourced.dispatcher')
+    #   app.start!(task)                                # everything else
+    #   app.start_component!('sourced.dispatcher', task) # later, and again after each #stop_component!
+    # Deferring is a property of the node, not of its implementation, so it's kept when the node is
+    # implemented again. Any component can defer a node below it, like implementing one.
+    def defer(ckey)
+      synchronize do
+        raise LockedComponentError, "can't defer #{ckey} in a locked component" if locked?
+
+        target = node(ckey)
+        target.defer!
+        emit(Events::ComponentDeferred, key: target.path, deferrer: path)
         self
       end
     end
@@ -309,29 +336,115 @@ module Sourced
         return self if past?(:started)
 
         instrument_root(:start) do
-          @order.each { |n| instrument_component(n, :start) { n.start_node!(context) } }
+          @starting = true
+          @order.each do |n|
+            # Deferred nodes, and the ones depending on them, wait to be started by key.
+            # A start hook may already have started some of them by key (see #start_component!)
+            next if n.held? || !n.dep_nodes.all? { |dep| dep.started? }
+
+            instrument_component(n, :start) { n.start_node!(context) }
+          end
           @boot_status = :started
         rescue Exception # rubocop:disable Lint/RescueException -- any error (incl. Interrupt) must tear down what was started. Always re-raised
-          teardown_nodes
+          teardown_nodes(include_built: false)
           @boot_status = :torn_down
           raise
+        ensure
+          @starting = false
         end
         self
       end
     end
 
-    # Tears down all started nodes, in reverse dependency order, even if some raise. The first error is re-raised.
+    # Tears down every node, in reverse dependency order, even if some raise. The first error is re-raised.
+    # Started nodes run their stop hooks, then their teardown hooks. Nodes that never started (deferred)
+    # or were stopped run their teardown hooks.
     def teardown!
       raise_mounted!
       synchronize do
         return self unless boot_status == :started
 
         instrument_root(:teardown) do
-          errors = teardown_nodes
+          errors = teardown_nodes(include_built: true)
           @boot_status = :torn_down
           raise errors.first if errors.any?
         end
         self
+      end
+    end
+
+    # ---- Starting and stopping components by key ------------------------------------
+
+    # Start a component that isn't running, by key relative to this component: a deferred one
+    # (see #defer), or one stopped with #stop_component!. Follows the dependency graph:
+    # - first, any of its dependencies that aren't running, in dependency order
+    # - then the component itself
+    # - then the components depending on it that aren't running, once all their dependencies are,
+    #   ex. the ones its #stop_component! stopped. Not the ones stopped by key themselves
+    # Each one runs its start hooks with +context+. A no-op for components already running.
+    # If a start hook raises, the components this call started are stopped again, in reverse order,
+    # and the error is re-raised: the rest of the tree is left as it was.
+    # The root must be started, or starting (a start hook can start a deferred component).
+    #   app.start_component!('sourced.dispatcher', task)
+    def start_component!(ckey, context = Thread.current)
+      synchronize do
+        target = running_node(ckey)
+        dependencies = target.transitive_dependencies
+        dependents = target.transitive_dependents
+        holds = [target, *dependencies].to_h { |n| [n, n.held?] }
+        started = []
+
+        begin
+          root.order.each do |n|
+            if n.equal?(target) || dependencies.include?(n)
+              next if n.started?
+
+              n.release!
+            elsif dependents.include?(n)
+              next if n.started? || n.held? || !n.dep_nodes.all? { |dep| dep.started? }
+            else
+              next
+            end
+
+            instrument_component(n, :start) { n.start_node!(context) }
+            started << n
+          end
+        rescue Exception # rubocop:disable Lint/RescueException -- any error (incl. Interrupt) must stop what this call started. Always re-raised
+          stop_nodes(started.reverse)
+          holds.each { |n, held| n.hold! if held }
+          raise
+        end
+        self
+      end
+    end
+
+    # Stop a running component, by key relative to this component, and every running component
+    # that depends on it, directly or not: dependents first, in reverse dependency order. Each one
+    # runs its stop hooks, and keeps its value, so it can be started again (see #start_component!).
+    # The component's own dependencies keep running.
+    # The component stays stopped until it's started by key: the root's lifecycle, and starting
+    # its dependencies, don't start it again. Its dependents start again with it.
+    # Every one is stopped even if stop hooks raise, and the first error is re-raised.
+    #   app.stop_component!('sourced.dispatcher')
+    def stop_component!(ckey)
+      synchronize do
+        target = running_node(ckey)
+        target.hold!
+        stopping = [target, *target.transitive_dependents]
+        errors = stop_nodes(root.order.reverse.select { |n| stopping.include?(n) && n.started? })
+        raise errors.first if errors.any?
+
+        self
+      end
+    end
+
+    # #stop_component! then #start_component!: stops the component and its dependents, and starts
+    # them again, in dependency order.
+    #   app.restart_component!('sourced.dispatcher', task)
+    def restart_component!(ckey, context = Thread.current)
+      synchronize do
+        stop_component!(ckey)
+        start_component!(ckey, context)
       end
     end
 
@@ -361,6 +474,7 @@ module Sourced
             implemented: !impl.nil?,
             mode: impl&.mode,
             status: n.status,
+            deferred: n.deferred?,
             deps:,
             missing:,
             dependents: dependents[n.path],
@@ -394,6 +508,7 @@ module Sourced
         implemented: !implementation.nil?,
         mode: implementation&.mode,
         status:,
+        deferred: deferred?,
         owner: owner.equal?(self) ? path : owner.path,
         implementer: implementation&.implementer&.path,
         children: children.values.map { |child| child.tree_node }
@@ -411,6 +526,7 @@ module Sourced
     # ---- Node internals -------------------------------------------------------------
 
     protected def readable? = @readable
+    protected def starting? = @starting
     protected def lock = @lock
     protected def dep_nodes = @dep_nodes
     protected def order = @order
@@ -424,6 +540,32 @@ module Sourced
 
     protected def implement!(implementation)
       @implementation = implementation
+    end
+
+    protected def defer! = @deferred = true
+    protected def held? = @held
+    protected def hold! = @held = true
+    protected def release! = @held = false
+    protected def started? = status == :started
+
+    # Every node this one depends on, directly or not
+    protected def transitive_dependencies
+      dep_nodes.each_with_object([]) do |dep, all|
+        next if all.include?(dep)
+
+        all << dep
+        dep.transitive_dependencies.each { |n| all << n unless all.include?(n) }
+      end
+    end
+
+    # Every node that depends on this one, directly or not. Nodes come after their
+    # dependencies in the root's order, so one pass over the order finds them all.
+    protected def transitive_dependents
+      reached = [self]
+      root.order.each do |n|
+        reached << n if !reached.include?(n) && n.dep_nodes.any? { |dep| reached.include?(dep) }
+      end
+      reached.drop(1)
     end
 
     protected def adopt!(parent, key)
@@ -473,21 +615,53 @@ module Sourced
     end
 
     protected def prepare_node!
-      transition(:prepared) { implementation.prepare }
+      return self unless pending?(:prepare)
+
+      implementation.prepare
+      @status = :prepared
+      self
     end
 
     protected def build_node!
-      transition(:built) do
-        @value = build_value if implementation.singleton?
-      end
+      return self unless pending?(:build)
+
+      @value = build_value if implementation.singleton?
+      @status = :built
+      self
     end
 
+    # From :built, or again from :stopped
     protected def start_node!(context)
-      transition(:started) { implementation.start(value, context) }
+      return self unless pending?(:start)
+
+      implementation.start(value, context)
+      @status = :started
+      self
     end
 
+    # Stopped even if a stop hook raises: it's no longer running either way
+    protected def stop_node!
+      return self unless pending?(:stop)
+
+      begin
+        implementation.stop(value)
+      ensure
+        @status = :stopped
+      end
+      self
+    end
+
+    # A started node runs its stop hooks first. Teardown hooks run even if those raise
     protected def teardown_node!
-      transition(:torn_down) { implementation.teardown(value) }
+      return self unless pending?(:teardown)
+
+      begin
+        implementation.stop(value) if started?
+      ensure
+        implementation.teardown(value)
+      end
+      @status = :torn_down
+      self
     end
 
     # Without the readable check: deps are read while the component is building, in dependency order
@@ -505,19 +679,15 @@ module Sourced
       raise Plumb::ParseError, "#{path || '(root)'}: #{errors}"
     end
 
-    # Whether moving to new_status would run hooks. Only started nodes can be torn down.
-    protected def pending?(new_status)
-      return status == :started if new_status == :torn_down
-
-      STATUSES.index(status) < STATUSES.index(new_status)
-    end
-
-    private def transition(new_status)
-      return self unless pending?(new_status)
-
-      yield
-      @status = new_status
-      self
+    # Whether a lifecycle stage would run this node's hooks
+    protected def pending?(stage)
+      case stage
+      when :prepare then status == :open
+      when :build then status == :prepared
+      when :start then status == :built || status == :stopped
+      when :stop then started?
+      when :teardown then %i[built started stopped].include?(status)
+      end
     end
 
     # ---- Root internals -------------------------------------------------------------
@@ -539,7 +709,16 @@ module Sourced
         raise UnimplementedComponentError, "components are declared but not implemented: #{unimplemented.map(&:path).join(', ')}"
       end
 
-      nodes.each { |n| n.resolve_deps! }
+      deferred_namespaces = index.values.select { |n| n.deferred? && n.namespace? }
+      if deferred_namespaces.any?
+        raise UnimplementedComponentError, "components are deferred but not implemented: #{deferred_namespaces.map(&:path).join(', ')}"
+      end
+
+      nodes.each do |n|
+        n.resolve_deps!
+        n.release!
+        n.hold! if n.deferred?
+      end
 
       each_node = ->(&b) { nodes.each(&b) }
       each_child = ->(n, &b) { n.dep_nodes.each(&b) }
@@ -551,12 +730,37 @@ module Sourced
       TSort.tsort(each_node, each_child)
     end
 
-    private def teardown_nodes
+    # include_built: also tear down nodes that are built but never started (deferred, or depending
+    # on a deferred node). A failed #start! leaves the ones it didn't reach alone.
+    private def teardown_nodes(include_built:)
       @order.reverse.each_with_object([]) do |n, errors|
+        next if !include_built && n.status == :built
+
         instrument_component(n, :teardown) { n.teardown_node! }
       rescue StandardError => e
         errors << e
       end
+    end
+
+    # Stop the given nodes, in the given order, even if some raise. Returns the errors
+    private def stop_nodes(nodes)
+      nodes.each_with_object([]) do |n, errors|
+        instrument_component(n, :stop) { n.stop_node! }
+      rescue StandardError => e
+        errors << e
+      end
+    end
+
+    # A node to start or stop by key: implemented, under a root that's started, or starting
+    private def running_node(ckey)
+      target = node(ckey)
+      raise UndeclaredComponentError, "#{target.path} is a namespace, not a component" if target.namespace?
+      raise TornDownError, "can't start or stop #{target.path}: the component is torn down" if root.boot_status == :torn_down
+      unless root.boot_status == :started || root.starting?
+        raise NotStartedError, "can't start or stop #{target.path} before the root is started: start! it first"
+      end
+
+      target
     end
 
     # ---- Telemetry ------------------------------------------------------------------
@@ -579,7 +783,7 @@ module Sourced
     # Same as #instrument_root for a component, but only if the stage would run its hooks.
     # Dynamic components aren't built by the component, so they don't publish build events.
     private def instrument_component(node, stage)
-      return yield unless node.pending?(STAGES.fetch(stage))
+      return yield unless node.pending?(stage)
       return yield if stage == :build && node.implementation.dynamic?
 
       before, after = COMPONENT_EVENTS.fetch(stage)

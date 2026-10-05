@@ -3,7 +3,7 @@
 module Sourced
   class Component
     # Lifecycle hooks a component can implement, in the order they run
-    HOOKS = %i[prepare build start teardown].freeze
+    HOOKS = %i[prepare build start stop teardown].freeze
 
     CallableInterface = Plumb::Types::Interface[:call]
 
