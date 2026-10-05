@@ -172,6 +172,21 @@ module Sourced
       implement(ckey, deps, build_block, :dynamic)
     end
 
+    # Implement a node as an alias of another component: reading it reads the target, through the
+    # node's declared type. Deps are keys relative to this component, and so is the target.
+    #   comp.alias('sidereal.store', 'sourced.store')
+    # Same as comp.config!('sidereal.store', ['sourced.store']) { |store| store }, except that an alias of a
+    # dynamic component is dynamic too. An alias has no hooks: the target runs its own lifecycle,
+    # and the alias follows it like any other dependent.
+    def alias(ckey, target)
+      synchronize do
+        raise LockedComponentError, "can't implement #{ckey} in a locked component" if locked?
+
+        implement_node(node(ckey), Implementation.alias(target, implementer: self))
+        self
+      end
+    end
+
     # Implement singleton components built from ENV variables (see Component::ENVProvider),
     # decoding values into each declared type with Plumb::Codec::Forms. ENV is read when components are built.
     #   comp.env('USER_EMAIL' => 'user.email')        # a single variable
@@ -625,7 +640,7 @@ module Sourced
     protected def build_node!
       return self unless pending?(:build)
 
-      @value = build_value if implementation.singleton?
+      @value = build_value if memoized?
       @status = :built
       self
     end
@@ -665,7 +680,13 @@ module Sourced
     end
 
     # Without the readable check: deps are read while the component is building, in dependency order
-    protected def current_value = implementation.singleton? ? value : build_value
+    protected def current_value = memoized? ? value : build_value
+
+    # Whether the value is built once, on #build!: singletons, and aliases of memoized components.
+    # Only known once deps are resolved, on #prepare!
+    protected def memoized?
+      implementation.alias? ? dep_nodes.first.memoized? : implementation.singleton?
+    end
 
     # Parse the built value through the declared type. Type errors name the component, ex.
     #   Plumb::ParseError: db.port: Must be a Integer
@@ -781,10 +802,10 @@ module Sourced
     end
 
     # Same as #instrument_root for a component, but only if the stage would run its hooks.
-    # Dynamic components aren't built by the component, so they don't publish build events.
+    # Components that aren't memoized aren't built on #build!, so they don't publish build events.
     private def instrument_component(node, stage)
       return yield unless node.pending?(stage)
-      return yield if stage == :build && node.implementation.dynamic?
+      return yield if stage == :build && !node.memoized?
 
       before, after = COMPONENT_EVENTS.fetch(stage)
       emit(before, key: node.path)

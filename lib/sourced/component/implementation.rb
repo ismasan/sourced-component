@@ -2,7 +2,10 @@
 
 module Sourced
   class Component
-    MODES = %i[singleton dynamic].freeze
+    # singleton: built once, on #build!, and memoized
+    # dynamic:   built on every read
+    # alias:     reads another component (its only dep). Memoized if that component is, see Component#alias
+    MODES = %i[singleton dynamic alias].freeze
 
     # How a node is built. Deps are keys relative to the implementer: the component that called #component! or #component.
     #   prepare:  hooks run with no arguments
@@ -25,6 +28,15 @@ module Sourced
           block.arity > 0 ? block.call(dsl) : dsl.instance_eval(&block)
         end
         new(deps, implementer:, mode:, hooks: dsl.hooks)
+      end
+
+      # An alias of the component at +target+, relative to the implementer: its value is the target's,
+      # and it has no other hooks
+      def self.alias(target, implementer:)
+        target = target.to_s
+        raise ArgumentError, "can't alias #{target.inspect}: an alias takes a single component, not a wildcard" if target.include?('*')
+
+        new([target], implementer:, mode: :alias, hooks: DSL.new.build { |value| value }.hooks)
       end
 
       # Hooks that a provider's builder can implement, besides #call (the build step)
@@ -59,6 +71,7 @@ module Sourced
 
       def singleton? = mode == :singleton
       def dynamic? = mode == :dynamic
+      def alias? = mode == :alias
 
       def prepare = @hooks[:prepare].each(&:call)
       def build(*deps) = @hooks[:build].reduce(nil) { |_, b| b.call(*deps) }

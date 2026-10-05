@@ -513,6 +513,137 @@ RSpec.describe Sourced::Component do
     end
   end
 
+  describe '#alias' do
+    it 'reads the target, memoized if the target is a singleton' do
+      comp = new_component
+      comp.declare('store', String) { +'the store' }
+      comp.declare('other.store', String)
+      comp.alias('other.store', 'store')
+      comp.build!
+
+      expect(comp.node('other.store').implementation.mode).to eq(:alias)
+      expect(comp['other.store']).to eq('the store')
+      expect(comp['other.store']).to be(comp['store'])
+    end
+
+    it 'is dynamic if the target is dynamic' do
+      counter = 0
+      comp = new_component
+      comp.declare('counter', Integer)
+      comp.config('counter') { counter += 1 }
+      comp.declare('count', Integer)
+      comp.alias('count', 'counter')
+      comp.build!
+
+      expect([comp['count'], comp['count'], comp['counter']]).to eq([1, 2, 3])
+    end
+
+    it 'follows chains of aliases' do
+      comp = new_component
+      comp.declare('a', String) { +'a' }
+      comp.declare('b', String)
+      comp.declare('c', String)
+      comp.alias('c', 'b')
+      comp.alias('b', 'a')
+      comp.build!
+
+      expect(comp['c']).to be(comp['a'])
+    end
+
+    it "aliases a library's component to another library's, relative to the implementer" do
+      sourced = new_component
+      sourced.declare('store', String) { 'sourced store' }
+      sidereal = new_component
+      sidereal.declare('store', String)
+      sidereal.declare('runner', String)
+      sidereal.config!('runner', ['store']) { |store| "runner with #{store}" }
+      app = new_component
+      app.mount('sourced', sourced)
+      app.mount('sidereal', sidereal)
+      app.alias('sidereal.store', 'sourced.store')
+      app.build!
+
+      expect(app['sidereal.runner']).to eq('runner with sourced store')
+      expect(app.graph.components.find { |c| c[:key] == 'sidereal.store' }[:deps]).to eq(['sourced.store'])
+    end
+
+    it "parses the target's value through the alias' type" do
+      comp = new_component
+      comp.declare('port', String) { 'nope' }
+      comp.declare('db.port', Integer)
+      comp.alias('db.port', 'port')
+
+      expect { comp.build! }.to raise_error(Plumb::ParseError, /db\.port: Must be a Integer/)
+    end
+
+    it 'starts after the target, and waits for a deferred target' do
+      calls = []
+      comp = new_component
+      comp.declare('store') { :store }
+      comp.component!('store') { build { :store }; start { calls << :start_store } }
+      comp.declare('other.store')
+      comp.alias('other.store', 'store')
+      comp.declare('user')
+      comp.component!('user', ['other.store']) { build { |s| s }; start { calls << :start_user } }
+      comp.defer('store')
+      comp.start!
+
+      expect(calls).to eq([])
+      expect(comp.node('other.store').status).to eq(:built)
+      comp.start_component!('store')
+      expect(calls).to eq(%i[start_store start_user])
+      expect(comp.node('other.store').status).to eq(:started)
+    end
+
+    it 'can be implemented again, and replace other implementations' do
+      comp = new_component
+      comp.declare('a') { :a }
+      comp.declare('b') { :b }
+      comp.declare('c') { :c }
+      comp.alias('c', 'a')
+      comp.alias('c', 'b')
+      comp.build!
+
+      expect(comp['c']).to eq(:b)
+    end
+
+    it 'shows in the tree and graph as an alias' do
+      comp = new_component
+      comp.declare('a', String) { 'a' }
+      comp.declare('b', String)
+      comp.alias('b', 'a')
+      comp.build!
+
+      expect(comp.tree.to_s).to include('b String (alias, built)')
+      expect(comp.graph.components.find { |c| c[:key] == 'b' }).to include(mode: :alias, deps: ['a'])
+    end
+
+    it 'raises for wildcards, namespaces, cycles, undeclared keys and locked components' do
+      comp = new_component
+      comp.declare('a')
+      comp.declare('ns.x') { 1 }
+
+      expect { comp.alias('a', 'ns.*') }.to raise_error(ArgumentError, /not a wildcard/)
+      expect { comp.alias('nope', 'a') }.to raise_error(described_class::UndeclaredComponentError)
+
+      comp.alias('a', 'ns')
+      expect { new_component.tap { |c| c.mount('m', comp) }.prepare! }.to raise_error(described_class::MissingDependencyError, /m\.a depends on m\.ns/)
+
+      cyclic = new_component
+      cyclic.declare('a')
+      cyclic.declare('b')
+      cyclic.alias('a', 'b')
+      cyclic.alias('b', 'a')
+      expect { cyclic.prepare! }.to raise_error(described_class::CircularDependencyError)
+
+      locked = new_component
+      locked.declare('a') { 1 }
+      locked.declare('b') { 2 }
+      locked.prepare!
+      expect { locked.alias('a', 'b') }.to raise_error(described_class::LockedComponentError)
+    end
+  end
+
   describe '#env' do
     let(:user) { Plumb::Types::Data[name: String, dob: Date] }
 

@@ -141,6 +141,25 @@ App.component!('with.deps', ['sourced.db']) { build { |db| Foo.new(db) } }
 App.component('now') { build { Time.now } }
 ```
 
+### Aliases
+
+`#alias(key, target)` implements a declared node as an alias of another component: reading it reads the target. It's useful to wire one library's component to another's:
+
+```ruby
+App.mount('sourced', Sourced)
+App.mount('sidereal', Sidereal)
+App.alias('sidereal.store', 'sourced.store') # sidereal uses sourced's store
+```
+
+It's like `App.config!('sidereal.store', ['sourced.store']) { |store| store }`, with a few differences:
+
+- An alias follows its target's mode: an alias of a singleton is memoized, so it's the same object as the target, and an alias of a dynamic component is built on every read.
+- An alias has no hooks. The target runs its own lifecycle, and the alias is a dependent like any other: it starts after the target, and waits for it if it's [deferred](#deferred-components-and-starting-and-stopping-by-key).
+- The target's value is parsed through the alias' declared type, so a type mismatch raises `Plumb::ParseError` naming the alias.
+- The target is a key relative to the implementing component, like any dependency. Wildcards aren't allowed (`ArgumentError`), and an alias of a namespace raises `MissingDependencyError` on `#prepare!`.
+
+Aliases show their mode as `alias` in [`#tree`](#tree) and [`#graph`](#graph), with the target as their dependency.
+
 ### Wildcard dependencies
 
 A dependency ending in `.*` depends on every component directly under that key, so components can be registered under a namespace without listing them anywhere else. Its value is a hash of their values, by key segment:
@@ -550,7 +569,7 @@ node.parent          # => the my_lib component
 node.root            # => App
 node.owner           # => the component that declared it
 node.type            # => the declared type
-node.implementation  # => deps, mode (:singleton or :dynamic) and the implementing component
+node.implementation  # => deps, mode (:singleton, :dynamic or :alias) and the implementing component
 node.children        # => { segment => Component }
 node.namespace?      # => no type and no implementation
 ```
@@ -652,7 +671,7 @@ graph.to_h
 #       type: <Plumb type>,                  # the declared type
 #       type_name: 'Interface[append]',      # readable version of it
 #       implemented: true,
-#       mode: :singleton,                    # :singleton or :dynamic. nil if not implemented
+#       mode: :singleton,                    # :singleton, :dynamic or :alias. nil if not implemented
 #       status: :built,
 #       deps: ['db'],                        # full paths of the components this one depends on
 #       missing: [],                         # deps that aren't declared, or are namespaces without an implementation
