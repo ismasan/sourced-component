@@ -683,8 +683,10 @@ node.root            # => App
 node.owner           # => the component that declared it
 node.type            # => the declared type
 node.implementation  # => deps, mode (:singleton, :dynamic or :alias) and the implementing component
+node.dep_nodes       # => the components it depends on, wildcards included. See #graph for keys
 node.children        # => { segment => Component }
 node.namespace?      # => no type and no implementation
+node.removed?        # => whether a #reconfigure dropped it from the tree
 ```
 
 ### `#tree`

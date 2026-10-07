@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'monitor'
+require 'set'
 require 'tsort'
 require 'plumb'
 require_relative 'component/version'
@@ -91,11 +92,14 @@ module Sourced
 
     # Whether the root's #start! skips it (see #defer)
     def deferred? = @deferred
-    # Whether the tree refuses declarations. A #reconfigure block opens it again
-    def locked? = root.boot_status != :open && !root.reconfiguring?
+    # Whether the tree is past :open. #mount asks this of the component being mounted
+    def locked? = root.boot_status != :open
 
     # Whether a reconfiguration's block is running. Only ever true on the root
     def reconfiguring? = !@reconfiguration.nil?
+
+    # Whether the tree refuses declarations: locked, unless a #reconfigure block is open
+    private def declarations_locked? = locked? && !root.reconfiguring?
 
     # The Reconfiguration in progress, which records what its block declares
     protected def reconfiguration = @reconfiguration
@@ -110,28 +114,28 @@ module Sourced
     #   comp.declare('sourced.db.logger', Logger) { Logger.new(STDOUT) }
     def declare(ckey, type = T::Any, &default)
       synchronize do
-        raise LockedComponentError, "can't declare #{ckey} in a locked component" if locked?
+        raise LockedComponentError, "can't declare #{ckey} in a locked component" if declarations_locked?
 
+        reconf = root.reconfiguration
         branch, leaf = walk(ckey)
         node = branch.children[leaf]
         if node.nil?
           node = branch.attach(leaf, Component.new(owner: self, type:))
         elsif !node.owner.equal?(self)
           raise OwnershipError, ownership_message(node)
-        elsif !node.implicit? && !root.reconfiguring?
+        elsif !node.implicit? && reconf.nil?
           raise DeclarationOverrideError, "#{node.path} is already declared"
         else
           # Idempotent while reconfiguring: an unchanged component keeps its value and status,
           # and a changed type marks it to be recycled
           was = node.implicit? ? nil : node.type_name
           node.declare_type!(type) # an implicit namespace this component created, now with a type
-          root.reconfiguration&.retyped!(node) if was && was != node.type_name
+          reconf&.changed!(node) if was && was != node.type_name
         end
-        root.reconfiguration&.declared!(node)
+        new_to_the_tree = reconf.nil? || reconf.new?(node)
+        reconf&.declared!(node)
         # While reconfiguring, only new components are announced: re-declaring the rest is noise
-        unless root.reconfiguring? && !root.reconfiguration.created.include?(node)
-          emit(Events::ComponentDeclared, key: node.path, type_name: node.type_name)
-        end
+        emit(Events::ComponentDeclared, key: node.path, type_name: node.type_name) if new_to_the_tree
 
         implement_node(node, Implementation.from_block([], implementer: self, mode: :singleton) { build(&default) }) if default
         self
@@ -199,7 +203,7 @@ module Sourced
     # and the alias follows it like any other dependent.
     def alias(ckey, target)
       synchronize do
-        raise LockedComponentError, "can't implement #{ckey} in a locked component" if locked?
+        raise LockedComponentError, "can't implement #{ckey} in a locked component" if declarations_locked?
 
         implement_node(node(ckey), Implementation.alias(target, implementer: self))
         self
@@ -222,7 +226,7 @@ module Sourced
       end
 
       synchronize do
-        raise LockedComponentError, "can't implement ENV components in a locked component" if locked?
+        raise LockedComponentError, "can't implement ENV components in a locked component" if declarations_locked?
 
         builders = mapping.map do |source, ckey|
           target = node(ckey)
@@ -246,7 +250,7 @@ module Sourced
     # implemented again. Any component can defer a node below it, like implementing one.
     def defer(ckey)
       synchronize do
-        raise LockedComponentError, "can't defer #{ckey} in a locked component" if locked?
+        raise LockedComponentError, "can't defer #{ckey} in a locked component" if declarations_locked?
 
         target = node(ckey)
         target.defer!
@@ -290,7 +294,7 @@ module Sourced
       raise ArgumentError, "#{mountable.inspect}.to_component must return a Component, got #{sub.inspect}" unless sub.is_a?(Component)
 
       synchronize do
-        raise LockedComponentError, "can't mount #{ckey} in a locked component" if locked?
+        raise LockedComponentError, "can't mount #{ckey} in a locked component" if declarations_locked?
         raise SubcomponentError, "#{sub.inspect} is already mounted in another component" unless sub.root?
         raise SubcomponentError, "can't mount a component into its own tree" if sub.equal?(root)
         raise LockedComponentError, "can't mount a #{sub.boot_status} component: it must be open" if sub.locked?
@@ -337,6 +341,9 @@ module Sourced
 
         instrument_root(:prepare) do
           @order = resolve_order
+          # Holds start from the declarations, on a first boot only: #reresolve! must leave the ones
+          # #stop_component! set alone, or a reconfiguration would start a stopped component again
+          @order.each { |n| n.release!; n.hold! if n.deferred? }
           @order.each { |n| instrument_component(n, :prepare) { n.prepare_node! } }
           @boot_status = :prepared
         end
@@ -554,7 +561,7 @@ module Sourced
 
         begin
           instrument_root(:reconfigure) do
-            reconf.snapshot!(root)
+            reconf.snapshot!
             plan = begin
               block.call(reconf.branch_handle)
               validate_reconfiguration!(reconf)
@@ -627,7 +634,7 @@ module Sourced
         type:,
         type_name:,
         namespace: namespace?,
-        mounted: !root? && owner.equal?(self),
+        mounted: mounted?,
         implemented: !implementation.nil?,
         mode: implementation&.mode,
         status:,
@@ -681,16 +688,14 @@ module Sourced
 
     # Run a reverted component's hooks with the implementation it had, then leave it a bare namespace
     protected def teardown_reverted!(implementation)
-      return self unless %i[built started stopped].include?(status)
+      return self unless pending?(:teardown)
 
       begin
         implementation.stop(value) if started?
       ensure
         implementation.teardown(value)
       end
-      @status = :open
-      @value = nil
-      self
+      recycle_node!
     end
 
     protected def implement!(implementation)
@@ -703,6 +708,9 @@ module Sourced
     protected def release! = @held = false
     protected def started? = status == :started
 
+    # A component mounted into another tree: it owns itself, and isn't the root of its own
+    protected def mounted? = !root? && owner.equal?(self)
+
     # ---- Reconfiguration internals (see #reconfigure) -------------------------------
 
     # Public because Component::Reconfiguration is a collaborator, not another Component
@@ -711,32 +719,29 @@ module Sourced
     def restore_order!(order) = @order = order
 
     # Re-resolve every node's deps and the order, leaving holds alone. Raises if the new set is invalid
-    def reresolve! = resolve_order(reset_holds: false)
+    def reresolve! = resolve_order
 
-    # Everything a reconfiguration can change about a node, to snapshot and roll back
-    def reconfigurable_state
-      {
-        implementation: @implementation, type: @type, implicit: @implicit, deps: @deps,
-        dep_nodes: @dep_nodes, deferred: @deferred, held: @held, status: @status, value: @value,
-        recycle_to: @recycle_to
-      }
+    # Everything a reconfiguration can change about this node, as a frozen
+    # Reconfiguration::NodeState. #children and #index are the node's own mutable hashes, so they're
+    # copied; everything else is frozen, or a reference it has to keep as it is — its value above all
+    def capture_state
+      Reconfiguration::NodeState.new(
+        implementation:, type:, implicit: implicit?, deps:, dep_nodes:, deferred: deferred?,
+        held: held?, status:, value:, recycle_to:, children: children.dup, index: index.dup
+      )
     end
 
-    def reconfigurable_state=(state)
-      @implementation = state[:implementation]
-      @type = state[:type]
-      @implicit = state[:implicit]
-      @deps = state[:deps]
-      @dep_nodes = state[:dep_nodes]
-      @deferred = state[:deferred]
-      @held = state[:held]
-      @status = state[:status]
-      @value = state[:value]
-      @recycle_to = state[:recycle_to]
+    # Every member, so a new one can't be captured and then forgotten on the way back
+    def restore_state!(state)
+      state.to_h.each { |member, value| send(:"#{member}=", value) }
+      self
     end
 
-    def restore_children!(children) = @children = children
-    def restore_index!(index) = @index = index
+    # Only #capture_state and #restore_state! use these: a reconfiguration rolling back is the one
+    # thing that writes a node's state wholesale
+    private attr_reader :deps
+    private attr_writer :implementation, :type, :implicit, :deps, :dep_nodes, :deferred, :held,
+                        :status, :value, :recycle_to, :children, :index
 
     # The status a recycle is bringing this node back to, remembered before anything is torn down.
     # A recycle that raises leaves it set, so a retry restores what the first one meant to: the
@@ -951,10 +956,7 @@ module Sourced
     end
 
     # Every node that is declared or implemented, in dependency order
-    # reset_holds: release every node and hold only the deferred ones, as a first boot does.
-    # A reconfiguration passes false: a component stopped by #stop_component! must stay held,
-    # or it would start again on the next re-declaration
-    private def resolve_order(reset_holds: true)
+    private def resolve_order
       nodes = [self, *index.values].reject(&:namespace?)
 
       unimplemented = nodes.reject(&:implementation)
@@ -967,13 +969,7 @@ module Sourced
         raise UnimplementedComponentError, "components are deferred but not implemented: #{deferred_namespaces.map(&:path).join(', ')}"
       end
 
-      nodes.each do |n|
-        n.resolve_deps!
-        next unless reset_holds
-
-        n.release!
-        n.hold! if n.deferred?
-      end
+      nodes.each { |n| n.resolve_deps! }
 
       each_node = ->(&b) { nodes.each(&b) }
       each_child = ->(n, &b) { n.dep_nodes.each(&b) }
@@ -1039,7 +1035,7 @@ module Sourced
         raise UndeclaredComponentError, "#{branch.path} is a component, not a namespace: reconfigure the branch above it"
       end
 
-      mounted = [branch, *branch.index.values].find { |n| n.owner.equal?(n) && !n.root? }
+      mounted = [branch, *branch.index.values].find { |n| n.mounted? }
       raise SubcomponentError, "can't reconfigure #{branch.path}: #{mounted.path} is a mounted component" if mounted
 
       branch
@@ -1049,25 +1045,25 @@ module Sourced
     # would if it's invalid, with nothing torn down yet
     private def validate_reconfiguration!(reconf)
       reverting = reconf.reverting
-      removing = reconf.emptied_namespaces(reconf.removable)
+      removing = reconf.removing
 
       # Each reverted component hands its implementation back, to tear down once validation passes
       reverted = reverting.to_h { |n| [n, n.undeclare_type!] }
       removing.each { |n| n.parent.detach!(n.key) }
 
       # An open tree has nothing resolved or built: #prepare! validates the set when it boots
-      { reverting:, reverted:, removing:, order: root.boot_status == :open ? nil : root.reresolve! }
+      { reverted:, removing:, order: root.boot_status == :open ? nil : root.reresolve! }
     end
 
     # Past validation, so nothing here rolls back: tear down what's going, recycle what changed
     private def commit_reconfiguration!(reconf, plan, context)
       booted = !plan[:order].nil?
-      old_order = reconf.order_before
+      was = reconf.order_before.each_with_index.to_h
       root.restore_order!(plan[:order]) if booted
 
       # Dependents first. On an open tree every hook is pending?-skipped, so this only unindexes
-      going = plan[:removing] + plan[:reverting]
-      going.sort_by { |n| -(old_order.index(n) || -1) }.each do |n|
+      going = plan[:removing] + plan[:reverted].keys
+      going.sort_by { |n| -(was[n] || -1) }.each do |n|
         if (implementation = plan[:reverted][n])
           instrument_component(n, :teardown) { n.teardown_reverted!(implementation) }
           next
@@ -1105,8 +1101,11 @@ module Sourced
     # Tear the targets and their dependents down, drop their values, and prepare and build them
     # again, leaving each one in the status it had before. See #recycle_component!
     private def recycle_nodes!(targets, context)
-      affected = targets.flat_map { |t| [t, *t.transitive_dependents] }.uniq
-      ordered = root.order.select { |n| affected.include?(n) }
+      # Nodes come after their dependencies in the order, so one forward pass seeded with every
+      # target reaches the same nodes as a closure per target, without the walk-per-target
+      reached = targets.to_set
+      root.order.each { |n| reached << n if n.dep_nodes.any? { |dep| reached.include?(dep) } }
+      ordered = root.order.select { |n| reached.include?(n) }
       # What each node comes back to, remembered before anything is torn down. A node a previous
       # recycle left part way through keeps the status that recycle meant to restore
       ordered.each { |n| n.recycle_to!(n.recycle_to || n.status) }
@@ -1226,7 +1225,7 @@ module Sourced
       raise ArgumentError, "#{ckey}: pass either a provider or a block, not both" if provider && block
 
       synchronize do
-        raise LockedComponentError, "can't implement #{ckey} in a locked component" if locked?
+        raise LockedComponentError, "can't implement #{ckey} in a locked component" if declarations_locked?
 
         target = node(ckey)
         implementation = if provider
@@ -1242,7 +1241,7 @@ module Sourced
     private def implement_node(target, implementation)
       override = !target.implementation.nil?
       target.implement!(implementation)
-      root.reconfiguration&.implemented!(target)
+      root.reconfiguration&.changed!(target)
       emit(
         Events::ComponentImplemented,
         key: target.path,
