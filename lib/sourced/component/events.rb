@@ -49,7 +49,7 @@ module Sourced
 
       Completed = proc { attribute :duration, Float }
       Failed = proc do
-        attribute :stage, Symbol # :prepare, :build, :start, :stop or :teardown
+        attribute :stage, Symbol # :prepare, :build, :start, :stop, :teardown or :recycle
         attribute :error_class, String
         attribute :error_message, String
         attribute :backtrace, Plumb::Types::Array[String]
@@ -61,6 +61,8 @@ module Sourced
       RootBuilt = RootEvent.define('root.built', &Completed)
       RootStarting = RootEvent.define('root.starting')
       RootStarted = RootEvent.define('root.started', &Completed)
+      RootRecycling = RootEvent.define('root.recycling')
+      RootRecycled = RootEvent.define('root.recycled', &Completed)
       RootTearingDown = RootEvent.define('root.tearing_down')
       RootTornDown = RootEvent.define('root.torn_down', &Completed)
       RootFailed = RootEvent.define('root.failed', &Failed)
@@ -97,6 +99,7 @@ module Sourced
       prepare: [Events::RootPreparing, Events::RootPrepared],
       build: [Events::RootBuilding, Events::RootBuilt],
       start: [Events::RootStarting, Events::RootStarted],
+      recycle: [Events::RootRecycling, Events::RootRecycled],
       teardown: [Events::RootTearingDown, Events::RootTornDown]
     }.freeze
 

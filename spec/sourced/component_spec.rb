@@ -1735,6 +1735,66 @@ RSpec.describe Sourced::Component do
         expect(calls).to eq(%i[c b a])
         expect(comp.boot_status).to eq(:torn_down)
       end
+
+      it 'tears down every node when a hook raises something that is not a StandardError' do
+        calls = []
+        comp = new_component
+        %w[a b c].each { |key| comp.declare(key) }
+        comp.component!('a') { build { 1 }; stop { calls << :stop_a }; teardown { calls << :a } }
+        comp.component!('b', ['a']) do
+          build { 2 }
+          stop { calls << :stop_b; raise Interrupt }
+          teardown { calls << :b }
+        end
+        comp.component!('c', ['b']) { build { 3 }; teardown { calls << :c } }
+        comp.start!
+
+        # the Interrupt a signal handler raises must not leave the rest of the tree running
+        expect { comp.teardown! }.to raise_error(Interrupt)
+
+        expect(calls).to eq(%i[c stop_b b stop_a a])
+        expect(comp.boot_status).to eq(:torn_down)
+        expect(%w[a b c].map { |k| comp.node(k).status }).to eq(%i[torn_down torn_down torn_down])
+      end
+
+      it 'never tears a node down twice, even if its hooks raised' do
+        calls = []
+        comp = new_component
+        comp.declare('a')
+        comp.component!('a') do
+          build { 1 }
+          stop { calls << :stop; raise Interrupt }
+          teardown { calls << :teardown }
+        end
+        comp.start!
+        expect { comp.teardown! }.to raise_error(Interrupt)
+        expect(calls).to eq(%i[stop teardown])
+
+        expect(comp.teardown!).to be(comp)
+
+        expect(calls).to eq(%i[stop teardown])
+        expect(comp.node('a').status).to eq(:torn_down)
+      end
+
+      it 'tears the tree down, and re-raises the original error, when a rollback hook raises an Interrupt' do
+        calls = []
+        comp = new_component
+        %w[a b].each { |key| comp.declare(key) }
+        comp.component!('a') do
+          build { 1 }
+          start { calls << :start_a }
+          stop { calls << :stop_a; raise Interrupt }
+          teardown { calls << :teardown_a }
+        end
+        comp.component!('b', ['a']) { build { 2 }; start { raise 'boom' } }
+
+        expect { comp.start! }.to raise_error(RuntimeError, 'boom')
+
+        expect(calls).to eq(%i[start_a stop_a teardown_a])
+        expect(comp.boot_status).to eq(:torn_down)
+        expect(comp.node('a').status).to eq(:torn_down)
+        expect { comp.start! }.to raise_error(described_class::TornDownError)
+      end
     end
   end
 
@@ -2102,6 +2162,492 @@ RSpec.describe Sourced::Component do
       expect(comp.tree.to_s).to include('dispatcher Any (singleton, stopped)', 'monitor Any (singleton, built, deferred)')
       expect(comp.graph.components.find { |c| c[:key] == 'monitor' }).to include(status: :built, deferred: true)
       expect(comp.graph.to_mermaid).to include('<i>singleton, built, deferred</i>', 'classDef stopped')
+    end
+  end
+
+  describe 'recycling components' do
+    let(:calls) { [] }
+
+    # db <- store <- dispatcher <- monitor, and cache, which nothing depends on.
+    # Each build returns a fresh value, so recycling is visible in the values too
+    def chain
+      log = calls
+      comp = new_component
+      %w[db store dispatcher monitor cache].each { |key| comp.declare(key) }
+      hooks = lambda do |name, deps = []|
+        builds = 0
+        comp.component!(name, deps) do
+          prepare { log << [:prepare, name] }
+          build { |*| "#{name}-#{builds += 1}" }
+          start { |value, context| log << [:start, value, context] }
+          stop { |value| log << [:stop, value] }
+          teardown { |value| log << [:teardown, value] }
+        end
+      end
+      hooks.('db')
+      hooks.('store', ['db'])
+      hooks.('dispatcher', ['store'])
+      hooks.('monitor', ['dispatcher'])
+      hooks.('cache')
+      comp
+    end
+
+    def statuses(comp) = %w[db store dispatcher monitor cache].to_h { |key| [key, comp.node(key).status] }
+    def values(comp) = %w[db store dispatcher monitor cache].to_h { |key| [key, comp[key]] }
+
+    it 'tears a started component and its dependents down, then builds and starts them again' do
+      comp = chain
+      comp.start!(:boot)
+      calls.clear
+
+      expect(comp.recycle_component!('store', :again)).to be(comp)
+
+      expect(calls).to eq([
+                            # down, dependents first
+                            [:stop, 'monitor-1'], [:teardown, 'monitor-1'],
+                            [:stop, 'dispatcher-1'], [:teardown, 'dispatcher-1'],
+                            [:stop, 'store-1'], [:teardown, 'store-1'],
+                            # and up again, in dependency order
+                            [:prepare, 'store'], [:prepare, 'dispatcher'], [:prepare, 'monitor'],
+                            [:start, 'store-2', :again], [:start, 'dispatcher-2', :again], [:start, 'monitor-2', :again]
+                          ])
+      expect(statuses(comp)).to eq(
+        'db' => :started, 'store' => :started, 'dispatcher' => :started, 'monitor' => :started, 'cache' => :started
+      )
+    end
+
+    it 'builds fresh values for the component and its dependents, and leaves the rest alone' do
+      comp = chain
+      comp.start!
+
+      comp.recycle_component!('store')
+
+      expect(values(comp)).to eq(
+        'db' => 'db-1', 'store' => 'store-2', 'dispatcher' => 'dispatcher-2', 'monitor' => 'monitor-2',
+        'cache' => 'cache-1'
+      )
+    end
+
+    it 'leaves its dependencies running, and components nothing depends on untouched' do
+      comp = chain
+      comp.start!(:boot)
+      calls.clear
+
+      comp.recycle_component!('dispatcher', :again)
+
+      expect(calls).to eq([
+                            [:stop, 'monitor-1'], [:teardown, 'monitor-1'],
+                            [:stop, 'dispatcher-1'], [:teardown, 'dispatcher-1'],
+                            [:prepare, 'dispatcher'], [:prepare, 'monitor'],
+                            [:start, 'dispatcher-2', :again], [:start, 'monitor-2', :again]
+                          ])
+      expect(values(comp)).to include('db' => 'db-1', 'store' => 'store-1', 'cache' => 'cache-1')
+    end
+
+    it 'stops at built when the root was only built, running no start hooks' do
+      comp = chain
+      comp.build!
+      calls.clear
+
+      comp.recycle_component!('store')
+
+      expect(calls).to eq([
+                            [:teardown, 'monitor-1'], [:teardown, 'dispatcher-1'], [:teardown, 'store-1'],
+                            [:prepare, 'store'], [:prepare, 'dispatcher'], [:prepare, 'monitor']
+                          ])
+      expect(statuses(comp)).to eq(
+        'db' => :built, 'store' => :built, 'dispatcher' => :built, 'monitor' => :built, 'cache' => :built
+      )
+    end
+
+    it 'restores each component to its own status, leaving a deferred dependent built' do
+      comp = chain
+      comp.defer('dispatcher')
+      comp.start!(:boot)
+      calls.clear
+
+      comp.recycle_component!('db', :again)
+
+      expect(calls).to eq([
+                            [:teardown, 'monitor-1'], [:teardown, 'dispatcher-1'],
+                            [:stop, 'store-1'], [:teardown, 'store-1'],
+                            [:stop, 'db-1'], [:teardown, 'db-1'],
+                            [:prepare, 'db'], [:prepare, 'store'], [:prepare, 'dispatcher'], [:prepare, 'monitor'],
+                            [:start, 'db-2', :again], [:start, 'store-2', :again]
+                          ])
+      expect(statuses(comp)).to include(
+        'db' => :started, 'store' => :started, 'dispatcher' => :built, 'monitor' => :built
+      )
+      expect(comp.node('dispatcher')).to be_deferred
+    end
+
+    it 'never starts a built component, even under a started root' do
+      comp = chain
+      comp.defer('store')
+      comp.start!(:boot)
+      # dispatcher and monitor are :built and not held: they just can't start before store
+      expect(statuses(comp)).to include('dispatcher' => :built, 'monitor' => :built)
+      expect(comp.node('dispatcher')).not_to be_deferred
+      calls.clear
+
+      comp.recycle_component!('dispatcher', :again)
+
+      expect(calls).to eq([
+                            [:teardown, 'monitor-1'], [:teardown, 'dispatcher-1'],
+                            [:prepare, 'dispatcher'], [:prepare, 'monitor']
+                          ])
+      expect(statuses(comp)).to include('db' => :started, 'store' => :built,
+                                        'dispatcher' => :built, 'monitor' => :built)
+    end
+
+    it 'brings a deferred component back built and still held, to be started by key' do
+      comp = chain
+      comp.defer('dispatcher')
+      comp.start!(:boot)
+
+      comp.recycle_component!('dispatcher')
+
+      expect(statuses(comp)).to include('dispatcher' => :built, 'monitor' => :built)
+
+      calls.clear
+      comp.start_component!('dispatcher', :later)
+
+      expect(calls).to eq([[:start, 'dispatcher-2', :later], [:start, 'monitor-2', :later]])
+    end
+
+    it 'brings a component stopped by key back built and still held' do
+      comp = chain
+      comp.start!(:boot)
+      comp.stop_component!('dispatcher')
+      calls.clear
+
+      comp.recycle_component!('dispatcher')
+
+      expect(calls).to eq([
+                            [:teardown, 'monitor-1'], [:teardown, 'dispatcher-1'],
+                            [:prepare, 'dispatcher'], [:prepare, 'monitor']
+                          ])
+      expect(statuses(comp)).to include('db' => :started, 'store' => :started,
+                                        'dispatcher' => :built, 'monitor' => :built)
+
+      comp.start_component!('dispatcher', :later)
+      expect(statuses(comp)).to include('dispatcher' => :started, 'monitor' => :started)
+    end
+
+    describe '#recycle_components!' do
+      it 'recycles a shared dependent once' do
+        comp = chain
+        comp.start!(:boot)
+        calls.clear
+
+        expect(comp.recycle_components!('store', 'dispatcher', context: :again)).to be(comp)
+
+        expect(calls).to eq([
+                              [:stop, 'monitor-1'], [:teardown, 'monitor-1'],
+                              [:stop, 'dispatcher-1'], [:teardown, 'dispatcher-1'],
+                              [:stop, 'store-1'], [:teardown, 'store-1'],
+                              [:prepare, 'store'], [:prepare, 'dispatcher'], [:prepare, 'monitor'],
+                              [:start, 'store-2', :again], [:start, 'dispatcher-2', :again],
+                              [:start, 'monitor-2', :again]
+                            ])
+      end
+
+      it 'checks the tree, and does nothing, when given no keys' do
+        comp = chain
+        events = []
+
+        expect { comp.recycle_components! }
+          .to raise_error(described_class::NotBuiltError, /can't recycle components before the root is built/)
+
+        comp.start!
+        comp.notifier.subscribe(described_class::Event) { |e| events << e.type }
+        calls.clear
+
+        expect(comp.recycle_components!).to be(comp)
+        expect(comp.recycle_components!(*[])).to be(comp)
+        expect(calls).to be_empty
+        expect(events).to be_empty
+        expect(statuses(comp).values).to all(eq(:started))
+
+        comp.teardown!
+        expect { comp.recycle_components! }
+          .to raise_error(described_class::TornDownError, /can't recycle components: the component is torn down/)
+      end
+
+      it 'takes keys in any order, and recycles in dependency order' do
+        comp = chain
+        comp.start!
+        calls.clear
+
+        comp.recycle_components!('cache', 'db')
+
+        expect(calls.grep(->(c) { c.first == :prepare })).to eq([
+                                                                  [:prepare, 'db'], [:prepare, 'store'],
+                                                                  [:prepare, 'dispatcher'], [:prepare, 'monitor'],
+                                                                  [:prepare, 'cache']
+                                                                ])
+      end
+    end
+
+    describe '#recycle!' do
+      it 'recycles every component in the tree' do
+        comp = chain
+        comp.start!(:boot)
+        calls.clear
+
+        expect(comp.recycle!(:again)).to be(comp)
+
+        expect(calls).to eq([
+                              [:stop, 'cache-1'], [:teardown, 'cache-1'],
+                              [:stop, 'monitor-1'], [:teardown, 'monitor-1'],
+                              [:stop, 'dispatcher-1'], [:teardown, 'dispatcher-1'],
+                              [:stop, 'store-1'], [:teardown, 'store-1'],
+                              [:stop, 'db-1'], [:teardown, 'db-1'],
+                              [:prepare, 'db'], [:prepare, 'store'], [:prepare, 'dispatcher'],
+                              [:prepare, 'monitor'], [:prepare, 'cache'],
+                              [:start, 'db-2', :again], [:start, 'store-2', :again],
+                              [:start, 'dispatcher-2', :again], [:start, 'monitor-2', :again],
+                              [:start, 'cache-2', :again]
+                            ])
+        expect(values(comp).values).to all(end_with('-2'))
+      end
+
+      it 'raises on a mounted component' do
+        lib = new_component
+        lib.declare('store') { 'store' }
+        app = new_component
+        app.mount('lib', lib)
+        app.start!
+
+        expect { lib.recycle! }.to raise_error(described_class::SubcomponentError, /mounted in another component/)
+      end
+    end
+
+    it 'takes keys relative to the component, and works from a mounted one' do
+      lib = new_component
+      lib.declare('store')
+      builds = 0
+      lib.component!('store') { build { |*| "store-#{builds += 1}" } }
+      app = new_component
+      app.mount('lib', lib)
+      app.start!
+
+      lib.recycle_component!('store')
+      expect(app['lib.store']).to eq('store-2')
+
+      app.recycle_component!('lib.store')
+      expect(app['lib.store']).to eq('store-3')
+    end
+
+    describe 'when hooks raise' do
+      it 'tears every component down, drops their values, and re-raises the first error' do
+        comp = chain
+        comp.component!('dispatcher', ['store']) do
+          build { |*| 'dispatcher' }
+          stop { |_| raise 'stop failed' }
+        end
+        comp.start!
+        calls.clear
+
+        expect { comp.recycle_component!('store') }.to raise_error(RuntimeError, 'stop failed')
+
+        # monitor was torn down before dispatcher raised, and store after it
+        expect(calls).to eq([[:stop, 'monitor-1'], [:teardown, 'monitor-1'],
+                             [:stop, 'store-1'], [:teardown, 'store-1']])
+        expect(statuses(comp)).to include('store' => :open, 'dispatcher' => :open, 'monitor' => :open)
+        expect { comp['store'] }.to raise_error(described_class::NotBuiltError, /store is not built/)
+      end
+
+      it 'recycles again from there, restoring the statuses' do
+        comp = chain
+        raising = true
+        comp.component!('dispatcher', ['store']) do
+          build { |*| 'dispatcher' }
+          stop { |_| raise 'stop failed' if raising }
+        end
+        comp.start!
+        expect { comp.recycle_component!('store') }.to raise_error(RuntimeError, 'stop failed')
+        raising = false
+        calls.clear
+
+        comp.recycle_component!('store', :again)
+
+        expect(calls).to eq([
+                              [:prepare, 'store'], [:prepare, 'monitor'],
+                              [:start, 'store-2', :again], [:start, 'monitor-2', :again]
+                            ])
+        expect(statuses(comp)).to include('store' => :started, 'dispatcher' => :started, 'monitor' => :started)
+        expect(comp['store']).to eq('store-2')
+      end
+
+      it 'remembers the statuses to restore when a start hook raises, and restores them on the next recycle' do
+        comp = chain
+        raising = false
+        starts = 0
+        comp.component!('store', ['db']) do
+          build { |*| "store-#{starts += 1}" }
+          start { |_v, _c| raise 'start failed' if raising }
+        end
+        comp.start!(:boot)
+        raising = true
+
+        expect { comp.recycle_component!('db') }.to raise_error(RuntimeError, 'start failed')
+        # store never started, and dispatcher and monitor were never reached: :built, not :open,
+        # so their own statuses no longer say they were running
+        expect(statuses(comp)).to include('db' => :started, 'store' => :built,
+                                          'dispatcher' => :built, 'monitor' => :built)
+
+        raising = false
+        calls.clear
+        comp.recycle_component!('db', :again)
+
+        expect(statuses(comp)).to eq(
+          'db' => :started, 'store' => :started, 'dispatcher' => :started, 'monitor' => :started,
+          'cache' => :started
+        )
+        expect(calls.grep(->(c) { c.first == :start }))
+          .to eq([[:start, 'db-3', :again], [:start, 'dispatcher-3', :again], [:start, 'monitor-3', :again]])
+      end
+
+      it 'keeps remembering through repeated failures' do
+        comp = chain
+        raising = false
+        comp.component!('dispatcher', ['store']) do
+          build { |*| 'dispatcher' }
+          start { |_v, _c| raise 'start failed' if raising }
+        end
+        comp.start!(:boot)
+        raising = true
+
+        2.times { expect { comp.recycle_component!('store') }.to raise_error(RuntimeError, 'start failed') }
+        expect(statuses(comp)).to include('store' => :started, 'dispatcher' => :built, 'monitor' => :built)
+
+        raising = false
+        comp.recycle_component!('store')
+
+        expect(statuses(comp)).to include('store' => :started, 'dispatcher' => :started, 'monitor' => :started)
+      end
+
+      it 'forgets the statuses once a recycle completes' do
+        comp = chain
+        comp.start!(:boot)
+        comp.recycle_component!('store')
+        comp.stop_component!('monitor')
+        calls.clear
+
+        # monitor is held and stopped now: the earlier recycle must not still think it was started
+        comp.recycle_component!('store', :again)
+
+        expect(statuses(comp)).to include('store' => :started, 'dispatcher' => :started, 'monitor' => :built)
+        expect(calls.grep(->(c) { c.first == :start }))
+          .to eq([[:start, 'store-3', :again], [:start, 'dispatcher-3', :again]])
+      end
+
+      it 'forgets what a failed recycle meant to restore once a component is stopped by key' do
+        comp = chain
+        raising = false
+        comp.component!('monitor', ['dispatcher']) do
+          build { |*| 'monitor' }
+          start { |_v, _c| raise 'start failed' if raising }
+        end
+        comp.start!(:boot)
+        raising = true
+        expect { comp.recycle_component!('dispatcher') }.to raise_error(RuntimeError, 'start failed')
+        raising = false
+        comp.recycle_component!('monitor')
+        comp.stop_component!('dispatcher')
+        expect(statuses(comp)).to include('dispatcher' => :stopped, 'monitor' => :stopped)
+        calls.clear
+
+        comp.recycle_component!('db', :again)
+
+        # the earlier failed recycle must not start a component that was since stopped by key
+        expect(statuses(comp)).to include('db' => :started, 'store' => :started,
+                                          'dispatcher' => :built, 'monitor' => :built)
+        expect(comp.node('dispatcher').send(:held?)).to be(true)
+        expect(calls.grep(->(c) { c.first == :start })).to eq([[:start, 'db-2', :again], [:start, 'store-2', :again]])
+      end
+
+      it 'drops the values even when a hook raises something that is not a StandardError' do
+        comp = chain
+        comp.component!('store', ['db']) do
+          build { |*| 'store' }
+          stop { |_| raise Interrupt }
+        end
+        comp.start!
+
+        expect { comp.recycle_component!('store') }.to raise_error(Interrupt)
+
+        expect(statuses(comp)).to include('store' => :open, 'dispatcher' => :open, 'monitor' => :open)
+        expect { comp['store'] }.to raise_error(described_class::NotBuiltError, /store is not built/)
+        expect { comp.recycle_component!('store') }.not_to raise_error
+        expect(statuses(comp)).to include('store' => :started, 'dispatcher' => :started, 'monitor' => :started)
+      end
+
+      it 'leaves a component prepared when its build hook raises, and recovers on the next recycle' do
+        comp = chain
+        raising = false
+        builds = 0
+        comp.component!('store', ['db']) do
+          build { |*| raising ? raise('build failed') : "store-#{builds += 1}" }
+        end
+        comp.start!
+        raising = true
+
+        expect { comp.recycle_component!('store') }.to raise_error(RuntimeError, 'build failed')
+        expect(statuses(comp)).to include('store' => :prepared, 'dispatcher' => :prepared,
+                                          'monitor' => :prepared)
+
+        raising = false
+        comp.recycle_component!('store')
+
+        expect(statuses(comp)).to include('store' => :started, 'dispatcher' => :started, 'monitor' => :started)
+        expect(comp['store']).to eq('store-2')
+      end
+    end
+
+    describe 'guards' do
+      it 'raises before the root is built' do
+        comp = chain
+
+        expect { comp.recycle_component!('store') }
+          .to raise_error(described_class::NotBuiltError, /can't recycle store before the root is built/)
+        expect { comp.recycle! }.to raise_error(described_class::NotBuiltError)
+
+        comp.prepare!
+        expect { comp.recycle_component!('store') }.to raise_error(described_class::NotBuiltError)
+      end
+
+      it 'raises once the root is torn down' do
+        comp = chain
+        comp.start!
+        comp.teardown!
+
+        expect { comp.recycle_component!('store') }
+          .to raise_error(described_class::TornDownError, /can't recycle store: the component is torn down/)
+      end
+
+      it 'raises while the root is booting' do
+        comp = chain
+        comp.component!('db') do
+          build { |*| 'db' }
+          start { |_, _| comp.recycle_component!('store') }
+        end
+
+        expect { comp.start! }
+          .to raise_error(described_class::LockedComponentError, /can't recycle store while the root is booting/)
+      end
+
+      it 'raises on undeclared keys and namespaces' do
+        comp = chain
+        comp.declare('nested.worker') { 'worker' }
+        comp.start!
+
+        expect { comp.recycle_component!('nope') }
+          .to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
+        expect { comp.recycle_component!('nested') }
+          .to raise_error(described_class::UndeclaredComponentError, /nested is a namespace/)
+      end
     end
   end
 
@@ -2665,6 +3211,48 @@ RSpec.describe Sourced::Component do
       expect(events).to all(be_valid)
       expect(events).to all(be_a(Sourced::Message))
       expect(events).to all(have_attributes(created_at: be_a(Time)))
+    end
+
+    it 'publishes recycling events around each component stage' do
+      comp = new_component
+      comp.declare('db') { 'db' }
+      comp.declare('store', String)
+      comp.config!('store', ['db']) { |db| "store-#{db}" }
+      comp.start!
+      events = record(comp)
+
+      comp.recycle_component!('db')
+
+      expect(summary(events)).to eq([
+        'root.recycling',
+        'components.tearing_down store', 'components.torn_down store',
+        'components.tearing_down db', 'components.torn_down db',
+        'components.preparing db', 'components.prepared db',
+        'components.preparing store', 'components.prepared store',
+        'components.building db', 'components.built db',
+        'components.building store', 'components.built store',
+        'components.starting db', 'components.started db',
+        'components.starting store', 'components.started store',
+        'root.recycled'
+      ])
+      expect(events).to all(be_valid)
+      expect(events.last.payload.duration).to be >= 0
+    end
+
+    it 'publishes root.failed with the recycle stage' do
+      comp = new_component
+      comp.declare('db')
+      comp.component!('db') do
+        build { |*| 'db' }
+        stop { |_| raise ArgumentError, 'boom' }
+      end
+      comp.start!
+      events = record(comp)
+
+      expect { comp.recycle! }.to raise_error(ArgumentError, 'boom')
+
+      expect(summary(events).last(2)).to eq(['components.failed db', 'root.failed'])
+      expect(events.last.payload).to have_attributes(stage: :recycle, error_class: 'ArgumentError', error_message: 'boom')
     end
 
     it 'includes event details' do

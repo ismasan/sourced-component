@@ -6,6 +6,9 @@
 - `components.deferred`, `components.stopping` and `components.stopped` events, and `NotStartedError`
 - `#tree` and `#graph` show deferred and stopped components
 - `.__component_deps` on classes including an injector: the keys of every component injected into them, including inherited ones
+- `#recycle_component!`, `#recycle_components!` and `#recycle!` run a component's whole lifecycle again, leaving every affected component in the status it was in. A recycle that raises can be retried: components remember the status to restore until one completes
+- `root.recycling` and `root.recycled` events
+- Fix: `#teardown!` left the rest of the tree running, and the root `:started`, when a hook raised something that wasn't a `StandardError` (ex. the `Interrupt` a signal handler raises). Every component is now torn down exactly once, and a component whose hooks already ran is never torn down again
 
 ## [0.1.0] - 2026-10-04
 
