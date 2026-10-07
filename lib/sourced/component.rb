@@ -240,6 +240,22 @@ module Sourced
       end
     end
 
+    # Implement a declared component by building +constructor+ on each read, from the components it
+    # injects: #__component_deps maps each one's key to the keyword argument it's injected as, so the
+    # component's dependencies and the constructor's arguments come from the same place.
+    # A constructor that injects nothing is built with no arguments.
+    #   class Dispatcher
+    #     include App.inject('logger', 'repos.users' => 'customers')
+    #   end
+    #   app.declare('dispatcher', Dispatcher)
+    #   app.factory('dispatcher', Dispatcher) # Dispatcher.new(logger:, customers:)
+    # Keys are paths from the root of the injector's tree, so call this on that root.
+    def factory(ckey, constructor)
+      deps = constructor.respond_to?(:__component_deps) ? constructor.__component_deps : {}
+      config(ckey, deps.keys) { |*values| constructor.new(**deps.values.zip(values).to_h) }
+      self
+    end
+
     # Defer a node under this component: the root's #start! skips it, and every component that
     # depends on it, directly or not, since they can't start before it. Start it by key instead,
     # ex. when its process is elected to run it (see #start_component!).

@@ -141,6 +141,8 @@ App.component!('with.deps', ['sourced.db']) { build { |db| Foo.new(db) } }
 App.component('now') { build { Time.now } }
 ```
 
+A class that injects its own dependencies can be implemented from them, without repeating the list: see [`#factory`](#factory).
+
 ### Aliases
 
 `#alias(key, target)` implements a declared node as an alias of another component: reading it reads the target. It's useful to wire one library's component to another's:
@@ -665,12 +667,33 @@ Foo.__component_deps # => { "logger" => :logger, "repos.users" => :customers }
 - A class defining its own `def self.__component_deps` keeps it: unlike the injected readers, this one is never overwritten.
 - `Sourced::Component::Injector.deps_for(klass)` returns the same hash for any class or module, which is useful when an injector is included into a module rather than directly into a class: the module gets `.__component_deps`, but classes including it don't.
 
-Keys and values line up with the component's dependencies and its constructor's keyword arguments, so a class can be registered from its own declared dependencies:
+### `#factory`
+
+Keys and values line up with a component's dependencies and its constructor's keyword arguments, so `#factory(key, constructor)` implements a declared component from a class that injects:
 
 ```ruby
-deps = Foo.__component_deps
-App.config('foo', deps.keys) { |*values| Foo.new(**deps.values.zip(values).to_h) }
+class Dispatcher
+  include App.inject('logger', 'repos.users' => 'customers')
+end
+
+App.declare('dispatcher', Dispatcher)
+App.factory('dispatcher', Dispatcher)   # Dispatcher.new(logger:, customers:)
 ```
+
+which is the same as writing out what the class already declares:
+
+```ruby
+deps = Dispatcher.__component_deps      # { "logger" => :logger, "repos.users" => :customers }
+App.config('dispatcher', deps.keys) { |*values| Dispatcher.new(**deps.values.zip(values).to_h) }
+```
+
+- **The injected components become the component's dependencies**, so it's built after them and [`#graph`](#graph) shows the edges.
+- **Values are passed to the constructor**, so each dependency is read once per build. The injector takes the keyword arguments it's given instead of reading the components itself, which matters for a dynamic dependency: the instance and the build see the same value.
+- **It's dynamic**, like `#config`: a new instance on every read. For one instance, built once, use `App.config!('dispatcher', deps.keys) { ... }` with the block above.
+- **Any class works.** One that injects nothing is built with `new` and no arguments, and so has no dependencies. One that needs positional arguments doesn't fit: `#factory` only passes keywords.
+- **Inherited injections are included**, since `.__component_deps` includes them.
+- **Declare the key first.** `#factory` implements an existing declaration, and the built instance is parsed through its declared type like any other value.
+- **Keys are paths from the root of the injector's tree** (see above), so call `#factory` on that root. Calling it on a component mounted inside that tree resolves them relative to itself instead, and `#prepare!` then raises `MissingDependencyError`.
 
 ## Inspecting the tree
 

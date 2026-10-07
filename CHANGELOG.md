@@ -6,6 +6,7 @@
 - `components.deferred`, `components.stopping` and `components.stopped` events, and `NotStartedError`
 - `#tree` and `#graph` show deferred and stopped components
 - `.__component_deps` on classes including an injector: every component injected into them, including inherited ones, as the key it's registered under mapped to the name it's injected as
+- `#factory(key, constructor)` implements a declared component from a class that injects, taking its dependencies and its constructor's keyword arguments from `.__component_deps`
 - `#recycle_component!`, `#recycle_components!` and `#recycle!` run a component's whole lifecycle again, leaving every affected component in the status it was in. A recycle that raises can be retried: components remember the status to restore until one completes
 - `root.recycling` and `root.recycled` events
 - `#reconfigure(key) { |branch| ... }` re-declares one branch of a booted tree from scratch: what the block doesn't declare is removed, unchanged components keep running, and the new declaration set is validated before anything is torn down, so a failure leaves the tree as it was

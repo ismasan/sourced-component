@@ -564,7 +564,7 @@ RSpec.describe Sourced::Component do
       app.build!
 
       expect(app['sidereal.runner']).to eq('runner with sourced store')
-      expect(app.graph.components.find { |c| c[:key] == 'sidereal.store' }[:deps]).to eq(['sourced.store'])
+      expect(app.node('sidereal.store').implementation.deps).to eq(['sourced.store'])
     end
 
     it "parses the target's value through the alias' type" do
@@ -1175,6 +1175,144 @@ RSpec.describe Sourced::Component do
     end
   end
 
+
+  describe '#factory' do
+    def injectable
+      comp = new_component
+      comp.declare('logger', String) { 'the logger' }
+      comp.declare('sourced.store', String) { 'the store' }
+      comp
+    end
+
+    it 'builds the constructor from the components it injects, as keyword arguments' do
+      comp = injectable
+      klass = Class.new do
+        include comp.inject('logger', 'sourced.store' => 'st')
+        def to_a = [logger, st]
+      end
+      comp.declare('dispatcher', klass)
+
+      expect(comp.factory('dispatcher', klass)).to be(comp)
+
+      comp.start!
+      expect(comp['dispatcher']).to be_a(klass)
+      expect(comp['dispatcher'].to_a).to eq(['the logger', 'the store'])
+    end
+
+    it 'declares the injected components as its dependencies, so it builds after them' do
+      comp = injectable
+      klass = Class.new { include comp.inject('logger', 'sourced.store' => 'st') }
+      comp.declare('dispatcher', klass)
+      comp.factory('dispatcher', klass)
+      comp.start!
+
+      implementation = comp.node('dispatcher').implementation
+      expect(implementation.deps).to eq(%w[logger sourced.store])
+      expect(implementation.mode).to eq(:dynamic)
+      keys = comp.ordered_nodes.map(&:path)
+      expect(keys.index('dispatcher')).to be > keys.index('sourced.store')
+    end
+
+    it 'includes the dependencies the constructor inherits' do
+      comp = injectable
+      parent = Class.new { include comp.inject('logger') }
+      child = Class.new(parent) do
+        include comp.inject('sourced.store')
+        def to_a = [logger, store]
+      end
+      comp.declare('child', child)
+      comp.factory('child', child)
+      comp.start!
+
+      expect(comp.node('child').implementation.deps).to eq(%w[logger sourced.store])
+      expect(comp['child'].to_a).to eq(['the logger', 'the store'])
+    end
+
+    it 'builds a constructor that injects nothing with no arguments' do
+      comp = injectable
+      klass = Class.new do
+        def initialize = @built = true
+        def built? = @built
+      end
+      comp.declare('plain', klass)
+      comp.factory('plain', klass)
+      comp.start!
+
+      expect(comp['plain']).to be_built
+      expect(comp.node('plain').implementation.deps).to eq([])
+    end
+
+    it 'builds a new instance on every read' do
+      comp = injectable
+      klass = Class.new { include comp.inject('logger') }
+      comp.declare('dispatcher', klass)
+      comp.factory('dispatcher', klass)
+      comp.start!
+
+      expect(comp['dispatcher']).not_to be(comp['dispatcher'])
+    end
+
+    it 'reads each dependency once per build, passing on the values it resolved' do
+      reads = []
+      comp = new_component
+      comp.declare('ticket', String)
+      comp.config('ticket') { reads << :read; "ticket-#{reads.size}" } # dynamic: every read is visible
+      klass = Class.new do
+        include comp.inject('ticket')
+        def value = ticket
+      end
+      comp.declare('handler', klass)
+      comp.factory('handler', klass)
+      comp.start!
+      reads.clear
+
+      handler = comp['handler']
+
+      # The injector takes the value the build resolved, rather than reading the node again itself
+      expect(reads.size).to eq(1)
+      expect(handler.value).to eq('ticket-1')
+    end
+
+    it 'parses the built value through the declared type' do
+      comp = injectable
+      klass = Class.new { include comp.inject('logger') }
+      comp.declare('wrong_type', Integer)
+      comp.factory('wrong_type', klass)
+      comp.start!
+
+      expect { comp['wrong_type'] }.to raise_error(Plumb::ParseError, /wrong_type: Must be a Integer/)
+    end
+
+    it 'raises on undeclared keys' do
+      comp = injectable
+      klass = Class.new { include comp.inject('logger') }
+
+      expect { comp.factory('nope', klass) }
+        .to raise_error(described_class::UndeclaredComponentError, /nope is not declared/)
+    end
+
+    it "wires the component the constructor injects, not another one under the same key" do
+      lib = new_component
+      lib.declare('logger', String) { 'lib logger' }
+      lib.declare('dispatcher')
+      klass = Class.new do
+        include lib.inject('logger') # the library's own logger, from its own root
+        def to_s = "dispatcher(#{logger})"
+      end
+      app = new_component
+      app.declare('logger', String) { 'app logger' } # a different component, same last segment
+      app.mount('lib', lib)
+
+      app.factory('lib.dispatcher', klass)
+      app.start!
+
+      # __component_deps follows mounting, so the dep is 'lib.logger', not the app's 'logger'
+      expect(klass.__component_deps).to eq('lib.logger' => :logger)
+      expect(app.node('lib.dispatcher').implementation.deps).to eq(['lib.logger'])
+      expect(app['lib.dispatcher'].to_s).to eq('dispatcher(lib logger)')
+      expect(app['logger']).to eq('app logger')
+    end
+  end
   describe '#mount' do
     it 'attaches a standalone component as a branch, indexing its nodes' do
       lib = new_component
