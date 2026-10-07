@@ -13,16 +13,18 @@ module Sourced
     class Injector < Module
       # Extended into whatever includes an Injector, see #included
       module ComponentDeps
-        # The keys of every component injected into this class, including inherited ones.
+        # Every component injected into this class, including inherited ones, by key.
         # See Injector.deps_for
         def __component_deps = Injector.deps_for(self)
       end
 
-      # The keys of every component injected into mod, as paths from the root of each component's tree,
-      # in injection order, with the ones injected into its ancestors first.
-      # Keys are the ones the components are registered under, not the names they're injected as.
+      # Every component injected into mod, as the key it's registered under (a path from the root of
+      # its tree) mapped to the name it's injected as, in injection order, with the ones injected
+      # into mod's ancestors first. Injecting a key again under another name replaces the name, so
+      # the one closest to mod wins.
+      #   { 'logger' => :logger, 'repos.users' => :customers }
       def self.deps_for(mod)
-        mod.ancestors.grep(Injector).reverse.flat_map(&:paths).uniq
+        mod.ancestors.grep(Injector).reverse.reduce({}) { |deps, injector| deps.merge(injector.mapping) }
       end
 
       attr_reader :names, :nodes
@@ -75,6 +77,9 @@ module Sourced
       # The keys the injected components are registered under, as paths from the root of their tree.
       # Computed on each call: a node's path changes when its root is mounted into another component.
       def paths = nodes.map(&:path)
+
+      # Those keys, mapped to the names the components are injected as
+      def mapping = paths.zip(names.values).to_h
 
       def inspect = "#<#{self.class} #{names.map { |key, name| "#{key} => #{name}" }.join(', ')}>"
     end
