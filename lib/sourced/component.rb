@@ -475,8 +475,10 @@ module Sourced
     # (or deferred) comes back built and still held: the fresh value has never run, so it waits to
     # be started by key, as it was.
     # If a stop or teardown hook raises, every component is still torn down and its value dropped,
-    # and the first error is re-raised before anything is prepared again: they're left :open, and
-    # recycling again picks up from there.
+    # and the first error is re-raised before anything is prepared again. A prepare, build or start
+    # hook leaves the component where it got to. Either way, recycling again recovers: each one
+    # remembers the status to restore until a recycle completes, so a retry puts it back even when
+    # its own status no longer says it was running.
     # The root must be built, or started, and not booting.
     #   app.recycle_component!('sourced.store')
     def recycle_component!(ckey, context = Thread.current)
@@ -488,7 +490,14 @@ module Sourced
     #   app.recycle_components!('sourced.store', 'repos.users')
     def recycle_components!(*ckeys, context: Thread.current)
       synchronize do
-        recycle_nodes!(ckeys.flatten.map { |ckey| recyclable_node(ckey) }, context)
+        nodes = ckeys.flatten.map { |ckey| recyclable_node(ckey) }
+        # Recycling nothing resolves no nodes, so it checks the tree itself, and does nothing
+        if nodes.empty?
+          check_recyclable!('components')
+          return self
+        end
+
+        recycle_nodes!(nodes, context)
       end
     end
 
@@ -698,6 +707,7 @@ module Sourced
 
       implementation.start(value, context)
       @status = :started
+      recycled! # whatever a recycle meant to restore, this is the node's status now
       self
     end
 
@@ -709,6 +719,7 @@ module Sourced
         implementation.stop(value)
       ensure
         @status = :stopped
+        recycled! # ... and the same when a component is stopped by key
       end
       self
     end
@@ -879,13 +890,18 @@ module Sourced
       ordered.each { |n| n.recycle_to!(n.recycle_to || n.status) }
 
       instrument_root(:recycle) do
-        # Down, dependents first. Started nodes run their stop hooks, then their teardown hooks
-        errors = ordered.reverse.each_with_object([]) do |n, errs|
-          instrument_component(n, :teardown) { n.teardown_node! }
-        rescue StandardError => e
-          errs << e
+        # Down, dependents first. Started nodes run their stop hooks, then their teardown hooks.
+        # Their values are dropped whatever a hook raises (incl. Interrupt): they've been torn down
+        errors = []
+        begin
+          ordered.reverse.each do |n|
+            instrument_component(n, :teardown) { n.teardown_node! }
+          rescue Exception => e # rubocop:disable Lint/RescueException -- as #teardown_nodes: the rest are still torn down
+            errors << e
+          end
+        ensure
+          ordered.each { |n| n.recycle_node! }
         end
-        ordered.each { |n| n.recycle_node! }
         raise errors.first if errors.any?
 
         # And up again, in dependency order, one stage at a time, as the root boots
