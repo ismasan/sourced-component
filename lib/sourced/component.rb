@@ -57,6 +57,7 @@ module Sourced
       @value = nil
       @deferred = false # skipped by the root's #start!, see #defer
       @held = false     # not started with the tree or its dependencies: deferred, or stopped by key
+      @recycle_to = nil # the status to come back to while recycling, see #recycle_component!
       @deps = [].freeze      # resolved deps: a node, or { segment => node } for a wildcard
       @dep_nodes = [].freeze # every node in @deps, for sorting
       @children = {}
@@ -463,6 +464,45 @@ module Sourced
       end
     end
 
+    # ---- Recycling components -------------------------------------------------------
+
+    # Run a component's whole lifecycle again, by key relative to this component: stop it if it's
+    # running, tear it down, drop its value, then prepare and build it from scratch.
+    # Every component depending on it, directly or not, is recycled too: their values were built
+    # from its old one. Its own dependencies are left alone.
+    # Each one is left in the status it had before, so a started component is started again with
+    # +context+, and one that was only built stops at built. A component that was stopped by key
+    # (or deferred) comes back built and still held: the fresh value has never run, so it waits to
+    # be started by key, as it was.
+    # If a stop or teardown hook raises, every component is still torn down and its value dropped,
+    # and the first error is re-raised before anything is prepared again: they're left :open, and
+    # recycling again picks up from there.
+    # The root must be built, or started, and not booting.
+    #   app.recycle_component!('sourced.store')
+    def recycle_component!(ckey, context = Thread.current)
+      recycle_components!(ckey, context:)
+    end
+
+    # #recycle_component! for several keys at once: a component depending on more than one of them
+    # is recycled once, not once per key.
+    #   app.recycle_components!('sourced.store', 'repos.users')
+    def recycle_components!(*ckeys, context: Thread.current)
+      synchronize do
+        recycle_nodes!(ckeys.flatten.map { |ckey| recyclable_node(ckey) }, context)
+      end
+    end
+
+    # #recycle_component! for every component in the tree, in dependency order. Only the root
+    # can recycle the whole tree.
+    #   app.recycle!
+    def recycle!(context = Thread.current)
+      raise_mounted!
+      synchronize do
+        check_recyclable!('the tree')
+        recycle_nodes!(order, context)
+      end
+    end
+
     # A Component::Graph describing the components under this component, by full path from the root.
     # Components are listed in dependency order once the tree is prepared, and in declaration order before that.
     # Namespaces without an implementation are left out.
@@ -562,6 +602,13 @@ module Sourced
     protected def hold! = @held = true
     protected def release! = @held = false
     protected def started? = status == :started
+
+    # The status a recycle is bringing this node back to, remembered before anything is torn down.
+    # A recycle that raises leaves it set, so a retry restores what the first one meant to: the
+    # node's own status is no use by then, ex. :built for one a failed start never reached
+    protected def recycle_to = @recycle_to
+    protected def recycle_to!(status) = @recycle_to = status
+    protected def recycled! = @recycle_to = nil
 
     # Every node this one depends on, directly or not
     protected def transitive_dependencies
@@ -679,8 +726,25 @@ module Sourced
       self
     end
 
+    # Back to :open, so every hook runs again from the top (see #recycle_component!).
+    # Keeps the node's hold, its deps and its place in the root's order: the tree is locked,
+    # so nothing about the graph can have changed
+    protected def recycle_node!
+      @status = :open
+      @value = nil
+      self
+    end
+
+    # Whether the node has been built. A torn down node keeps its value, which stays readable;
+    # only recycling drops it, back to :open
+    protected def built? = !%i[open prepared].include?(status)
+
     # Without the readable check: deps are read while the component is building, in dependency order
-    protected def current_value = memoized? ? value : build_value
+    protected def current_value
+      raise NotBuiltError, "#{path} is not built: it was torn down or recycled" if memoized? && !built?
+
+      memoized? ? value : build_value
+    end
 
     # Whether the value is built once, on #build!: singletons, and aliases of memoized components.
     # Only known once deps are resolved, on #prepare!
@@ -782,6 +846,60 @@ module Sourced
       end
 
       target
+    end
+
+    # A node to recycle by key: implemented, under a root that can be recycled
+    private def recyclable_node(ckey)
+      target = node(ckey)
+      raise UndeclaredComponentError, "#{target.path} is a namespace, not a component" if target.namespace?
+
+      check_recyclable!(target.path)
+      target
+    end
+
+    # Whether the tree can be recycled: built or started, and not booting. +what+ names what
+    # the caller is recycling, for the error messages
+    private def check_recyclable!(what)
+      raise TornDownError, "can't recycle #{what}: the component is torn down" if root.boot_status == :torn_down
+      if root.starting?
+        raise LockedComponentError, "can't recycle #{what} while the root is booting: it has no status to go back to"
+      end
+      return if %i[built started].include?(root.boot_status)
+
+      raise NotBuiltError, "can't recycle #{what} before the root is built: build! it first"
+    end
+
+    # Tear the targets and their dependents down, drop their values, and prepare and build them
+    # again, leaving each one in the status it had before. See #recycle_component!
+    private def recycle_nodes!(targets, context)
+      affected = targets.flat_map { |t| [t, *t.transitive_dependents] }.uniq
+      ordered = root.order.select { |n| affected.include?(n) }
+      # What each node comes back to, remembered before anything is torn down. A node a previous
+      # recycle left part way through keeps the status that recycle meant to restore
+      ordered.each { |n| n.recycle_to!(n.recycle_to || n.status) }
+
+      instrument_root(:recycle) do
+        # Down, dependents first. Started nodes run their stop hooks, then their teardown hooks
+        errors = ordered.reverse.each_with_object([]) do |n, errs|
+          instrument_component(n, :teardown) { n.teardown_node! }
+        rescue StandardError => e
+          errs << e
+        end
+        ordered.each { |n| n.recycle_node! }
+        raise errors.first if errors.any?
+
+        # And up again, in dependency order, one stage at a time, as the root boots
+        ordered.each { |n| instrument_component(n, :prepare) { n.prepare_node! } }
+        ordered.each { |n| instrument_component(n, :build) { n.build_node! } }
+        ordered.each do |n|
+          next unless n.recycle_to == :started && n.dep_nodes.all? { |dep| dep.started? }
+
+          instrument_component(n, :start) { n.start_node!(context) }
+        end
+        # Only once every node is back: a recycle that raises keeps the statuses for the retry
+        ordered.each { |n| n.recycled! }
+      end
+      self
     end
 
     # ---- Telemetry ------------------------------------------------------------------

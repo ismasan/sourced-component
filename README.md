@@ -382,6 +382,38 @@ App.start_component!('dispatcher')  # starts dispatcher, then monitor
 - **If `stop` hooks raise,** every component is still stopped, and the first error is re-raised.
 - **`#teardown!`** runs `stop` on the started components and `teardown` on all of them, deferred or stopped ones included.
 
+### Recycling components
+
+`#recycle_component!(key, context = Thread.current)` runs a component's whole lifecycle again, from the top: it stops the component if it's running, tears it down, drops its value, then prepares and builds it from scratch. This is for class reloaders and the like — a file changes, and the components built from it are recycled.
+
+```ruby
+App.recycle_component!('sourced.store', task)
+App.recycle_components!('sourced.store', 'repos.users', context: task) # several at once
+App.recycle!(task)                                                     # the whole tree
+```
+
+- **Every component is left in the status it was in before.** A started one is started again with `context`, and one that was only built stops at built. Nothing changes the root's own status.
+- **The components depending on it are recycled too**, directly or not: their values were built from its old value, so they're stale. Its own dependencies are left alone, running.
+- **A component that was stopped by key, or deferred, comes back `:built` and still held.** Its fresh value has never run, so it waits to be started by `#start_component!`, exactly as it was waiting before.
+- **Order:** down in reverse dependency order, dependents first, then up in dependency order, one stage at a time — every affected component is prepared before any is built, as when the root boots.
+- **Keys are relative to the component** the method is called on, like `#component!`. Only the root can `#recycle!` the whole tree.
+- **Hooks:** a started component runs `stop` then `teardown` on the way down, and `prepare`, `build` and `start` on the way back up. A component that wasn't running only runs `teardown`.
+- **Events:** `root.recycling` and `root.recycled` wrap the operation, and each component publishes its usual stage events, so a reloader can follow along. As with `#teardown!`, the `stop` hooks of a started component run under its `components.tearing_down` event.
+
+```
+db <- store <- dispatcher
+
+App.recycle_component!('store')   # tears down dispatcher, then store
+                                  # then builds store, dispatcher, and starts both again
+                                  # db keeps running, with the same value
+```
+
+- **If a `stop` or `teardown` hook raises,** every affected component is still torn down and its value dropped, and the first error is re-raised before anything is prepared again. They're left `:open`, with no value: reading one raises `NotBuiltError`.
+- **If a `prepare`, `build` or `start` hook raises,** the component is left where it got to and the error is re-raised. The ones the recycle didn't reach keep the value it built for them, at `:built`.
+- **Recycling again recovers, however it failed.** Each component remembers the status the first recycle meant to restore, until one completes, so a retry puts it back even when its own status no longer says it was running: a component a failed `start` left `:built` is started again, not left behind. A reloader can just retry on the next save.
+- **The root must be built, or started.** Before that there's nothing to recycle, and it raises `NotBuiltError`; once the root is torn down, `TornDownError`. Recycling while the root is booting raises `LockedComponentError`: mid-`#start!` there's no settled status to go back to.
+- **No code is reloaded.** Recycling re-runs the hooks a component was implemented with; it doesn't re-implement it. The tree is locked once prepared, so a class captured in a provider (`App.component!('store', Store)`) stays captured — only a block that resolves the constant when it builds (`build { Store.new }`) picks up a reloaded class.
+
 ### Signal handlers
 
 The lifecycle methods, and anything else that takes the root's lock (declaring, implementing and mounting components, `#graph`, `#tree`), can't be called from a `trap` block: Ruby doesn't allow locking a `Monitor` in trap context, so they raise `ThreadError: can't be called from trap context` and nothing is torn down. Reading values doesn't take the lock.
@@ -757,6 +789,7 @@ end
 | `root.preparing` / `root.prepared` | around `#prepare!` | `duration` when finished |
 | `root.building` / `root.built` | around `#build!` | `duration` when finished |
 | `root.starting` / `root.started` | around `#start!` | `duration` when finished |
+| `root.recycling` / `root.recycled` | around `#recycle_component!`, `#recycle_components!` and `#recycle!` | `duration` when finished |
 | `root.tearing_down` / `root.torn_down` | around `#teardown!` | `duration` when finished |
 | `root.failed` | a lifecycle step raised | `stage`, `error_class`, `error_message`, `backtrace` |
 
@@ -764,7 +797,7 @@ end
 - **`key`** is the component's full path from the root, ex. `sourced.db`.
 - **`deps`** are relative to the `implementer`, the full path of the component that implemented the component (`nil` for the root).
 - **`duration`** is in seconds, measured with a monotonic clock.
-- **`stage`** is one of `:prepare`, `:build`, `:start`, `:stop` or `:teardown`.
+- **`stage`** is one of `:prepare`, `:build`, `:start`, `:stop`, `:teardown` or `:recycle`.
 - **Errors are described, not attached:** `error_class`, `error_message` and `backtrace` are strings, so events stay serializable (see below). The error itself is re-raised to the caller of the lifecycle method.
 
 A few rules:
@@ -854,14 +887,14 @@ Plumb::ParseError: user: {age: "Must be a Integer"}
 | --- | --- |
 | `DeclarationOverrideError` | declaring or mounting on a key that's already declared |
 | `OwnershipError` | declaring or mounting under nodes owned by another component |
-| `LockedComponentError` | changing the tree after it's prepared, or mounting a component that isn't open |
+| `LockedComponentError` | changing the tree after it's prepared, mounting a component that isn't open, or recycling while the root is booting |
 | `SubcomponentError` | booting a mounted component, or mounting a component that's already mounted |
 | `UndeclaredComponentError` | implementing or reading an undeclared key, or reading a namespace |
 | `UnimplementedComponentError` | preparing with declared (or deferred) components that have no implementation |
 | `MissingDependencyError` | preparing with dependencies that aren't declared or implemented |
 | `CircularDependencyError` | preparing with dependency cycles |
-| `NotBuiltError` | reading values before the component is built |
-| `TornDownError` | starting a component that's torn down, or starting or stopping a component by key once its root is torn down |
+| `NotBuiltError` | reading values before the component is built, reading one that was recycled away, or recycling before the root is built |
+| `TornDownError` | starting a component that's torn down, or starting, stopping or recycling a component by key once its root is torn down |
 | `NotStartedError` | starting or stopping a component by key before its root is started |
 | `InjectionError` | including an injector in a class that already has a method with an injected name, or already injects it |
 
