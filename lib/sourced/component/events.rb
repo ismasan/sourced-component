@@ -49,7 +49,7 @@ module Sourced
 
       Completed = proc { attribute :duration, Float }
       Failed = proc do
-        attribute :stage, Symbol # :prepare, :build, :start, :stop, :teardown or :recycle
+        attribute :stage, Symbol # :prepare, :build, :start, :stop, :teardown, :recycle or :reconfigure
         attribute :error_class, String
         attribute :error_message, String
         attribute :backtrace, Plumb::Types::Array[String]
@@ -61,6 +61,8 @@ module Sourced
       RootBuilt = RootEvent.define('root.built', &Completed)
       RootStarting = RootEvent.define('root.starting')
       RootStarted = RootEvent.define('root.started', &Completed)
+      RootReconfiguring = RootEvent.define('root.reconfiguring')
+      RootReconfigured = RootEvent.define('root.reconfigured', &Completed)
       RootRecycling = RootEvent.define('root.recycling')
       RootRecycled = RootEvent.define('root.recycled', &Completed)
       RootTearingDown = RootEvent.define('root.tearing_down')
@@ -78,6 +80,9 @@ module Sourced
       end
       ComponentDeferred = ComponentEvent.define('components.deferred') do
         attribute :deferrer, Plumb::Types::String.nullable # the full path of the component that deferred it. nil for the root
+      end
+      ComponentRemoved = ComponentEvent.define('components.removed') do
+        attribute :remover, Plumb::Types::String.nullable # the full path of the component that removed it. nil for the root
       end
       ComponentPreparing = ComponentEvent.define('components.preparing')
       ComponentPrepared = ComponentEvent.define('components.prepared', &Completed)
@@ -99,6 +104,7 @@ module Sourced
       prepare: [Events::RootPreparing, Events::RootPrepared],
       build: [Events::RootBuilding, Events::RootBuilt],
       start: [Events::RootStarting, Events::RootStarted],
+      reconfigure: [Events::RootReconfiguring, Events::RootReconfigured],
       recycle: [Events::RootRecycling, Events::RootRecycled],
       teardown: [Events::RootTearingDown, Events::RootTornDown]
     }.freeze

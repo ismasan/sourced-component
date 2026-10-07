@@ -2651,6 +2651,404 @@ RSpec.describe Sourced::Component do
     end
   end
 
+
+  describe 'reconfiguring a booted tree' do
+    let(:calls) { [] }
+
+    # 'db <- store' and 'runner' are the app's own, declared by hand. The 'reactors' branch is the
+    # one a watcher owns: 'audit' is a direct child, the others are nested, and 'runner' has a
+    # wildcard dep over the branch's direct children
+    def app(reactors: { 'audit' => 'audit', 'billing.invoices' => 'invoices', 'billing.payments' => 'payments' })
+      comp = new_component
+      comp.declare('db') { 'db' }
+      comp.declare('store', String)
+      comp.config!('store', ['db']) { |db| "store(#{db})" }
+      comp.declare('runner', Array)
+      comp.config!('runner', ['reactors.*']) { |rs| rs.keys.sort }
+      reactors.each { |ckey, label| reactor(comp, "reactors.#{ckey}", label) }
+      comp
+    end
+
+    def reactor(target, ckey, label, version = 1)
+      log = calls
+      target.declare(ckey)
+      target.component!(ckey, []) do
+        prepare { log << [:prepare, label] }
+        build { |*| "#{label}##{version}" }
+        start { |value, _context| log << [:start, value] }
+        stop { |value| log << [:stop, value] }
+        teardown { |value| log << [:teardown, value] }
+      end
+    end
+
+    def reactor_keys(comp) = comp.index.keys.grep(/\Areactors/)
+    def statuses(comp) = reactor_keys(comp).to_h { |k| [k, comp.node(k).status] }
+    def values(comp) = reactor_keys(comp).reject { |k| comp.node(k).namespace? }.to_h { |k| [k, comp[k]] }
+
+    it 'keeps components whose declaration did not change running, untouched' do
+      comp = app
+      comp.start!(:boot)
+      before = [statuses(comp), values(comp), comp.index.keys]
+      calls.clear
+
+      expect(comp.reconfigure('reactors') { |b| %w[audit billing.invoices billing.payments].each { |k| b.declare(k) } })
+        .to be(comp)
+
+      expect(calls).to be_empty
+      expect([statuses(comp), values(comp), comp.index.keys]).to eq(before)
+      expect(comp['runner']).to eq(['audit'])
+    end
+
+    it 'recycles a re-implemented component, and nothing else' do
+      comp = app
+      comp.start!(:boot)
+      calls.clear
+
+      comp.reconfigure('reactors', :reload) do |b|
+        %w[audit billing.invoices billing.payments].each { |k| b.declare(k) }
+        reactor(b, 'billing.invoices', 'invoices', 2)
+      end
+
+      expect(calls).to eq([
+                            [:stop, 'invoices#1'], [:teardown, 'invoices#1'],
+                            [:prepare, 'invoices'], [:start, 'invoices#2']
+                          ])
+      expect(values(comp)).to eq(
+        'reactors.audit' => 'audit#1', 'reactors.billing.invoices' => 'invoices#2',
+        'reactors.billing.payments' => 'payments#1'
+      )
+      expect(statuses(comp).values.uniq - [:open]).to eq([:started])
+    end
+
+    it 'prepares, builds and starts a new component' do
+      comp = app
+      comp.start!(:boot)
+      calls.clear
+
+      comp.reconfigure('reactors', :later) do |b|
+        %w[audit billing.invoices billing.payments].each { |k| b.declare(k) }
+        reactor(b, 'billing.refunds', 'refunds')
+      end
+
+      expect(calls).to eq([[:prepare, 'refunds'], [:start, 'refunds#1']])
+      expect(comp['reactors.billing.refunds']).to eq('refunds#1')
+      expect(comp.node('reactors.billing.refunds').status).to eq(:started)
+    end
+
+    it 'only builds a new component when the root is built but not started' do
+      comp = app
+      comp.build!
+      calls.clear
+
+      comp.reconfigure('reactors') do |b|
+        %w[audit billing.invoices billing.payments].each { |k| b.declare(k) }
+        reactor(b, 'audit2', 'audit2')
+      end
+
+      expect(calls).to eq([[:prepare, 'audit2']])
+      expect(comp.node('reactors.audit2').status).to eq(:built)
+      expect(comp['reactors.audit2']).to eq('audit2#1')
+    end
+
+    it 'tears down and removes a component the block did not declare' do
+      comp = app
+      klass = Class.new { include comp.inject('reactors.billing.payments' => 'payments') }
+      comp.start!(:boot)
+      calls.clear
+
+      comp.reconfigure('reactors') { |b| %w[audit billing.invoices].each { |k| b.declare(k) } }
+
+      expect(calls).to eq([[:stop, 'payments#1'], [:teardown, 'payments#1']])
+      expect(comp.index.keys).not_to include('reactors.billing.payments')
+      expect(comp.node('reactors.billing').index.keys).to eq(['invoices'])
+      expect { comp['reactors.billing.payments'] }.to raise_error(described_class::UndeclaredComponentError)
+      # anything still holding the node itself, ex. an injected class, fails loudly
+      expect { klass.new.payments }
+        .to raise_error(described_class::RemovedComponentError, /reactors.billing.payments was removed/)
+    end
+
+    it 'recycles a wildcard dependent when the branch gains or loses a direct child' do
+      comp = app
+      comp.start!(:boot)
+      expect(comp['runner']).to eq(['audit'])
+      calls.clear
+
+      comp.reconfigure('reactors') do |b|
+        %w[audit billing.invoices billing.payments].each { |k| b.declare(k) }
+        reactor(b, 'metrics', 'metrics')
+      end
+
+      expect(comp['runner']).to eq(%w[audit metrics])
+
+      comp.reconfigure('reactors') { |b| %w[metrics billing.invoices billing.payments].each { |k| b.declare(k) } }
+
+      expect(comp['runner']).to eq(['metrics'])
+      expect(comp.index.keys).not_to include('reactors.audit')
+    end
+
+    describe 'nested components' do
+      it 'declares nested keys through the component that called reconfigure' do
+        comp = app
+        comp.start!(:boot)
+        calls.clear
+
+        comp.reconfigure('reactors') do |b|
+          %w[audit billing.invoices billing.payments].each { |k| b.declare(k) }
+          reactor(b, 'billing.deep.refunds', 'refunds')
+        end
+
+        expect(comp.index.keys).to include('reactors.billing.deep', 'reactors.billing.deep.refunds')
+        expect(comp['reactors.billing.deep.refunds']).to eq('refunds#1')
+      end
+
+      # Which is why the block is handed a delegator that declares through the component
+      # #reconfigure was called on, rather than the branch node itself
+      it "can't be done by the branch node, which doesn't own the namespaces above it" do
+        comp = app
+        expect(comp.node('reactors.billing').owner).to be(comp)
+        expect { comp.node('reactors').declare('billing.other') }
+          .to raise_error(described_class::OwnershipError, /reactors.billing is owned by another component/)
+      end
+
+      it 'removes emptied namespaces too, bottom-up' do
+        comp = app(reactors: { 'audit' => 'audit', 'billing.deep.x' => 'x' })
+        comp.start!(:boot)
+        expect(comp.index.keys).to include('reactors.billing', 'reactors.billing.deep')
+        calls.clear
+
+        comp.reconfigure('reactors') { |b| b.declare('audit') }
+
+        expect(calls).to eq([[:stop, 'x#1'], [:teardown, 'x#1']])
+        expect(reactor_keys(comp)).to eq(%w[reactors reactors.audit])
+        expect(comp.node('reactors').index.keys).to eq(['audit'])
+      end
+
+      it 'reverts a component that keeps declared children to a namespace' do
+        comp = app(reactors: { 'audit' => 'audit', 'billing' => 'billing' })
+        comp.start!(:boot)
+        expect(comp['reactors.billing']).to eq('billing#1')
+        calls.clear
+
+        comp.reconfigure('reactors') do |b|
+          b.declare('audit')
+          reactor(b, 'billing.invoices', 'invoices')
+        end
+
+        expect(calls).to eq([[:stop, 'billing#1'], [:teardown, 'billing#1'],
+                             [:prepare, 'invoices'], [:start, 'invoices#1']])
+        expect(comp.node('reactors.billing')).to be_namespace
+        expect(comp.node('reactors.billing').status).to eq(:open)
+        expect(comp['reactors.billing.invoices']).to eq('invoices#1')
+        expect { comp['reactors.billing'] }
+          .to raise_error(described_class::UndeclaredComponentError, /is a namespace/)
+      end
+
+      it 'collapses a namespace back into a component' do
+        comp = app(reactors: { 'audit' => 'audit', 'billing.invoices' => 'invoices' })
+        comp.start!(:boot)
+        calls.clear
+
+        comp.reconfigure('reactors') do |b|
+          b.declare('audit')
+          reactor(b, 'billing', 'billing')
+        end
+
+        expect(calls).to eq([[:stop, 'invoices#1'], [:teardown, 'invoices#1'],
+                             [:prepare, 'billing'], [:start, 'billing#1']])
+        expect(comp['reactors.billing']).to eq('billing#1')
+        expect(comp.index.keys).not_to include('reactors.billing.invoices')
+      end
+    end
+
+    it 'leaves components stopped by key stopped, and deferred ones deferred' do
+      comp = app
+      comp.defer('reactors.billing.payments')
+      comp.start!(:boot)
+      comp.stop_component!('reactors.audit')
+      before = statuses(comp)
+      calls.clear
+
+      comp.reconfigure('reactors') { |b| %w[audit billing.invoices billing.payments].each { |k| b.declare(k) } }
+
+      expect(calls).to be_empty
+      expect(statuses(comp)).to eq(before)
+      expect(statuses(comp)).to include('reactors.audit' => :stopped, 'reactors.billing.payments' => :built)
+      expect(comp.node('reactors.billing.payments')).to be_deferred
+      comp.start_component!('reactors.audit')
+      expect(comp.node('reactors.audit').status).to eq(:started)
+    end
+
+    describe 'when the new declaration set is invalid' do
+      # Each of these must leave the tree exactly as it was, with no hooks run
+      def expect_unchanged(comp, &block)
+        before = [statuses(comp), values(comp), comp.index.keys, comp['runner'], comp['store']]
+        calls.clear
+        block.call
+        expect(calls).to be_empty
+        expect([statuses(comp), values(comp), comp.index.keys, comp['runner'], comp['store']]).to eq(before)
+      end
+
+      it 'rolls back a block that raises' do
+        comp = app
+        comp.start!(:boot)
+
+        expect_unchanged(comp) do
+          expect do
+            comp.reconfigure('reactors') do |b|
+              b.declare('audit')
+              reactor(b, 'metrics', 'metrics')
+              raise 'the file is broken'
+            end
+          end.to raise_error(RuntimeError, 'the file is broken')
+        end
+      end
+
+      it 'rolls back a missing dependency' do
+        comp = app
+        comp.start!(:boot)
+
+        expect_unchanged(comp) do
+          expect do
+            comp.reconfigure('reactors') do |b|
+              %w[audit billing.invoices billing.payments].each { |k| b.declare(k) }
+              b.declare('broken')
+              b.config!('broken', ['nope.missing']) { |x| x }
+            end
+          end.to raise_error(described_class::MissingDependencyError, /nope.missing/)
+        end
+      end
+
+      it 'rolls back a declaration with no implementation' do
+        comp = app
+        comp.start!(:boot)
+
+        expect_unchanged(comp) do
+          expect do
+            comp.reconfigure('reactors') do |b|
+              %w[audit billing.invoices billing.payments].each { |k| b.declare(k) }
+              b.declare('bare')
+            end
+          end.to raise_error(described_class::UnimplementedComponentError, /reactors.bare/)
+        end
+      end
+
+      it 'rolls back a cycle' do
+        comp = app
+        comp.start!(:boot)
+
+        expect_unchanged(comp) do
+          expect do
+            comp.reconfigure('reactors') do |b|
+              %w[audit billing.invoices billing.payments].each { |k| b.declare(k) }
+              b.declare('a')
+              b.declare('b')
+              b.config!('a', ['reactors.b']) { |x| x }
+              b.config!('b', ['reactors.a']) { |x| x }
+            end
+          end.to raise_error(described_class::CircularDependencyError)
+        end
+      end
+
+      it 'rolls back dropping a component something still depends on' do
+        comp = app
+        comp.declare('audit_log', String)
+        comp.config!('audit_log', ['reactors.audit']) { |a| "log(#{a})" }
+        comp.start!(:boot)
+
+        expect_unchanged(comp) do
+          expect { comp.reconfigure('reactors') { |b| b.declare('billing.invoices') } }
+            .to raise_error(described_class::MissingDependencyError, /reactors.audit/)
+        end
+        expect(comp['audit_log']).to eq('log(audit#1)')
+      end
+
+      it 'still boots and tears down after a rolled back reconfigure' do
+        comp = app
+        comp.start!(:boot)
+        expect { comp.reconfigure('reactors') { |_b| raise 'boom' } }.to raise_error(RuntimeError)
+        calls.clear
+
+        comp.teardown!
+
+        expect(calls.grep(->(c) { c.first == :teardown }).size).to eq(3)
+        expect(comp.boot_status).to eq(:torn_down)
+      end
+    end
+
+    describe 'guards' do
+      it 'needs a block' do
+        comp = app
+        comp.start!
+
+        expect { comp.reconfigure('reactors') }
+          .to raise_error(ArgumentError, /a block must declare the branch's contents/)
+      end
+
+      it 'raises on unknown keys, and on components that are not namespaces' do
+        comp = app
+        comp.start!
+
+        expect { comp.reconfigure('nope') { |_b| } }.to raise_error(described_class::UndeclaredComponentError)
+        expect { comp.reconfigure('store') { |_b| } }
+          .to raise_error(described_class::UndeclaredComponentError, /store is a component, not a namespace/)
+      end
+
+      it 'refuses a mounted component under the branch' do
+        lib = new_component
+        lib.declare('worker') { 'worker' }
+        comp = app
+        comp.mount('reactors.lib', lib)
+        comp.start!
+
+        expect { comp.reconfigure('reactors') { |_b| } }
+          .to raise_error(described_class::SubcomponentError, /reactors.lib is a mounted component/)
+      end
+
+      it 'refuses a nested reconfigure, and one while the root is booting' do
+        comp = app
+        comp.start!
+
+        expect do
+          comp.reconfigure('reactors') do |b|
+            b.declare('audit')
+            comp.reconfigure('reactors') { |_| }
+          end
+        end.to raise_error(described_class::LockedComponentError, /a reconfiguration is already running/)
+
+        booting = app
+        booting.component!('reactors.audit') do
+          build { |*| 'audit' }
+          start { |_v, _c| booting.reconfigure('reactors') { |_| } }
+        end
+        expect { booting.start! }
+          .to raise_error(described_class::LockedComponentError, /while the root is booting/)
+      end
+
+      it 'refuses once the root is torn down' do
+        comp = app
+        comp.start!
+        comp.teardown!
+
+        expect { comp.reconfigure('reactors') { |_b| } }
+          .to raise_error(described_class::TornDownError, /the component is torn down/)
+      end
+    end
+
+    it 'reconfigures an open tree as plain declaration, which then boots' do
+      comp = app(reactors: { 'audit' => 'audit' })
+      calls.clear
+
+      comp.reconfigure('reactors') { |b| reactor(b, 'metrics', 'metrics') }
+
+      expect(calls).to be_empty
+      expect(reactor_keys(comp)).to eq(%w[reactors reactors.metrics])
+
+      comp.start!(:boot)
+
+      expect(calls).to eq([[:prepare, 'metrics'], [:start, 'metrics#1']])
+      expect(comp['runner']).to eq(['metrics'])
+    end
+  end
   describe 'reading values' do
     it 'raises until the component is built' do
       comp = new_component
@@ -3253,6 +3651,48 @@ RSpec.describe Sourced::Component do
 
       expect(summary(events).last(2)).to eq(['components.failed db', 'root.failed'])
       expect(events.last.payload).to have_attributes(stage: :recycle, error_class: 'ArgumentError', error_message: 'boom')
+    end
+
+    it 'publishes reconfiguration events' do
+      comp = new_component
+      comp.declare('reactors.audit') { 'audit' }
+      comp.declare('reactors.old') { 'old' }
+      comp.start!
+      events = record(comp)
+
+      comp.reconfigure('reactors') do |b|
+        b.declare('audit')
+        b.declare('fresh') { 'fresh' }
+      end
+
+      expect(summary(events)).to eq([
+        'root.reconfiguring',
+        'components.declared reactors.fresh', 'components.implemented reactors.fresh',
+        'components.tearing_down reactors.old', 'components.torn_down reactors.old',
+        'components.removed reactors.old',
+        'root.recycling',
+        'components.preparing reactors.fresh', 'components.prepared reactors.fresh',
+        'components.building reactors.fresh', 'components.built reactors.fresh',
+        'components.starting reactors.fresh', 'components.started reactors.fresh',
+        'root.recycled',
+        'root.reconfigured'
+      ])
+      expect(events).to all(be_valid)
+      removed = events.find { |e| e.type == 'components.removed' }
+      expect(removed.payload).to have_attributes(key: 'reactors.old', remover: nil)
+    end
+
+    it 'publishes root.failed with the reconfigure stage' do
+      comp = new_component
+      comp.declare('reactors.audit') { 'audit' }
+      comp.start!
+      events = record(comp)
+
+      expect { comp.reconfigure('reactors') { |_b| raise ArgumentError, 'boom' } }
+        .to raise_error(ArgumentError, 'boom')
+
+      expect(summary(events)).to eq(['root.reconfiguring', 'root.failed'])
+      expect(events.last.payload).to have_attributes(stage: :reconfigure, error_class: 'ArgumentError')
     end
 
     it 'includes event details' do
