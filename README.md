@@ -553,6 +553,26 @@ App.start!
 MyLib::Dispatcher.new.store # => #<DBStore ...>, the app's override
 ```
 
+### `.__component_deps`
+
+Including an injector also defines `.__component_deps` on the class: the keys of every component injected
+into it, including the ones injected into its ancestors.
+
+```ruby
+class Foo
+  include App.inject('logger', 'repos.users' => 'customers')
+end
+
+Foo.__component_deps # => ["logger", "repos.users"]
+```
+
+- Keys are the ones components are **registered** under, never the names they're injected as (`customers` above).
+- Inherited dependencies are included, the superclass' first, each class' own in the order they were injected. A component injected twice under different names is listed once.
+- Keys are paths from the root of the component's tree, so they follow mounting. `MyLib::Dispatcher` above reports `["store"]` while the library is standalone, and `["my_lib.store"]` once the app mounts it at `my_lib`: the key the app would use to read it.
+- An alias (see `#alias`) is listed under its own key, not its target's.
+- A class defining its own `def self.__component_deps` keeps it: unlike the injected readers, this one is never overwritten.
+- `Sourced::Component::Injector.deps_for(klass)` returns the same list for any class or module, which is useful when an injector is included into a module rather than directly into a class: the module gets `.__component_deps`, but classes including it don't.
+
 ## Inspecting the tree
 
 ```ruby

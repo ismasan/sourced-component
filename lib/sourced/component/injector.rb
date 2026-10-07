@@ -11,16 +11,31 @@ module Sourced
     # Values are read from the nodes themselves, so a class injecting from a library's component
     # gets the overrides of the application that mounts it.
     class Injector < Module
-      attr_reader :names
+      # Extended into whatever includes an Injector, see #included
+      module ComponentDeps
+        # The keys of every component injected into this class, including inherited ones.
+        # See Injector.deps_for
+        def __component_deps = Injector.deps_for(self)
+      end
+
+      # The keys of every component injected into mod, as paths from the root of each component's tree,
+      # in injection order, with the ones injected into its ancestors first.
+      # Keys are the ones the components are registered under, not the names they're injected as.
+      def self.deps_for(mod)
+        mod.ancestors.grep(Injector).reverse.flat_map(&:paths).uniq
+      end
+
+      attr_reader :names, :nodes
 
       # nodes: { 'component.key' => <Component node> }
       # names: { 'component.key' => :kwarg_name }
       def initialize(nodes, names)
         super()
         @names = names.freeze
+        @nodes = names.keys.map { |key| nodes.fetch(key) }.freeze
 
         # Instance variable names are computed once, not on every #new
-        entries = names.map { |key, name| [nodes.fetch(key), name, :"@#{name}"] }.freeze
+        entries = @nodes.zip(names.values).map { |node, name| [node, name, :"@#{name}"] }.freeze
 
         initializer = Module.new do
           define_method(:initialize) do |*args, **kwargs, &block|
@@ -50,8 +65,16 @@ module Sourced
         define_singleton_method(:included) do |base|
           base.prepend(initializer)
           base.attr_reader(*names.values)
+          base.extend(ComponentDeps)
         end
       end
+
+      # The keys as passed to Component#inject, relative to the component they were injected from
+      def keys = names.keys
+
+      # The keys the injected components are registered under, as paths from the root of their tree.
+      # Computed on each call: a node's path changes when its root is mounted into another component.
+      def paths = nodes.map(&:path)
 
       def inspect = "#<#{self.class} #{names.map { |key, name| "#{key} => #{name}" }.join(', ')}>"
     end

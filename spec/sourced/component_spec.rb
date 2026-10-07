@@ -1077,6 +1077,101 @@ RSpec.describe Sourced::Component do
 
       expect([klass.new.logger, klass.new.app_logger]).to eq(['own logger', 'the logger'])
     end
+
+    describe '.__component_deps' do
+      it 'lists the keys components are registered under, not the names they are injected as' do
+        comp = injectable_component
+        klass = Class.new { include comp.inject('logger', 'sourced.store' => 'st') }
+
+        expect(klass.__component_deps).to eq(%w[logger sourced.store])
+      end
+
+      it 'composes multiple injections, in order' do
+        comp = injectable_component
+        klass = Class.new do
+          include comp.inject('sourced.store')
+          include comp.inject('logger')
+        end
+
+        expect(klass.__component_deps).to eq(%w[sourced.store logger])
+      end
+
+      it "includes inherited dependencies, with the superclass' first" do
+        comp = injectable_component
+        parent = Class.new { include comp.inject('logger') }
+        child = Class.new(parent) { include comp.inject('sourced.store') }
+        grandchild = Class.new(child)
+
+        expect(parent.__component_deps).to eq(%w[logger])
+        expect(child.__component_deps).to eq(%w[logger sourced.store])
+        expect(grandchild.__component_deps).to eq(%w[logger sourced.store])
+      end
+
+      it 'lists a component injected twice under different names once' do
+        comp = injectable_component
+        parent = Class.new { include comp.inject('logger') }
+        child = Class.new(parent) { include comp.inject('logger' => 'app_logger') }
+
+        expect(child.__component_deps).to eq(%w[logger])
+      end
+
+      it 'lists keys relative to the component as paths from its root' do
+        comp = injectable_component
+        klass = Class.new { include comp.node('sourced').inject('store') }
+
+        expect(klass.__component_deps).to eq(%w[sourced.store])
+      end
+
+      it "follows mounting, so a library's classes report the keys of the app that mounts it" do
+        lib = new_component
+        lib.declare('store', String) { 'lib store' }
+        klass = Class.new { include lib.inject('store') } # defined before the library is mounted
+
+        expect(klass.__component_deps).to eq(%w[store])
+
+        new_component.mount('my_lib', lib)
+
+        expect(klass.__component_deps).to eq(%w[my_lib.store])
+      end
+
+      it 'lists an alias under its own key, not its target' do
+        comp = injectable_component
+        comp.declare('store_alias', String)
+        comp.alias('store_alias', 'sourced.store')
+        klass = Class.new { include comp.inject('store_alias') }
+
+        expect(klass.__component_deps).to eq(%w[store_alias])
+      end
+
+      it 'keeps a class-level method the class defines itself' do
+        comp = injectable_component
+        klass = Class.new do
+          include comp.inject('logger')
+          def self.__component_deps = ['own deps']
+        end
+
+        expect(klass.__component_deps).to eq(['own deps'])
+      end
+
+      describe 'Injector.deps_for' do
+        it 'lists the dependencies of any class or module including an injector' do
+          comp = injectable_component
+          klass = Class.new { include comp.inject('logger') }
+          mod = Module.new { include comp.inject('sourced.store') }
+          including = Class.new { include mod }
+
+          expect(described_class::Injector.deps_for(klass)).to eq(%w[logger])
+          expect(described_class::Injector.deps_for(mod)).to eq(%w[sourced.store])
+          # A class including the module isn't extended, so it has no .__component_deps of its own
+          expect(described_class::Injector.deps_for(including)).to eq(%w[sourced.store])
+          expect(including).not_to respond_to(:__component_deps)
+        end
+
+        it 'is empty for a class with no injections' do
+          expect(described_class::Injector.deps_for(Class.new)).to eq([])
+        end
+      end
+    end
   end
 
   describe '#mount' do
