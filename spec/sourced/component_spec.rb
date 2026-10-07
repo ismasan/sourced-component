@@ -2750,6 +2750,50 @@ RSpec.describe Sourced::Component do
       expect(comp['reactors.audit2']).to eq('audit2#1')
     end
 
+    it 'stops at prepared when the root is only prepared, building nothing' do
+      comp = app
+      comp.prepare!
+      calls.clear
+
+      comp.reconfigure('reactors') do |b|
+        %w[audit billing.invoices billing.payments].each { |k| b.declare(k) }
+        reactor(b, 'late', 'late')
+      end
+
+      # a tree forked after #prepare! holds no values: its children build and start for themselves
+      expect(calls).to eq([[:prepare, 'late']])
+      expect(statuses(comp)).to include('reactors.audit' => :prepared, 'reactors.late' => :prepared)
+      expect(comp.node('reactors.audit').value).to be_nil
+      expect(comp.node('reactors.late').value).to be_nil
+      expect(comp.boot_status).to eq(:prepared)
+
+      # and #build!/#start! then pick the new component up, as they would in a forked process
+      comp.start!(:child)
+
+      expect(comp['reactors.late']).to eq('late#1')
+      expect(statuses(comp).values.uniq - [:open]).to eq([:started])
+      expect(comp['runner']).to eq(%w[audit late])
+    end
+
+    it 'brings a new component up to where the root is, and no further when deferred' do
+      { prepare!: :prepared, build!: :built, start!: :started }.each do |boot, status|
+        comp = app
+        comp.public_send(boot)
+
+        comp.reconfigure('reactors') do |b|
+          %w[audit billing.invoices billing.payments].each { |k| b.declare(k) }
+          reactor(b, 'plain', 'plain')
+          reactor(b, 'later', 'later')
+          b.defer('later')
+        end
+
+        # deferring lowers the ceiling to :built, it never raises it above the root's own state
+        expect(comp.node('reactors.plain').status).to eq(status)
+        expect(comp.node('reactors.later').status).to eq(status == :started ? :built : status)
+        expect(comp.node('reactors.later')).to be_deferred
+      end
+    end
+
     it 'tears down and removes a component the block did not declare' do
       comp = app
       klass = Class.new { include comp.inject('reactors.billing.payments' => 'payments') }

@@ -1079,11 +1079,12 @@ module Sourced
       end
       return unless booted
 
-      # Nothing new has a status to go back to, so it comes up to wherever the root is
-      coming_up = root.boot_status == :started ? :started : :built
+      # Nothing new has a status to go back to, so it comes up to where the root is: :prepared,
+      # :built or :started. Deferring lowers that ceiling to :built, never raises it
+      coming_up = root.boot_status
       reconf.newly_components.each do |n|
         n.hold! if n.deferred?
-        n.recycle_to!(n.deferred? ? :built : coming_up)
+        n.recycle_to!(n.deferred? && coming_up == :started ? :built : coming_up)
       end
       affected = reconf.affected
       recycle_nodes!(affected, context) if affected.any?
@@ -1127,7 +1128,13 @@ module Sourced
 
         # And up again, in dependency order, one stage at a time, as the root boots
         ordered.each { |n| instrument_component(n, :prepare) { n.prepare_node! } }
-        ordered.each { |n| instrument_component(n, :build) { n.build_node! } }
+        ordered.each do |n|
+          # A tree that's only prepared stops there: its values are built by #build!, which is what
+          # a process forked after #prepare! runs for itself
+          next if n.recycle_to == :prepared
+
+          instrument_component(n, :build) { n.build_node! }
+        end
         ordered.each do |n|
           next unless n.recycle_to == :started && n.dep_nodes.all? { |dep| dep.started? }
 

@@ -456,7 +456,7 @@ end
 
 ### Signal handlers
 
-The lifecycle methods, and anything else that takes the root's lock (declaring, implementing and mounting components, `#graph`, `#tree`), can't be called from a `trap` block: Ruby doesn't allow locking a `Monitor` in trap context, so they raise `ThreadError: can't be called from trap context` and nothing is torn down. Reading values doesn't take the lock.
+The lifecycle methods, and anything else that takes the root's lock (declaring, implementing and mounting components, `#recycle_component!` and friends, `#reconfigure`, `#graph`, `#tree`), can't be called from a `trap` block: Ruby doesn't allow locking a `Monitor` in trap context, so they raise `ThreadError: can't be called from trap context` and nothing is torn down. Reading values doesn't take the lock.
 
 Instead, have the trap wake up the main thread, and tear down from there, as in the example above:
 
@@ -469,6 +469,27 @@ trap('TERM') { Thread.main.raise(Interrupt) }
 ```
 
 Any other way out of trap context works too, ex. pushing to a `Queue` or writing to a self-pipe that a thread waits on.
+
+### Forked processes
+
+`#prepare!` resolves dependencies, computes the boot order and runs the `prepare` hooks, but builds no values. That makes it the point to fork from: the parent holds no connections, sockets or threads, and each child builds and starts its own.
+
+```ruby
+App.prepare!                 # once, in the parent: requires, validation, dependency order
+
+workers.times do
+  fork do
+    App.build!
+    App.start!(task)         # this process' own values, from here on
+    ...
+  end
+end
+```
+
+- **Don't fork a built or started tree.** Threads don't survive `fork`, so a long-running component would report `:started` in the child with nothing running, and file descriptors *do* survive, shared: the child and the parent would write to the same connection. Tearing down or recycling in the child would then run `stop` and `teardown` hooks on resources the parent still owns.
+- **Fork from the main thread**, with no lifecycle call in flight. The root's `Monitor` is copied as-is, so forking while another thread holds it leaves the child's copy locked forever.
+- **A reconfigured branch comes up to where the tree already is**, and no further: on a prepared tree its new components are prepared but not built, so children forked afterwards build them for themselves. Deferring lowers that ceiling to `:built`, it never raises it.
+- **Everything else is per-process.** `#recycle_component!` and `#reconfigure` act on one process' tree, in memory, with no coordination between them: a file watcher has to run in each process that should react to it, as `ActiveSupport::FileUpdateChecker` and Zeitwerk do. Driving one from a signal has the `trap` restriction above, since it takes the root's lock.
 
 ### Errors while starting and tearing down
 
