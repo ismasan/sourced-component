@@ -724,16 +724,19 @@ module Sourced
       self
     end
 
-    # A started node runs its stop hooks first. Teardown hooks run even if those raise
+    # A started node runs its stop hooks first. Teardown hooks run even if those raise, and the node
+    # is torn down whatever they raise (incl. Interrupt): its hooks have had their turn either way,
+    # and running them again would tear the same value down twice
     protected def teardown_node!
       return self unless pending?(:teardown)
 
+      was_started = started?
+      @status = :torn_down
       begin
-        implementation.stop(value) if started?
+        implementation.stop(value) if was_started
       ensure
         implementation.teardown(value)
       end
-      @status = :torn_down
       self
     end
 
@@ -833,7 +836,7 @@ module Sourced
         next if !include_built && n.status == :built
 
         instrument_component(n, :teardown) { n.teardown_node! }
-      rescue StandardError => e
+      rescue Exception => e # rubocop:disable Lint/RescueException -- any error (incl. Interrupt) must still tear the rest down. The first is re-raised
         errors << e
       end
     end

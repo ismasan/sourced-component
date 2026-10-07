@@ -433,7 +433,7 @@ Any other way out of trap context works too, ex. pushing to a `Queue` or writing
 ### Errors while starting and tearing down
 
 - If a `start` hook raises, the components already started are torn down in reverse order, the component is left `:torn_down`, and the error is re-raised.
-- If `teardown` hooks raise, every component is still torn down, and the first error is re-raised.
+- If `stop` or `teardown` hooks raise, every component is still torn down, exactly once, and the first error is re-raised. This holds for anything they raise, `Interrupt` included: a signal handler interrupting the shutdown can't leave part of the tree running, and the root still ends `:torn_down`. A component whose hooks already ran is never torn down again, so `#teardown!` is safe to call once more after one failed.
 
 ## Mounting components
 

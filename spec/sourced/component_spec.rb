@@ -1735,6 +1735,66 @@ RSpec.describe Sourced::Component do
         expect(calls).to eq(%i[c b a])
         expect(comp.boot_status).to eq(:torn_down)
       end
+
+      it 'tears down every node when a hook raises something that is not a StandardError' do
+        calls = []
+        comp = new_component
+        %w[a b c].each { |key| comp.declare(key) }
+        comp.component!('a') { build { 1 }; stop { calls << :stop_a }; teardown { calls << :a } }
+        comp.component!('b', ['a']) do
+          build { 2 }
+          stop { calls << :stop_b; raise Interrupt }
+          teardown { calls << :b }
+        end
+        comp.component!('c', ['b']) { build { 3 }; teardown { calls << :c } }
+        comp.start!
+
+        # the Interrupt a signal handler raises must not leave the rest of the tree running
+        expect { comp.teardown! }.to raise_error(Interrupt)
+
+        expect(calls).to eq(%i[c stop_b b stop_a a])
+        expect(comp.boot_status).to eq(:torn_down)
+        expect(%w[a b c].map { |k| comp.node(k).status }).to eq(%i[torn_down torn_down torn_down])
+      end
+
+      it 'never tears a node down twice, even if its hooks raised' do
+        calls = []
+        comp = new_component
+        comp.declare('a')
+        comp.component!('a') do
+          build { 1 }
+          stop { calls << :stop; raise Interrupt }
+          teardown { calls << :teardown }
+        end
+        comp.start!
+        expect { comp.teardown! }.to raise_error(Interrupt)
+        expect(calls).to eq(%i[stop teardown])
+
+        expect(comp.teardown!).to be(comp)
+
+        expect(calls).to eq(%i[stop teardown])
+        expect(comp.node('a').status).to eq(:torn_down)
+      end
+
+      it 'tears the tree down, and re-raises the original error, when a rollback hook raises an Interrupt' do
+        calls = []
+        comp = new_component
+        %w[a b].each { |key| comp.declare(key) }
+        comp.component!('a') do
+          build { 1 }
+          start { calls << :start_a }
+          stop { calls << :stop_a; raise Interrupt }
+          teardown { calls << :teardown_a }
+        end
+        comp.component!('b', ['a']) { build { 2 }; start { raise 'boom' } }
+
+        expect { comp.start! }.to raise_error(RuntimeError, 'boom')
+
+        expect(calls).to eq(%i[start_a stop_a teardown_a])
+        expect(comp.boot_status).to eq(:torn_down)
+        expect(comp.node('a').status).to eq(:torn_down)
+        expect { comp.start! }.to raise_error(described_class::TornDownError)
+      end
     end
   end
 
