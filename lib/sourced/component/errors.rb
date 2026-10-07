@@ -14,6 +14,7 @@ module Sourced
     NotBuiltError = Class.new(ComponentError)
     TornDownError = Class.new(ComponentError)
     NotStartedError = Class.new(ComponentError)
+    RemovedComponentError = Class.new(ComponentError)
     InjectionError = Class.new(ComponentError)
   end
 end

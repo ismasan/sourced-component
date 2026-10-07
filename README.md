@@ -414,9 +414,49 @@ App.recycle_component!('store')   # tears down dispatcher, then store
 - **The root must be built, or started.** Before that there's nothing to recycle, and it raises `NotBuiltError`; once the root is torn down, `TornDownError`. Recycling while the root is booting raises `LockedComponentError`: mid-`#start!` there's no settled status to go back to.
 - **No code is reloaded.** Recycling re-runs the hooks a component was implemented with; it doesn't re-implement it. The tree is locked once prepared, so a class captured in a provider (`App.component!('store', Store)`) stays captured — only a block that resolves the constant when it builds (`build { Store.new }`) picks up a reloaded class.
 
+### Re-configuring a booted tree
+
+`#reconfigure(key, context = Thread.current)` re-declares one branch of the tree from scratch while it's running. The block declares the branch's new contents, and whatever it doesn't declare is removed. This is for file watchers: rescan a directory, re-register every file, and removal is a consequence of not declaring a key rather than an operation of its own.
+
+```ruby
+App.reconfigure('reactors') do |reactors|
+  files.each { |f| reactors.declare(f.key) }                        # idempotent: these are kept
+  changed.each { |f| reactors.component!(f.key, f.deps, &f.hooks) } # these recycle
+end
+```
+
+| In the block | Before | Result |
+| --- | --- | --- |
+| declared, not re-implemented | existed | kept, untouched: same value and status |
+| declared and re-implemented | existed | recycled |
+| declared with another type | existed | recycled |
+| declared | new | prepared, built, and started if the root is started |
+| not declared | existed | torn down and removed |
+
+- **Re-declaring is idempotent**, so a component whose declaration didn't change keeps its value and status, and runs no hooks. Only the ones the block re-implements, re-types or declares for the first time are recycled (see above), along with everything depending on them.
+- **Components elsewhere in the tree are recycled if their dependencies changed**, which is how a `config('runner', ['reactors.*'])` picks up an added or removed reactor: its memoized value listed the old ones.
+- **Nothing runs any hooks until the whole new declaration set has been validated.** A block that raises, a missing dependency, a cycle, a declaration with no implementation, or dropping a component something still depends on: each leaves the tree exactly as it was, still running. A broken file save is the normal case in a dev loop, so recovering from it is the point.
+- **Components stopped by key stay stopped**, and deferred ones stay deferred. Re-declaring doesn't start anything that wasn't running.
+- **Keys are relative to the branch**, and the block declares through the component `#reconfigure` was called on, so ownership comes out exactly as plain declaration would. The branch must be a namespace, and the tree is locked for anything outside the block as usual.
+- **Removed components are `:removed`**, which is terminal. They're gone from `#index`, `#tree` and `#graph`, so reading them by key raises `UndeclaredComponentError` — and anything still holding the node itself, ex. a class that injected it, raises `RemovedComponentError` rather than reading a dead value.
+- **Nested keys work the same**, since dotted keys build the tree. A namespace left with nothing under it is removed too, pruned bottom-up: dropping `billing.deep.x` leaves neither `deep` nor `billing` behind.
+- **A component that keeps declared children reverts to a namespace** instead of being removed. That's the `billing.rb` → `billing/` refactor: it's torn down and loses its implementation, but stays as the parent of its new children. Collapsing it back the other way re-implements it and removes the children.
+- **An open tree** reconfigures as plain declaration: nothing is built yet, so nothing is torn down or recycled, and `#prepare!` validates the whole set when it boots.
+- **Events:** `root.reconfiguring` and `root.reconfigured` wrap the operation, with `components.removed` for each removal and the usual stage and recycling events in between.
+- **No code is reloaded**, as with recycling: the block supplies the new implementations, and a class captured in a provider is only re-captured if the block passes it again.
+
+```ruby
+App.reconfigure('reactors') do |reactors|
+  reactors.declare('audit')              # kept, still running
+  reactors.declare('billing.invoices')   # kept
+  reactors.component!('billing.invoices', [], NewImpl)  # ... but re-implemented, so recycled
+  # 'billing.payments' isn't declared: torn down and removed
+end
+```
+
 ### Signal handlers
 
-The lifecycle methods, and anything else that takes the root's lock (declaring, implementing and mounting components, `#graph`, `#tree`), can't be called from a `trap` block: Ruby doesn't allow locking a `Monitor` in trap context, so they raise `ThreadError: can't be called from trap context` and nothing is torn down. Reading values doesn't take the lock.
+The lifecycle methods, and anything else that takes the root's lock (declaring, implementing and mounting components, `#recycle_component!` and friends, `#reconfigure`, `#graph`, `#tree`), can't be called from a `trap` block: Ruby doesn't allow locking a `Monitor` in trap context, so they raise `ThreadError: can't be called from trap context` and nothing is torn down. Reading values doesn't take the lock.
 
 Instead, have the trap wake up the main thread, and tear down from there, as in the example above:
 
@@ -429,6 +469,27 @@ trap('TERM') { Thread.main.raise(Interrupt) }
 ```
 
 Any other way out of trap context works too, ex. pushing to a `Queue` or writing to a self-pipe that a thread waits on.
+
+### Forked processes
+
+`#prepare!` resolves dependencies, computes the boot order and runs the `prepare` hooks, but builds no values. That makes it the point to fork from: the parent holds no connections, sockets or threads, and each child builds and starts its own.
+
+```ruby
+App.prepare!                 # once, in the parent: requires, validation, dependency order
+
+workers.times do
+  fork do
+    App.build!
+    App.start!(task)         # this process' own values, from here on
+    ...
+  end
+end
+```
+
+- **Don't fork a built or started tree.** Threads don't survive `fork`, so a long-running component would report `:started` in the child with nothing running, and file descriptors *do* survive, shared: the child and the parent would write to the same connection. Tearing down or recycling in the child would then run `stop` and `teardown` hooks on resources the parent still owns.
+- **Fork from the main thread**, with no lifecycle call in flight. The root's `Monitor` is copied as-is, so forking while another thread holds it leaves the child's copy locked forever.
+- **A reconfigured branch comes up to where the tree already is**, and no further: on a prepared tree its new components are prepared but not built, so children forked afterwards build them for themselves. Deferring lowers that ceiling to `:built`, it never raises it.
+- **Everything else is per-process.** `#recycle_component!` and `#reconfigure` act on one process' tree, in memory, with no coordination between them: a file watcher has to run in each process that should react to it, as `ActiveSupport::FileUpdateChecker` and Zeitwerk do. Driving one from a signal has the `trap` restriction above, since it takes the root's lock.
 
 ### Errors while starting and tearing down
 
@@ -622,8 +683,10 @@ node.root            # => App
 node.owner           # => the component that declared it
 node.type            # => the declared type
 node.implementation  # => deps, mode (:singleton, :dynamic or :alias) and the implementing component
+node.dep_nodes       # => the components it depends on, wildcards included. See #graph for keys
 node.children        # => { segment => Component }
 node.namespace?      # => no type and no implementation
+node.removed?        # => whether a #reconfigure dropped it from the tree
 ```
 
 ### `#tree`
@@ -785,11 +848,13 @@ end
 | `components.stopping` / `components.stopped` | around a component's `stop` hooks, when stopped by key (on `#teardown!`, they're part of tearing down) | `key`, and `duration` when finished |
 | `components.tearing_down` / `components.torn_down` | around a component's `teardown` hooks | `key`, and `duration` when finished |
 | `components.deferred` | `#defer` | `key`, `deferrer` (the full path of the component that deferred it, `nil` for the root) |
+| `components.removed` | a component `#reconfigure` dropped from the tree | `key`, `remover` (the full path of the component that reconfigured, `nil` for the root) |
 | `components.failed` | a component's hook (or type check) raised | `key`, `stage`, `error_class`, `error_message`, `backtrace` |
 | `root.preparing` / `root.prepared` | around `#prepare!` | `duration` when finished |
 | `root.building` / `root.built` | around `#build!` | `duration` when finished |
 | `root.starting` / `root.started` | around `#start!` | `duration` when finished |
 | `root.recycling` / `root.recycled` | around `#recycle_component!`, `#recycle_components!` and `#recycle!` | `duration` when finished |
+| `root.reconfiguring` / `root.reconfigured` | around `#reconfigure` | `duration` when finished |
 | `root.tearing_down` / `root.torn_down` | around `#teardown!` | `duration` when finished |
 | `root.failed` | a lifecycle step raised | `stage`, `error_class`, `error_message`, `backtrace` |
 
@@ -797,7 +862,7 @@ end
 - **`key`** is the component's full path from the root, ex. `sourced.db`.
 - **`deps`** are relative to the `implementer`, the full path of the component that implemented the component (`nil` for the root).
 - **`duration`** is in seconds, measured with a monotonic clock.
-- **`stage`** is one of `:prepare`, `:build`, `:start`, `:stop`, `:teardown` or `:recycle`.
+- **`stage`** is one of `:prepare`, `:build`, `:start`, `:stop`, `:teardown`, `:recycle` or `:reconfigure`.
 - **Errors are described, not attached:** `error_class`, `error_message` and `backtrace` are strings, so events stay serializable (see below). The error itself is re-raised to the caller of the lifecycle method.
 
 A few rules:
@@ -887,7 +952,7 @@ Plumb::ParseError: user: {age: "Must be a Integer"}
 | --- | --- |
 | `DeclarationOverrideError` | declaring or mounting on a key that's already declared |
 | `OwnershipError` | declaring or mounting under nodes owned by another component |
-| `LockedComponentError` | changing the tree after it's prepared, mounting a component that isn't open, or recycling while the root is booting |
+| `LockedComponentError` | changing the tree after it's prepared, mounting a component that isn't open, recycling or reconfiguring while the root is booting, or a nested `#reconfigure` |
 | `SubcomponentError` | booting a mounted component, or mounting a component that's already mounted |
 | `UndeclaredComponentError` | implementing or reading an undeclared key, or reading a namespace |
 | `UnimplementedComponentError` | preparing with declared (or deferred) components that have no implementation |
@@ -896,6 +961,7 @@ Plumb::ParseError: user: {age: "Must be a Integer"}
 | `NotBuiltError` | reading values before the component is built, reading one that was recycled away, or recycling before the root is built |
 | `TornDownError` | starting a component that's torn down, or starting, stopping or recycling a component by key once its root is torn down |
 | `NotStartedError` | starting or stopping a component by key before its root is started |
+| `RemovedComponentError` | reading a component that `#reconfigure` removed from the tree |
 | `InjectionError` | including an injector in a class that already has a method with an injected name, or already injects it |
 
 ## Thread safety

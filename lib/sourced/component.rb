@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'monitor'
+require 'set'
 require 'tsort'
 require 'plumb'
 require_relative 'component/version'
@@ -14,6 +15,7 @@ require_relative 'component/graph'
 require_relative 'component/events'
 require_relative 'component/notifier'
 require_relative 'component/tree'
+require_relative 'component/reconfiguration'
 
 module Sourced
   # A tree of components. Every node is a Component: it can declare a type, be implemented with
@@ -31,8 +33,9 @@ module Sourced
 
     # Lifecycle statuses, in order. Shared by the root (boot status) and every node.
     # Only nodes are ever :stopped: a started node stopped by key (see #stop_component!),
-    # which can be started again.
-    STATUSES = %i[open prepared built started stopped torn_down].freeze
+    # which can be started again. Only nodes are ever :removed either: a component a
+    # reconfiguration dropped from the tree (see #reconfigure), which is terminal.
+    STATUSES = %i[open prepared built started stopped torn_down removed].freeze
 
     # What #mount takes: anything that returns a Component from #to_component
     MountableInterface = Plumb::Types::Interface[:to_component]
@@ -58,6 +61,7 @@ module Sourced
       @deferred = false # skipped by the root's #start!, see #defer
       @held = false     # not started with the tree or its dependencies: deferred, or stopped by key
       @recycle_to = nil # the status to come back to while recycling, see #recycle_component!
+      @reconfiguration = nil # the reconfiguration in progress, on the root only. See #reconfigure
       @deps = [].freeze      # resolved deps: a node, or { segment => node } for a wildcard
       @dep_nodes = [].freeze # every node in @deps, for sorting
       @children = {}
@@ -88,7 +92,17 @@ module Sourced
 
     # Whether the root's #start! skips it (see #defer)
     def deferred? = @deferred
+    # Whether the tree is past :open. #mount asks this of the component being mounted
     def locked? = root.boot_status != :open
+
+    # Whether a reconfiguration's block is running. Only ever true on the root
+    def reconfiguring? = !@reconfiguration.nil?
+
+    # Whether the tree refuses declarations: locked, unless a #reconfigure block is open
+    private def declarations_locked? = locked? && !root.reconfiguring?
+
+    # The Reconfiguration in progress, which records what its block declares
+    protected def reconfiguration = @reconfiguration
 
     def inspect
       details = namespace? ? '(namespace)' : "#{type_name} (#{[implementation&.mode || 'not implemented', status, ('deferred' if deferred?)].compact.join(', ')})"
@@ -100,20 +114,28 @@ module Sourced
     #   comp.declare('sourced.db.logger', Logger) { Logger.new(STDOUT) }
     def declare(ckey, type = T::Any, &default)
       synchronize do
-        raise LockedComponentError, "can't declare #{ckey} in a locked component" if locked?
+        raise LockedComponentError, "can't declare #{ckey} in a locked component" if declarations_locked?
 
+        reconf = root.reconfiguration
         branch, leaf = walk(ckey)
         node = branch.children[leaf]
         if node.nil?
           node = branch.attach(leaf, Component.new(owner: self, type:))
         elsif !node.owner.equal?(self)
           raise OwnershipError, ownership_message(node)
-        elsif !node.implicit?
+        elsif !node.implicit? && reconf.nil?
           raise DeclarationOverrideError, "#{node.path} is already declared"
         else
+          # Idempotent while reconfiguring: an unchanged component keeps its value and status,
+          # and a changed type marks it to be recycled
+          was = node.implicit? ? nil : node.type_name
           node.declare_type!(type) # an implicit namespace this component created, now with a type
+          reconf&.changed!(node) if was && was != node.type_name
         end
-        emit(Events::ComponentDeclared, key: node.path, type_name: node.type_name)
+        new_to_the_tree = reconf.nil? || reconf.new?(node)
+        reconf&.declared!(node)
+        # While reconfiguring, only new components are announced: re-declaring the rest is noise
+        emit(Events::ComponentDeclared, key: node.path, type_name: node.type_name) if new_to_the_tree
 
         implement_node(node, Implementation.from_block([], implementer: self, mode: :singleton) { build(&default) }) if default
         self
@@ -181,7 +203,7 @@ module Sourced
     # and the alias follows it like any other dependent.
     def alias(ckey, target)
       synchronize do
-        raise LockedComponentError, "can't implement #{ckey} in a locked component" if locked?
+        raise LockedComponentError, "can't implement #{ckey} in a locked component" if declarations_locked?
 
         implement_node(node(ckey), Implementation.alias(target, implementer: self))
         self
@@ -204,7 +226,7 @@ module Sourced
       end
 
       synchronize do
-        raise LockedComponentError, "can't implement ENV components in a locked component" if locked?
+        raise LockedComponentError, "can't implement ENV components in a locked component" if declarations_locked?
 
         builders = mapping.map do |source, ckey|
           target = node(ckey)
@@ -228,7 +250,7 @@ module Sourced
     # implemented again. Any component can defer a node below it, like implementing one.
     def defer(ckey)
       synchronize do
-        raise LockedComponentError, "can't defer #{ckey} in a locked component" if locked?
+        raise LockedComponentError, "can't defer #{ckey} in a locked component" if declarations_locked?
 
         target = node(ckey)
         target.defer!
@@ -272,7 +294,7 @@ module Sourced
       raise ArgumentError, "#{mountable.inspect}.to_component must return a Component, got #{sub.inspect}" unless sub.is_a?(Component)
 
       synchronize do
-        raise LockedComponentError, "can't mount #{ckey} in a locked component" if locked?
+        raise LockedComponentError, "can't mount #{ckey} in a locked component" if declarations_locked?
         raise SubcomponentError, "#{sub.inspect} is already mounted in another component" unless sub.root?
         raise SubcomponentError, "can't mount a component into its own tree" if sub.equal?(root)
         raise LockedComponentError, "can't mount a #{sub.boot_status} component: it must be open" if sub.locked?
@@ -301,6 +323,7 @@ module Sourced
     def [](ckey) = node(ckey).read
 
     def read
+      raise RemovedComponentError, "#{path} was removed from the tree" if removed?
       raise NotBuiltError, 'component is not built yet' unless root.readable?
       raise UndeclaredComponentError, "#{path} is a namespace, not a component" unless implementation
 
@@ -318,6 +341,9 @@ module Sourced
 
         instrument_root(:prepare) do
           @order = resolve_order
+          # Holds start from the declarations, on a first boot only: #reresolve! must leave the ones
+          # #stop_component! set alone, or a reconfiguration would start a stopped component again
+          @order.each { |n| n.release!; n.hold! if n.deferred? }
           @order.each { |n| instrument_component(n, :prepare) { n.prepare_node! } }
           @boot_status = :prepared
         end
@@ -512,6 +538,46 @@ module Sourced
       end
     end
 
+    # ---- Re-configuring a booted tree ----------------------------------------------
+
+    # Re-declare one branch of a booted tree, by key relative to this component. The block declares
+    # the branch's new contents, and whatever it doesn't declare is removed.
+    # Re-declaring a key is idempotent, so a component that didn't change keeps its value and status.
+    # Re-implementing it, re-typing it, or declaring a new key recycles it (see #recycle_component!),
+    # along with its dependents and anything whose resolved deps changed, ex. a wildcard over the branch.
+    # Nothing runs any hooks until the new set is validated, so a block that raises, or a set with a
+    # missing dep or a cycle, leaves the tree as it was. Holds survive: stopped stays stopped.
+    #   app.reconfigure('reactors') do |reactors|
+    #     files.each { |f| reactors.declare(f.key) }
+    #     changed.each { |f| reactors.component!(f.key, f.deps, &f.implementation) }
+    #   end
+    def reconfigure(ckey, context = Thread.current, &block)
+      raise ArgumentError, "reconfigure #{ckey}: a block must declare the branch's contents" unless block
+
+      synchronize do
+        branch = reconfigurable_branch(ckey)
+        reconf = Reconfiguration.new(branch, self)
+        root.reconfiguring!(reconf)
+
+        begin
+          instrument_root(:reconfigure) do
+            reconf.snapshot!
+            plan = begin
+              block.call(reconf.branch_handle)
+              validate_reconfiguration!(reconf)
+            rescue Exception # rubocop:disable Lint/RescueException -- nothing has run yet: put the tree back, whatever it was. Always re-raised
+              reconf.rollback!
+              raise
+            end
+            commit_reconfiguration!(reconf, plan, context)
+          end
+        ensure
+          root.reconfiguring!(nil)
+        end
+        self
+      end
+    end
+
     # A Component::Graph describing the components under this component, by full path from the root.
     # Components are listed in dependency order once the tree is prepared, and in declaration order before that.
     # Namespaces without an implementation are left out.
@@ -568,7 +634,7 @@ module Sourced
         type:,
         type_name:,
         namespace: namespace?,
-        mounted: !root? && owner.equal?(self),
+        mounted: mounted?,
         implemented: !implementation.nil?,
         mode: implementation&.mode,
         status:,
@@ -589,17 +655,47 @@ module Sourced
 
     # ---- Node internals -------------------------------------------------------------
 
+    # The nodes this one depends on, resolved on #prepare!, wildcards included. See #graph for keys
+    def dep_nodes = @dep_nodes
+
+    # Every node in dependency order, or nil before #prepare!. #ordered_nodes is the checked version
+    def order = @order
+
+    # Whether a #reconfigure dropped this node. Terminal: reading it raises RemovedComponentError
+    def removed? = status == :removed
+
     protected def readable? = @readable
     protected def starting? = @starting
     protected def lock = @lock
-    protected def dep_nodes = @dep_nodes
-    protected def order = @order
 
     private def synchronize(&) = root.lock.synchronize(&)
 
     protected def declare_type!(type)
       @implicit = false
       @type = Plumb::Composable.wrap(type)
+    end
+
+    # Back to an implicit namespace: a dropped component that still has children (see #reconfigure).
+    # Returns the implementation it had, to tear it down with, and keeps its value until then.
+    # Clearing it before the order is resolved leaves it out, and fails validation for its dependents
+    protected def undeclare_type!
+      @implicit = true
+      @type = Plumb::Types::Any
+      @deps = [].freeze
+      @dep_nodes = [].freeze
+      @implementation.tap { @implementation = nil }
+    end
+
+    # Run a reverted component's hooks with the implementation it had, then leave it a bare namespace
+    protected def teardown_reverted!(implementation)
+      return self unless pending?(:teardown)
+
+      begin
+        implementation.stop(value) if started?
+      ensure
+        implementation.teardown(value)
+      end
+      recycle_node!
     end
 
     protected def implement!(implementation)
@@ -611,6 +707,41 @@ module Sourced
     protected def hold! = @held = true
     protected def release! = @held = false
     protected def started? = status == :started
+
+    # A component mounted into another tree: it owns itself, and isn't the root of its own
+    protected def mounted? = !root? && owner.equal?(self)
+
+    # ---- Reconfiguration internals (see #reconfigure) -------------------------------
+
+    # Public because Component::Reconfiguration is a collaborator, not another Component
+
+    def reconfiguring!(reconf) = @reconfiguration = reconf
+    def restore_order!(order) = @order = order
+
+    # Re-resolve every node's deps and the order, leaving holds alone. Raises if the new set is invalid
+    def reresolve! = resolve_order
+
+    # Everything a reconfiguration can change about this node, as a frozen
+    # Reconfiguration::NodeState. #children and #index are the node's own mutable hashes, so they're
+    # copied; everything else is frozen, or a reference it has to keep as it is — its value above all
+    def capture_state
+      Reconfiguration::NodeState.new(
+        implementation:, type:, implicit: implicit?, deps:, dep_nodes:, deferred: deferred?,
+        held: held?, status:, value:, recycle_to:, children: children.dup, index: index.dup
+      )
+    end
+
+    # Every member, so a new one can't be captured and then forgotten on the way back
+    def restore_state!(state)
+      state.to_h.each { |member, value| send(:"#{member}=", value) }
+      self
+    end
+
+    # Only #capture_state and #restore_state! use these: a reconfiguration rolling back is the one
+    # thing that writes a node's state wholesale
+    private attr_reader :deps
+    private attr_writer :implementation, :type, :implicit, :deps, :dep_nodes, :deferred, :held,
+                        :status, :value, :recycle_to, :children, :index
 
     # The status a recycle is bringing this node back to, remembered before anything is torn down.
     # A recycle that raises leaves it set, so a retry restores what the first one meant to: the
@@ -656,6 +787,22 @@ module Sourced
     protected def index!(ckey, node)
       @index[ckey] = node
       parent&.index!("#{key}.#{ckey}", node)
+    end
+
+    # The inverse of #index!: drop a descendant here and in every ancestor
+    protected def unindex!(ckey)
+      @index.delete(ckey)
+      parent&.unindex!("#{key}.#{ckey}")
+    end
+
+    # Drop a child and its descendants from this node's children, and from every index
+    protected def detach!(segment)
+      child = @children.delete(segment)
+      return nil unless child
+
+      child.index.each_key { |sub_key| unindex!("#{segment}.#{sub_key}") }
+      unindex!(segment)
+      child
     end
 
     # Resolve deps through the implementer's index. Called on #prepare!, so declaration order doesn't matter.
@@ -750,11 +897,20 @@ module Sourced
     end
 
     # Whether the node has been built. A torn down node keeps its value, which stays readable;
-    # only recycling drops it, back to :open
-    protected def built? = !%i[open prepared].include?(status)
+    # recycling drops it, back to :open, and removing it drops it for good
+    protected def built? = !%i[open prepared removed].include?(status)
+
+    # Drop the value and mark the node removed, once torn down: anything still holding it (an
+    # Injector, say) then fails loudly instead of reading a dead value. Terminal
+    protected def remove_node!
+      @value = nil
+      @status = :removed
+      self
+    end
 
     # Without the readable check: deps are read while the component is building, in dependency order
     protected def current_value
+      raise RemovedComponentError, "#{path} was removed from the tree" if removed?
       raise NotBuiltError, "#{path} is not built: it was torn down or recycled" if memoized? && !built?
 
       memoized? ? value : build_value
@@ -813,11 +969,7 @@ module Sourced
         raise UnimplementedComponentError, "components are deferred but not implemented: #{deferred_namespaces.map(&:path).join(', ')}"
       end
 
-      nodes.each do |n|
-        n.resolve_deps!
-        n.release!
-        n.hold! if n.deferred?
-      end
+      nodes.each { |n| n.resolve_deps! }
 
       each_node = ->(&b) { nodes.each(&b) }
       each_child = ->(n, &b) { n.dep_nodes.each(&b) }
@@ -871,6 +1023,69 @@ module Sourced
       target
     end
 
+    # A branch to reconfigure: a namespace, under a tree that isn't booting or torn down
+    private def reconfigurable_branch(ckey)
+      branch = node(ckey)
+      raise LockedComponentError, "can't reconfigure #{branch.path}: a reconfiguration is already running" if root.reconfiguring?
+      raise TornDownError, "can't reconfigure #{branch.path}: the component is torn down" if root.boot_status == :torn_down
+      if root.starting?
+        raise LockedComponentError, "can't reconfigure #{branch.path} while the root is booting"
+      end
+      unless branch.namespace?
+        raise UndeclaredComponentError, "#{branch.path} is a component, not a namespace: reconfigure the branch above it"
+      end
+
+      mounted = [branch, *branch.index.values].find { |n| n.mounted? }
+      raise SubcomponentError, "can't reconfigure #{branch.path}: #{mounted.path} is a mounted component" if mounted
+
+      branch
+    end
+
+    # Apply the new set structurally and re-resolve, before any hooks run: raises what a first boot
+    # would if it's invalid, with nothing torn down yet
+    private def validate_reconfiguration!(reconf)
+      reverting = reconf.reverting
+      removing = reconf.removing
+
+      # Each reverted component hands its implementation back, to tear down once validation passes
+      reverted = reverting.to_h { |n| [n, n.undeclare_type!] }
+      removing.each { |n| n.parent.detach!(n.key) }
+
+      # An open tree has nothing resolved or built: #prepare! validates the set when it boots
+      { reverted:, removing:, order: root.boot_status == :open ? nil : root.reresolve! }
+    end
+
+    # Past validation, so nothing here rolls back: tear down what's going, recycle what changed
+    private def commit_reconfiguration!(reconf, plan, context)
+      booted = !plan[:order].nil?
+      was = reconf.order_before.each_with_index.to_h
+      root.restore_order!(plan[:order]) if booted
+
+      # Dependents first. On an open tree every hook is pending?-skipped, so this only unindexes
+      going = plan[:removing] + plan[:reverted].keys
+      going.sort_by { |n| -(was[n] || -1) }.each do |n|
+        if (implementation = plan[:reverted][n])
+          instrument_component(n, :teardown) { n.teardown_reverted!(implementation) }
+          next
+        end
+
+        instrument_component(n, :teardown) { n.teardown_node! }
+        n.remove_node!
+        emit(Events::ComponentRemoved, key: n.path, remover: path)
+      end
+      return unless booted
+
+      # Nothing new has a status to go back to, so it comes up to where the root is: :prepared,
+      # :built or :started. Deferring lowers that ceiling to :built, never raises it
+      coming_up = root.boot_status
+      reconf.newly_components.each do |n|
+        n.hold! if n.deferred?
+        n.recycle_to!(n.deferred? && coming_up == :started ? :built : coming_up)
+      end
+      affected = reconf.affected
+      recycle_nodes!(affected, context) if affected.any?
+    end
+
     # Whether the tree can be recycled: built or started, and not booting. +what+ names what
     # the caller is recycling, for the error messages
     private def check_recyclable!(what)
@@ -886,8 +1101,11 @@ module Sourced
     # Tear the targets and their dependents down, drop their values, and prepare and build them
     # again, leaving each one in the status it had before. See #recycle_component!
     private def recycle_nodes!(targets, context)
-      affected = targets.flat_map { |t| [t, *t.transitive_dependents] }.uniq
-      ordered = root.order.select { |n| affected.include?(n) }
+      # Nodes come after their dependencies in the order, so one forward pass seeded with every
+      # target reaches the same nodes as a closure per target, without the walk-per-target
+      reached = targets.to_set
+      root.order.each { |n| reached << n if n.dep_nodes.any? { |dep| reached.include?(dep) } }
+      ordered = root.order.select { |n| reached.include?(n) }
       # What each node comes back to, remembered before anything is torn down. A node a previous
       # recycle left part way through keeps the status that recycle meant to restore
       ordered.each { |n| n.recycle_to!(n.recycle_to || n.status) }
@@ -909,7 +1127,13 @@ module Sourced
 
         # And up again, in dependency order, one stage at a time, as the root boots
         ordered.each { |n| instrument_component(n, :prepare) { n.prepare_node! } }
-        ordered.each { |n| instrument_component(n, :build) { n.build_node! } }
+        ordered.each do |n|
+          # A tree that's only prepared stops there: its values are built by #build!, which is what
+          # a process forked after #prepare! runs for itself
+          next if n.recycle_to == :prepared
+
+          instrument_component(n, :build) { n.build_node! }
+        end
         ordered.each do |n|
           next unless n.recycle_to == :started && n.dep_nodes.all? { |dep| dep.started? }
 
@@ -1001,7 +1225,7 @@ module Sourced
       raise ArgumentError, "#{ckey}: pass either a provider or a block, not both" if provider && block
 
       synchronize do
-        raise LockedComponentError, "can't implement #{ckey} in a locked component" if locked?
+        raise LockedComponentError, "can't implement #{ckey} in a locked component" if declarations_locked?
 
         target = node(ckey)
         implementation = if provider
@@ -1017,6 +1241,7 @@ module Sourced
     private def implement_node(target, implementation)
       override = !target.implementation.nil?
       target.implement!(implementation)
+      root.reconfiguration&.changed!(target)
       emit(
         Events::ComponentImplemented,
         key: target.path,
