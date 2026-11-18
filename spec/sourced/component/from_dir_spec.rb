@@ -459,6 +459,104 @@ RSpec.describe Sourced::Component, '#from_dir' do
     end
   end
 
+  describe '#on_dir_load' do
+    let(:loads) { [] }
+
+    before do
+      search_class
+      write('lib/plain.rb', "class #{ns}::Plain; end")
+      app.on_dir_load { |source, constants| loads << [source, constants] }
+    end
+
+    def names(constants) = constants.map { |c| c.name.delete_prefix("#{ns}::") }
+
+    it 'gets the source and every constant its files define, installable or not, once the tree is reconfigured' do
+      seen = nil
+      app.on_dir_load { |_source, _constants| seen = app.declared?('lib.queries.users.search') }
+      from_dir
+      loader.setup
+      app.prepare!
+
+      expect(loads.size).to eq(1)
+      source, constants = loads.first
+      expect(source.inspect).to include('lib/**/*.rb')
+      expect(names(constants)).to eq(%w[Plain Queries::Users::Search])
+      expect(seen).to be(true)
+    end
+
+    it 'gets them on #install_dirs!, and not again on #prepare!' do
+      from_dir
+      loader.setup
+      app.install_dirs!
+      app.prepare!
+
+      expect(loads.size).to eq(1)
+    end
+
+    it 'gets the reloaded constants on each reload' do
+      from_dir
+      loader.setup
+      app.start!
+      before = loads.last.last
+
+      delete('lib/plain.rb')
+      loader.reload
+
+      expect(loads.size).to eq(2)
+      expect(names(loads.last.last)).to eq(%w[Queries::Users::Search])
+      expect(loads.last.last.first).not_to be(before.last)
+    end
+
+    it "isn't called when a reload leaves the tree as it was" do
+      errors = []
+      from_dir(on_error: ->(e) { errors << e })
+      loader.setup
+      app.start!
+
+      write('lib/queries/users/search.rb', "class #{ns}::Queries::Users::Search\n def oops(\nend")
+      loader.reload
+
+      expect(errors.map(&:class)).to eq([SyntaxError])
+      expect(loads.size).to eq(1)
+    end
+
+    it 'raises what a listener raises on install, and sends it to on_error on a reload, with the tree reconfigured' do
+      errors = []
+      failing = true
+      app.on_dir_load { |_s, _c| raise 'listener' if failing }
+      from_dir(on_error: ->(e) { errors << e })
+      loader.setup
+
+      expect { app.install_dirs! }.to raise_error(RuntimeError, 'listener')
+
+      failing = false
+      app.start!
+      failing = true
+      search_class(version: 2)
+      loader.reload
+
+      expect(errors.map(&:message)).to eq(['listener'])
+      expect(app['lib.queries.users.search'].version).to eq(2)
+    end
+
+    it 'raises once a source has installed, as the listener would miss what it loaded' do
+      from_dir
+      loader.setup
+      app.install_dirs!
+
+      expect { app.on_dir_load { nil } }.to raise_error(ArgumentError, /already installed/)
+    end
+
+    it 'is for the root, and needs a block' do
+      host = Sourced::Component.new
+      lib = Sourced::Component.new
+      host.mount('lib', lib)
+
+      expect { lib.on_dir_load { nil } }.to raise_error(Sourced::Component::SubcomponentError, /on the root/)
+      expect { app.on_dir_load }.to raise_error(ArgumentError)
+    end
+  end
+
   describe 'the loader' do
     it 'is required' do
       expect { Sourced::Component.new.from_dir(File.join(@dir, 'lib/**/*.rb')) }
