@@ -287,9 +287,88 @@ RSpec.describe Sourced::Component, '#from_dir' do
       .to raise_error(Sourced::Component::LockedComponentError)
   end
 
-  it 'raises if files would be declared at the root' do
-    expect { app.from_dir(File.join(@dir, 'lib/*.rb'), root: File.join(@dir, 'lib')) }
-      .to raise_error(ArgumentError, /under a key/)
+  describe 'rooted at the directory it scans' do
+    let(:lib) { File.join(@dir, 'lib') }
+
+    def installable(path, name, deps = [])
+      write("lib/#{path}.rb", <<~RUBY)
+        class #{ns}::#{name}
+          include Sourced::Component::Installable
+          #{"include #{ns}::App.inject(#{deps.map(&:inspect).join(', ')})" if deps.any?}
+        end
+      RUBY
+    end
+
+    before { app.from_dir(File.join(lib, '**/*.rb'), root: lib) }
+
+    it 'declares each top-level directory as a branch of its own' do
+      installable('users/create', 'Users::Create', ['db'])
+      installable('queries/search', 'Queries::Search', ['users.create'])
+      loader.setup
+      app.start!
+
+      expect(app['queries.search'].create.db).to eq('the-db')
+      expect(app['db']).to eq('the-db')
+    end
+
+    it 're-declares every branch at once on reload, adding and removing directories' do
+      installable('users/create', 'Users::Create')
+      installable('queries/search', 'Queries::Search', ['users.create'])
+      write('lib/support/helper.rb', "module #{ns}::Support::Helper; end")
+      app.declare('support.manual', String) { 'manual' }
+      loader.setup
+      app.start!
+
+      # Renamed in one branch, and its dependent in another follows
+      delete('lib/users/create.rb')
+      installable('users/register', 'Users::Register')
+      installable('queries/search', 'Queries::Search', ['users.register'])
+      installable('billing/charge', 'Billing::Charge')
+      loader.reload
+
+      expect(app['queries.search'].register).to be_a(Object.const_get("#{ns}::Users::Register"))
+      expect(app.declared?('users.create')).to be(false)
+      expect(app.declared?('billing.charge')).to be(true)
+      expect(app['support.manual']).to eq('manual') # no file installs under support: not claimed
+
+      delete('lib/billing/charge.rb')
+      loader.reload
+
+      expect(app.declared?('billing.charge')).to be(false)
+    end
+
+    it 'raises for an injected component no file declares, and rolls back on reload' do
+      errors = []
+      app.instance_variable_get(:@dir_sources).first.instance_variable_set(:@on_error, ->(e) { errors << e })
+      installable('users/create', 'Users::Create')
+      installable('queries/search', 'Queries::Search', ['users.missing'])
+      loader.setup
+
+      expect { app.prepare! }.to raise_error(Sourced::Component::UndeclaredComponentError, /users.missing/)
+      expect(app.declared?('users.create')).to be(false)
+
+      installable('queries/search', 'Queries::Search', ['users.create'])
+      loader.reload
+      app.start!
+      installable('queries/search', 'Queries::Search', ['users.missing'])
+      loader.reload
+
+      expect(errors.map(&:class)).to eq([Sourced::Component::UndeclaredComponentError])
+      # Rolled back: the previous classes, not the ones the failed reload loaded
+      expect(app['queries.search'].create.class.name).to eq("#{ns}::Users::Create")
+    end
+
+    it 'raises for a top-level file that installs components' do
+      installable('top', 'Top')
+      write('lib/plain.rb', "class #{ns}::Plain; end")
+      loader.setup
+
+      expect { app.prepare! }.to raise_error(ArgumentError, /top level/)
+    end
+
+    it 'overlaps any other source' do
+      expect { from_dir('lib/other/*.rb') }.to raise_error(ArgumentError, /overlaps/)
+    end
   end
 
   describe 'the loader' do

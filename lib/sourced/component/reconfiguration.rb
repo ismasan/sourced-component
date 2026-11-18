@@ -2,7 +2,7 @@
 
 module Sourced
   class Component
-    # A re-declaration of one branch of a booted tree, driven by Component#reconfigure: it records
+    # A re-declaration of one or more branches of a booted tree, driven by Component#reconfigure: it records
     # what the block declares, and snapshots what's needed to roll back if anything raises.
     #   Branch        what the block declares through, see below
     #   #snapshot!    everything the block or the validation can touch
@@ -45,21 +45,21 @@ module Sourced
         private def key(ckey) = "#{@prefix}.#{ckey}"
       end
 
-      # branch: the namespace node being re-declared. owner: the component #reconfigure was called on
-      def initialize(branch, owner)
-        @branch = branch
+      # branches: the namespace nodes being re-declared. owner: the component #reconfigure was called on
+      def initialize(branches, owner)
+        @branches = branches
         @owner = owner
         @declared = Set.new # nodes the block declared, new and surviving
         @changed = Set.new  # nodes it re-implemented, or declared with another type
-        @before = Set.new   # the nodes under the branch before the block
+        @before = Set.new   # the nodes under the branches before the block
         @snapshot = nil
       end
 
-      def branch_handle = Branch.new(@owner, @branch.path)
+      def branch_handles = @branches.map { |b| Branch.new(@owner, b.path) }
 
       def snapshot!
-        root = @branch.root
-        @before = @branch.index.values.to_set
+        root = @owner.root
+        @before = @branches.flat_map { |b| b.index.values }.to_set
         nodes = [root, *root.index.values]
         @snapshot = Snapshot.new(order: root.order&.dup, nodes: nodes.to_h { |n| [n, n.capture_state] })
         self
@@ -68,7 +68,7 @@ module Sourced
       # Put it all back. Nothing has run any hooks yet, so this is all it takes
       def rollback!
         @snapshot.nodes.each { |n, state| n.restore_state!(state) }
-        @branch.root.restore_order!(@snapshot.order)
+        @owner.root.restore_order!(@snapshot.order)
         self
       end
 

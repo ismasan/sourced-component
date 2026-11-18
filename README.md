@@ -439,6 +439,15 @@ end
 - **Components elsewhere in the tree are recycled if their dependencies changed**, which is how a `config('runner', ['reactors.*'])` picks up an added or removed reactor: its memoized value listed the old ones.
 - **Nothing runs any hooks until the whole new declaration set has been validated.** A block that raises, a missing dependency, a cycle, a declaration with no implementation, or dropping a component something still depends on: each leaves the tree exactly as it was, still running. A broken file save is the normal case in a dev loop, so recovering from it is the point.
 - **Components stopped by key stay stopped**, and deferred ones stay deferred. Re-declaring doesn't start anything that wasn't running.
+- **Several branches at once:** given an Array of keys, `#reconfigure` re-declares them together, and the block gets a handle per branch. They're validated as one set, so a component can move from one branch to another, along with whatever depends on it, which one branch at a time couldn't do without dropping a component that's still depended on.
+
+  ```ruby
+  App.reconfigure(%w[users accounts]) do |users, accounts|
+    users.declare('register')
+    accounts.declare('open')
+  end
+  ```
+
 - **Keys are relative to the branch**, and the block declares through the component `#reconfigure` was called on, so ownership comes out exactly as plain declaration would. The branch must be a namespace, and the tree is locked for anything outside the block as usual.
 - **Removed components are `:removed`**, which is terminal. They're gone from `#index`, `#tree` and `#graph`, so reading them by key raises `UndeclaredComponentError` — and anything still holding the node itself, ex. a class that injected it, raises `RemovedComponentError` rather than reading a dead value.
 - **Nested keys work the same**, since dotted keys build the tree. A namespace left with nothing under it is removed too, pruned bottom-up: dropping `billing.deep.x` leaves neither `deep` nor `billing` behind.
@@ -520,10 +529,20 @@ end
 - **Dependencies are relative to the component `#from_dir` was called on**, like the keys of `#inject`, so siblings are referenced by their full key (`c['logger'].key`).
 - **Constants that don't respond to `.__install_component` are skipped**, and so are files the loader ignores.
 - **Files are loaded on the root's `#prepare!`**, not by `#from_dir`, so the components they inject are declared by then. The loader must be set up before that. If a file raises, none of the directory's components are left declared, so booting again after fixing it works.
+- **Files can inject each other's components**, whichever loads first. While `#from_dir` loads files, injecting a key that isn't declared yet is resolved once every file has declared its components, and one that's still missing raises `UndeclaredComponentError` (on a reload, rolling it back). Everywhere else, injecting an undeclared key raises straight away.
 - **Keys:** `App.from_dir('app/queries/**/*.rb', root: 'app/queries', namespace: 'queries')` keys `app/queries/users/search.rb` as `queries.users.search`. A glob without wildcards is a directory's own `.rb` files.
-- **On reload**, the branch above the glob's first wildcard (`lib` above) is [reconfigured](#re-configuring-a-booted-tree) from the reloaded constants: every component the files declare is recycled with its new class, along with its dependents, components whose file is gone are removed, and new ones are added. A wildcard dependency on the branch (`'lib.queries.users.*'`) picks the changes up.
+- **A whole directory, without its name:** with `root:` set to the directory scanned and no `namespace:`, each top-level directory is a branch of its own:
+
+  ```ruby
+  App.from_dir('system/**/*.rb', root: 'system')
+  # system/users/create.rb   => 'users.create'
+  # system/queries/search.rb => 'queries.search'
+  ```
+
+  The branches are the top-level directories with files that install components, and reloads re-declare all of them at once, so directories can be added and removed. Top-level directories whose files install nothing are left alone, along with anything else declared under them. A file directly in `system/` that installs components raises `ArgumentError`: a component at the root of the tree can't be re-declared by a reload.
+- **On reload**, the branch above the glob's first wildcard (`lib` above), or each top-level directory's, is [reconfigured](#re-configuring-a-booted-tree) from the reloaded constants: every component the files declare is recycled with its new class, along with its dependents, components whose file is gone are removed, and new ones are added. A wildcard dependency on the branch (`'lib.queries.users.*'`) picks the changes up.
 - **A failed reload leaves the tree as it was**, still running, and is published as `root.failed`. It's not raised: it happens inside Zeitwerk's `on_setup`, and raising there would leave the loader unable to reload again. It's passed to `on_error` instead (by default, a warning), which mustn't raise either, and the next reload retries.
-- **Branches can't overlap:** each `#from_dir` reconfigures its whole branch, so two whose branches nest raise `ArgumentError`, wherever in the tree they were registered, and so does one whose files would be declared at the component's root. The branch must be a namespace with no mounted components, like any reconfigured branch.
+- **Branches can't overlap:** each `#from_dir` reconfigures its whole branch, so two whose branches nest raise `ArgumentError`, wherever in the tree they were registered. One rooted at the directory it scans overlaps any other. The branch must be a namespace with no mounted components, like any reconfigured branch.
 - **`#from_dir` is for open trees**, and raises `LockedComponentError` once the tree is prepared, including inside a `#reconfigure` block.
 - **The loader keeps each tree's reload hook**, since Zeitwerk can't remove `on_setup` callbacks. After teardown it does nothing, but a long-lived loader shared by many trees, ex. in tests, keeps them all in memory: give each tree its own loader.
 - **Classes outside the directory aren't re-declared.** A component elsewhere that captured a reloaded class in a provider keeps the old one: see [recycling](#recycling-components).

@@ -8,6 +8,9 @@ module Sourced
     # The file's constant (as Zeitwerk expects it) declares its components with
     # .__install_component(declarer), where the declarer is scoped to that key. Constants that
     # don't respond to it are skipped.
+    # Reloads re-declare the branch above the glob's first wildcard. With no such branch (root: is
+    # the directory scanned, and no namespace:), each top-level directory is a branch of its own:
+    #   system/users/create.rb, system/queries/search.rb, root: 'system' => 'users.create', 'queries.search'
     class DirSource
       INSTALL = :__install_component
       GLOB_CHARS = /[*?\[{]/
@@ -15,7 +18,8 @@ module Sourced
         Kernel.warn("[Sourced::Component] reloading components failed: #{error.class}: #{error.message}")
       end
 
-      # branch: the key every file is declared under, relative to the owner. Reconfigured on reload
+      # branch: the key every file is declared under, relative to the owner. Reconfigured on reload.
+      #         Empty when each top-level directory is a branch
       # error:  the last reload's error, nil once a reload succeeds
       attr_reader :branch, :error
 
@@ -29,10 +33,7 @@ module Sourced
         @branch = key_for(static_dir)
         @installed = false
         @error = nil
-
-        if @branch.empty?
-          raise ArgumentError, "from_dir #{glob}: files must be declared under a key, pass namespace: or a root: above #{static_dir}"
-        end
+        @claimed = [] # with an empty branch: the top-level keys the last install declared under
       end
 
       def installed? = @installed
@@ -48,6 +49,8 @@ module Sourced
       def full_branch = [@owner.path, branch].compact.join('.')
 
       def overlaps?(other)
+        return true if full_branch.empty? || other.full_branch.empty? # claims every top-level directory
+
         mine = "#{full_branch}."
         theirs = "#{other.full_branch}."
         mine.start_with?(theirs) || theirs.start_with?(mine)
@@ -56,7 +59,7 @@ module Sourced
       # The first time, on the root's #prepare!. Through #reconfigure, which on an open tree is plain
       # declaration, but rolls back if a file raises: a retried #prepare! starts from a clean branch
       def install!
-        @owner.reconfigure(branch) { declare_all }
+        reconfigure!
         @installed = true
         self
       end
@@ -70,7 +73,7 @@ module Sourced
         return self unless @installed
         return self if @owner.root.boot_status == :torn_down
 
-        @owner.reconfigure(branch) { declare_all }
+        reconfigure!
         @error = nil
         self
       rescue StandardError, ScriptError => e
@@ -81,15 +84,45 @@ module Sourced
 
       def inspect = "#<#{self.class} #{@glob} => #{full_branch}>"
 
-      private def declare_all
-        files.each do |path|
+      # Load every file first, so a file that doesn't load raises before anything is reconfigured, and
+      # the branches are known. With an empty branch, they're the top-level keys of the files that
+      # install, and those of the last install, so a directory that's gone is emptied. New ones are
+      # created by declaring into them.
+      # Files can inject components that other files declare, whichever loads first: those are
+      # resolved once every file is installed, and a missing one rolls the reconfiguration back.
+      private def reconfigure!
+        installs = nil
+        deferred = @owner.root.deferring_injections { installs = installables }
+        keys = if branch.empty?
+                 claimed = installs.map { |key, _| key.split('.').first }.uniq
+                 (@claimed | claimed).select { |k| @owner.declared?(k) }
+               else
+                 [branch]
+               end
+
+        @owner.reconfigure(keys) do
+          installs.each { |key, mod| mod.public_send(INSTALL, Declarer.new(@owner, key)) }
+          deferred.each(&:resolve!)
+        end
+        @claimed = claimed if branch.empty?
+      end
+
+      # [[key, constant]] for each file whose constant responds to .__install_component
+      private def installables
+        files.filter_map do |path|
           cpath = @loader.cpath_expected_at(path)
           next unless cpath
 
           mod = Object.const_get(cpath)
           next unless mod.respond_to?(INSTALL)
 
-          mod.public_send(INSTALL, Declarer.new(@owner, key_for(path.delete_suffix('.rb'))))
+          key = key_for(path.delete_suffix('.rb'))
+          if branch.empty? && !key.include?('.')
+            raise ArgumentError, "#{path} can't install components at the top level, where reloading can't " \
+                                 "re-declare them: move it into a directory, or pass namespace: to #from_dir"
+          end
+
+          [key, mod]
         end
       end
 

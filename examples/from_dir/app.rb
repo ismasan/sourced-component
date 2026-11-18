@@ -37,6 +37,7 @@ App.declare('db', T::Array) { [{ id: 1, name: 'Joe' }, { id: 2, name: 'Joan' }, 
 # Files are loaded on #prepare!, so 'db' and 'logger' only need to be declared before booting.
 # On reload, the 'lib' branch is reconfigured from the reloaded constants.
 App.from_dir(File.join(lib, '**/*.rb'), root: dir)
+# Or root: lib, for 'queries.users.search': each top-level directory is then a branch of its own
 
 # Collects every user query, whichever files declare them
 App.declare('user_queries', T::Hash)

@@ -79,6 +79,7 @@ module Sourced
       @order = nil
       @lock = Monitor.new
       @dir_sources = [] # see #from_dir
+      @deferred_injections = nil # see #deferring_injections, on the root only
     end
 
     def root = parent ? parent.root : self
@@ -126,6 +127,7 @@ module Sourced
     # The Reconfiguration in progress, which records what its block declares
     protected def reconfiguration = @reconfiguration
     protected def dir_sources = @dir_sources
+    protected def deferred_injections = @deferred_injections
     protected def all_dir_sources = [self, *index.values].flat_map { |n| n.dir_sources }
 
     # Load the files of each #from_dir. The branch is created even if no file declares anything,
@@ -134,7 +136,7 @@ module Sourced
       @dir_sources.each do |source|
         next if source.installed?
 
-        walk("#{source.branch}._")
+        walk("#{source.branch}._") unless source.branch.empty? # a directory per branch otherwise, see DirSource
         source.install!
       end
     end
@@ -328,7 +330,29 @@ module Sourced
       duplicates = names.values.tally.select { |_, count| count > 1 }.keys
       raise ArgumentError, "duplicate injected names: #{duplicates.join(', ')}" if duplicates.any?
 
-      Injector.new(names.to_h { |key, _| [key, node(key)] }, names)
+      Injector.new(names.to_h { |key, _| [key, injected_node(key)] }, names)
+    end
+
+    # Run the block with injections of undeclared keys deferred, instead of raising, and return the
+    # deferred nodes, to resolve once their declarations have run. For #from_dir, whose files can
+    # inject each other's components in any order. Only on the root
+    def deferring_injections
+      synchronize do
+        raise LockedComponentError, "already deferring injections" if @deferred_injections
+
+        @deferred_injections = []
+        yield
+        @deferred_injections
+      ensure
+        @deferred_injections = nil
+      end
+    end
+
+    private def injected_node(key)
+      deferred = root.deferred_injections
+      return node(key) if deferred.nil? || declared?(key)
+
+      Injector::DeferredNode.new(self, key).tap { |n| deferred << n }
     end
 
     # Attach an existing standalone component as a branch. It keeps owning its declarations,
@@ -638,19 +662,23 @@ module Sourced
     #     files.each { |f| reactors.declare(f.key) }
     #     changed.each { |f| reactors.component!(f.key, f.deps, &f.implementation) }
     #   end
+    # Several branches are re-declared at once, and validated together, given an Array of keys.
+    # The block gets a handle per branch:
+    #   app.reconfigure(%w[users accounts]) { |users, accounts| }
     def reconfigure(ckey, context = Thread.current, &block)
       raise ArgumentError, "reconfigure #{ckey}: a block must declare the branch's contents" unless block
 
       synchronize do
-        branch = reconfigurable_branch(ckey)
-        reconf = Reconfiguration.new(branch, self)
+        check_reconfigurable!
+        branches = Array(ckey).map { |k| reconfigurable_branch(k) }
+        reconf = Reconfiguration.new(branches, self)
         root.reconfiguring!(reconf)
 
         begin
           instrument_root(:reconfigure) do
             reconf.snapshot!
             plan = begin
-              block.call(reconf.branch_handle)
+              block.call(*reconf.branch_handles)
               validate_reconfiguration!(reconf)
             rescue Exception # rubocop:disable Lint/RescueException -- nothing has run yet: put the tree back, whatever it was. Always re-raised
               reconf.rollback!
@@ -1111,13 +1139,14 @@ module Sourced
     end
 
     # A branch to reconfigure: a namespace, under a tree that isn't booting or torn down
+    private def check_reconfigurable!
+      raise LockedComponentError, "can't reconfigure: a reconfiguration is already running" if root.reconfiguring?
+      raise TornDownError, "can't reconfigure: the component is torn down" if root.boot_status == :torn_down
+      raise LockedComponentError, "can't reconfigure while the root is booting" if root.starting?
+    end
+
     private def reconfigurable_branch(ckey)
       branch = node(ckey)
-      raise LockedComponentError, "can't reconfigure #{branch.path}: a reconfiguration is already running" if root.reconfiguring?
-      raise TornDownError, "can't reconfigure #{branch.path}: the component is torn down" if root.boot_status == :torn_down
-      if root.starting?
-        raise LockedComponentError, "can't reconfigure #{branch.path} while the root is booting"
-      end
       unless branch.namespace?
         raise UndeclaredComponentError, "#{branch.path} is a component, not a namespace: reconfigure the branch above it"
       end
