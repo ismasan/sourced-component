@@ -16,5 +16,6 @@ module Sourced
     NotStartedError = Class.new(ComponentError)
     RemovedComponentError = Class.new(ComponentError)
     InjectionError = Class.new(ComponentError)
+    MissingLoaderError = Class.new(ComponentError)
   end
 end

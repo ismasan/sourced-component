@@ -456,6 +456,55 @@ App.reconfigure('reactors') do |reactors|
 end
 ```
 
+### Components from a directory
+
+`#from_dir(glob, root: Dir.pwd, namespace: nil, on_error:)` declares components from the Ruby files matching a glob, autoloaded by a [Zeitwerk](https://github.com/fxn/zeitwerk) loader, and re-declares them when the loader reloads.
+
+The loader is configuration for the whole tree, set on the root, either when it's created or later, while it's open:
+
+```ruby
+App = Sourced::Component.new(loader:) # or App.loader = loader
+
+App.from_dir('lib/**/*.rb')
+```
+
+- **It's optional**, and only `#from_dir` needs it: calling it on a tree without a loader raises `MissingLoaderError`. Zeitwerk isn't a dependency of this gem: bring your own loader (2.6.13+), or anything with `#cpath_expected_at(path)` and `#on_setup(&block)`.
+- **Mounted components use their root's loader**, so a library's component can call `#from_dir` once it's mounted. Setting it on a mounted component raises `SubcomponentError`.
+- **It can't be replaced** once `#from_dir` registered with it (`ArgumentError`), or once the tree is prepared (`LockedComponentError`).
+
+Each file's key is its path relative to `root`, prefixed with `namespace`. The constant Zeitwerk expects in the file declares its components with `.install_sourced_component`, which gets the component DSL scoped to that key:
+
+```ruby
+# lib/queries/users/search.rb => 'lib.queries.users.search'
+class Queries::Users::Search
+  include App.inject('db', 'logger')
+
+  def self.install_sourced_component(c) = c.declare(self).factory(self)
+end
+```
+
+`c['name']` scopes it to a key under the file's, so a file can declare several components:
+
+```ruby
+# lib/integrations/sourced.rb => 'lib.integrations.sourced.logger', 'lib.integrations.sourced.store'
+module Integrations::Sourced
+  def self.install_sourced_component(c)
+    c['logger'].declare(Logger) { Logger.new($stdout) }
+    c['store'].declare(Store).config!([c['logger'].key, 'db']) { |logger, db| Store.new(logger, db) }
+  end
+end
+```
+
+- **The declarer** has `declare(type = Any, &default)`, `component!`, `component`, `config!`, `config`, `alias`, `factory` and `defer`, which take the same arguments as the component's, without the key, and return the declarer. `#key` is its key.
+- **Dependencies are relative to the component `#from_dir` was called on**, like the keys of `#inject`, so siblings are referenced by their full key (`c['logger'].key`).
+- **Constants that don't respond to `.install_sourced_component` are skipped**, and so are files the loader ignores.
+- **Files are loaded on the root's `#prepare!`**, not by `#from_dir`, so the components they inject are declared by then. The loader must be set up before that.
+- **Keys:** `App.from_dir('app/queries/**/*.rb', root: 'app/queries', namespace: 'queries')` keys `app/queries/users/search.rb` as `queries.users.search`. A glob without wildcards is a directory's own `.rb` files.
+- **On reload**, the branch above the glob's first wildcard (`lib` above) is [reconfigured](#re-configuring-a-booted-tree) from the reloaded constants: every component the files declare is recycled with its new class, along with its dependents, components whose file is gone are removed, and new ones are added. A wildcard dependency on the branch (`'lib.queries.users.*'`) picks the changes up.
+- **A failed reload leaves the tree as it was**, still running, and is published as `root.failed`. It's not raised: it happens inside Zeitwerk's `on_setup`, and raising there would leave the loader unable to reload again. It's passed to `on_error` instead (by default, a warning), and the next reload retries.
+- **Branches can't overlap:** each `#from_dir` reconfigures its whole branch, so two whose branches nest raise `ArgumentError`, and so does one whose files would be declared at the component's root. The branch must be a namespace with no mounted components, like any reconfigured branch.
+- **Classes outside the directory aren't re-declared.** A component elsewhere that captured a reloaded class in a provider keeps the old one: see [recycling](#recycling-components).
+
 ### Signal handlers
 
 The lifecycle methods, and anything else that takes the root's lock (declaring, implementing and mounting components, `#recycle_component!` and friends, `#reconfigure`, `#graph`, `#tree`), can't be called from a `trap` block: Ruby doesn't allow locking a `Monitor` in trap context, so they raise `ThreadError: can't be called from trap context` and nothing is torn down. Reading values doesn't take the lock.
