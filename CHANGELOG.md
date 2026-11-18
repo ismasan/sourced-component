@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+- `#from_dir(glob)`: declare components from the files in a directory, with `.__install_component`, and reconfigure them when the tree's Zeitwerk loader reloads
+- `Sourced::Component::Installable`: the default `.__install_component`, `c.declare(self).factory(self)`, and `.__abstract_component!` for base classes
+- `#from_dir(glob, root: dir)`, rooted at the directory it scans: each top-level directory is a branch, reloaded together
+- Files loaded by `#from_dir` can inject each other's components, in any order
+- `#reconfigure([keys])` re-declares several branches at once, validated together
+- `Sourced::Component.new(loader:)` and `#loader=`: the tree's code loader, for `#from_dir`. `MissingLoaderError` without one
 - `stop` lifecycle hook: runs when a started component is stopped, and before `teardown` when the root is torn down
 - `#defer(key)`: the root's `#start!` skips the component, and everything depending on it
 - `#start_component!`, `#stop_component!` and `#restart_component!` start and stop components by key, following the dependency graph

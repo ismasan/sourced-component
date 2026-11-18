@@ -11,6 +11,21 @@ module Sourced
     # Values are read from the nodes themselves, so a class injecting from a library's component
     # gets the overrides of the application that mounts it.
     class Injector < Module
+      # A component injected before it was declared, while #from_dir loads files: the file declaring
+      # it may load later. Looked up on first use, and checked once every file is installed (#resolve!)
+      class DeferredNode
+        def initialize(component, key)
+          @component = component
+          @key = key
+          @node = nil
+        end
+
+        def resolve! = @node ||= @component.node(@key)
+        def read = resolve!.read
+        # Known before it's declared, so #factory can depend on it
+        def path = [@component.path, @key].compact.join('.')
+      end
+
       # Extended into whatever includes an Injector, see #included
       module ComponentDeps
         # Every component injected into this class, including inherited ones, by key.
@@ -29,7 +44,7 @@ module Sourced
 
       attr_reader :names, :nodes
 
-      # nodes: { 'component.key' => <Component node> }
+      # nodes: { 'component.key' => <Component node, or DeferredNode> }
       # names: { 'component.key' => :kwarg_name }
       def initialize(nodes, names)
         super()

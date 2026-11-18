@@ -2838,6 +2838,27 @@ RSpec.describe Sourced::Component do
       expect(comp['runner']).to eq(['audit'])
     end
 
+    it 're-declares several branches at once, validated together' do
+      comp = app
+      comp.declare('jobs.cleanup') { 'cleanup' }
+      comp.declare('jobs.mail') { 'mail' }
+      comp.start!
+
+      # 'reactors.audit' moves to 'jobs.audit', and 'store' follows it: one branch at a time, either
+      # order would drop a component something still depends on, or depend on one not declared yet
+      comp.reconfigure(%w[reactors jobs]) do |reactors, jobs|
+        %w[billing.invoices billing.payments].each { |k| reactors.declare(k) }
+        jobs.declare('cleanup')
+        jobs.declare('audit', String) { 'audit@jobs' }
+        comp.config!('store', ['jobs.audit']) { |audit| "store(#{audit})" }
+      end
+
+      expect(comp.declared?('reactors.audit')).to be(false)
+      expect(comp.declared?('jobs.mail')).to be(false)
+      expect(comp['store']).to eq('store(audit@jobs)')
+      expect(comp['runner']).to eq([]) # 'billing' is a namespace
+    end
+
     it 'recycles a re-implemented component, and nothing else' do
       comp = app
       comp.start!(:boot)

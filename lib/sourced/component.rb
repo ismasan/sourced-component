@@ -16,6 +16,8 @@ require_relative 'component/events'
 require_relative 'component/notifier'
 require_relative 'component/tree'
 require_relative 'component/reconfiguration'
+require_relative 'component/dir_source'
+require_relative 'component/installable'
 
 module Sourced
   # A tree of components. Every node is a Component: it can declare a type, be implemented with
@@ -40,6 +42,9 @@ module Sourced
     # What #mount takes: anything that returns a Component from #to_component
     MountableInterface = Plumb::Types::Interface[:to_component]
 
+    # What #from_dir needs from a code loader, ex. a Zeitwerk::Loader (2.6.13+)
+    LoaderInterface = Plumb::Types::Interface[:cpath_expected_at, :on_setup]
+
     # key:   local segment, ex. 'db'. nil for a root that isn't mounted anywhere
     # owner: the component that declared this node. Standalone components own themselves
     # type:  the declared type. Any for implicit nodes created as intermediate segments (namespaces)
@@ -48,8 +53,9 @@ module Sourced
 
     # notifier: receives lifecycle events. See Component::Notifier and Component::Events.
     # The root's notifier receives the events of the whole tree, so a mounted component uses its root's.
-    def initialize(owner: nil, type: Plumb::Undefined, notifier: Notifier.new)
+    def initialize(owner: nil, type: Plumb::Undefined, notifier: Notifier.new, loader: nil)
       @notifier = NotifierInterface.parse(notifier)
+      @loader = loader && LoaderInterface.parse(loader)
       @key = nil
       @parent = nil
       @owner = owner || self
@@ -72,6 +78,8 @@ module Sourced
       @starting = false
       @order = nil
       @lock = Monitor.new
+      @dir_sources = [] # see #from_dir
+      @deferred_injections = nil # see #deferring_injections, on the root only
     end
 
     def root = parent ? parent.root : self
@@ -79,6 +87,21 @@ module Sourced
 
     # The notifier lifecycle events are published to: the root's, for every component in the tree
     def notifier = root? ? @notifier : root.notifier
+
+    # The code loader for #from_dir, ex. a Zeitwerk::Loader. Set on the root, for the whole tree
+    def loader = root? ? @loader : root.loader
+
+    def loader=(loader)
+      synchronize do
+        raise SubcomponentError, "#{path} is mounted in another component: set the loader on the root" unless root?
+        raise LockedComponentError, "can't set the loader of a locked component" if locked?
+        if all_dir_sources.any?
+          raise ArgumentError, "can't replace the loader: #from_dir already registered with #{@loader.inspect}"
+        end
+
+        @loader = LoaderInterface.parse(loader)
+      end
+    end
 
     # Full key from the root, ex. 'sourced.db'. nil for the root
     def path
@@ -103,6 +126,20 @@ module Sourced
 
     # The Reconfiguration in progress, which records what its block declares
     protected def reconfiguration = @reconfiguration
+    protected def dir_sources = @dir_sources
+    protected def deferred_injections = @deferred_injections
+    protected def all_dir_sources = [self, *index.values].flat_map { |n| n.dir_sources }
+
+    # Load the files of each #from_dir. The branch is created even if no file declares anything,
+    # and outlives its files, so a reload can always reconfigure it
+    protected def install_dir_sources!
+      @dir_sources.each do |source|
+        next if source.installed?
+
+        walk("#{source.branch}._") unless source.branch.empty? # a directory per branch otherwise, see DirSource
+        source.install!
+      end
+    end
 
     def inspect
       details = namespace? ? '(namespace)' : "#{type_name} (#{[implementation&.mode || 'not implemented', status, ('deferred' if deferred?)].compact.join(', ')})"
@@ -293,7 +330,29 @@ module Sourced
       duplicates = names.values.tally.select { |_, count| count > 1 }.keys
       raise ArgumentError, "duplicate injected names: #{duplicates.join(', ')}" if duplicates.any?
 
-      Injector.new(names.to_h { |key, _| [key, node(key)] }, names)
+      Injector.new(names.to_h { |key, _| [key, injected_node(key)] }, names)
+    end
+
+    # Run the block with injections of undeclared keys deferred, instead of raising, and return the
+    # deferred nodes, to resolve once their declarations have run. For #from_dir, whose files can
+    # inject each other's components in any order. Only on the root
+    def deferring_injections
+      synchronize do
+        raise LockedComponentError, "already deferring injections" if @deferred_injections
+
+        @deferred_injections = []
+        yield
+        @deferred_injections
+      ensure
+        @deferred_injections = nil
+      end
+    end
+
+    private def injected_node(key)
+      deferred = root.deferred_injections
+      return node(key) if deferred.nil? || declared?(key)
+
+      Injector::DeferredNode.new(self, key).tap { |n| deferred << n }
     end
 
     # Attach an existing standalone component as a branch. It keeps owning its declarations,
@@ -314,6 +373,9 @@ module Sourced
         raise SubcomponentError, "#{sub.inspect} is already mounted in another component" unless sub.root?
         raise SubcomponentError, "can't mount a component into its own tree" if sub.equal?(root)
         raise LockedComponentError, "can't mount a #{sub.boot_status} component: it must be open" if sub.locked?
+        if sub.loader
+          raise SubcomponentError, "can't mount #{ckey}: it has its own loader. Set the loader on the root of the tree instead"
+        end
 
         branch, leaf = walk(ckey)
         if (existing = branch.children[leaf])
@@ -327,6 +389,38 @@ module Sourced
 
     # The mountable interface (see #mount)
     def to_component = self
+
+    # Declare components from the Ruby files matching +glob+, autoloaded by the root's #loader.
+    # Each file's key is its path relative to +root+, prefixed with +namespace+, and the constant
+    # Zeitwerk expects in it declares its components with .__install_component(declarer).
+    # See DirSource::Declarer.
+    #   app.loader = loader                         # once, on the root: see #loader=
+    #   app.from_dir('lib/**/*.rb')                 # lib/queries/users/search.rb => 'lib.queries.users.search'
+    #   app.from_dir('app/queries/**/*.rb', root: 'app/queries', namespace: 'queries')
+    # Files are loaded on the root's #prepare!, so the components they inject are declared by then.
+    # When the loader reloads, the branch above the glob's first wildcard is reconfigured from the new
+    # constants (see #reconfigure). A failed reload leaves the tree as it was and calls +on_error+.
+    def from_dir(glob, root: Dir.pwd, namespace: nil, on_error: DirSource::DEFAULT_ON_ERROR)
+      source = synchronize do
+        # Not even while reconfiguring: sources are only installed on #prepare!
+        raise LockedComponentError, "can't add #{glob} to a locked component" if locked?
+
+        loader = self.loader
+        unless loader
+          raise MissingLoaderError,
+                "from_dir #{glob}: the tree has no code loader. Set one on the root, " \
+                "ex. Sourced::Component.new(loader: Zeitwerk::Loader.new) or root.loader = loader"
+        end
+
+        source = DirSource.new(self, glob, loader:, root:, namespace:, on_error:)
+        DirSource.check_overlaps!([*self.root.all_dir_sources, source]) # self.root: root is the keyword here
+        @dir_sources << source
+        source
+      end
+      # Outside the tree's lock: Zeitwerk calls back under its own lock, and the callback takes the tree's
+      loader.on_setup { source.reload! }
+      self
+    end
 
     # A node under this component, by relative key
     def node(ckey)
@@ -356,6 +450,7 @@ module Sourced
         return self if past?(:prepared)
 
         instrument_root(:prepare) do
+          [self, *index.values].each { |n| n.install_dir_sources! }
           @order = resolve_order
           # Holds start from the declarations, on a first boot only: #reresolve! must leave the ones
           # #stop_component! set alone, or a reconfiguration would start a stopped component again
@@ -567,19 +662,23 @@ module Sourced
     #     files.each { |f| reactors.declare(f.key) }
     #     changed.each { |f| reactors.component!(f.key, f.deps, &f.implementation) }
     #   end
+    # Several branches are re-declared at once, and validated together, given an Array of keys.
+    # The block gets a handle per branch:
+    #   app.reconfigure(%w[users accounts]) { |users, accounts| }
     def reconfigure(ckey, context = Thread.current, &block)
       raise ArgumentError, "reconfigure #{ckey}: a block must declare the branch's contents" unless block
 
       synchronize do
-        branch = reconfigurable_branch(ckey)
-        reconf = Reconfiguration.new(branch, self)
+        check_reconfigurable!
+        branches = Array(ckey).map { |k| reconfigurable_branch(k) }
+        reconf = Reconfiguration.new(branches, self)
         root.reconfiguring!(reconf)
 
         begin
           instrument_root(:reconfigure) do
             reconf.snapshot!
             plan = begin
-              block.call(reconf.branch_handle)
+              block.call(*reconf.branch_handles)
               validate_reconfiguration!(reconf)
             rescue Exception # rubocop:disable Lint/RescueException -- nothing has run yet: put the tree back, whatever it was. Always re-raised
               reconf.rollback!
@@ -1040,13 +1139,14 @@ module Sourced
     end
 
     # A branch to reconfigure: a namespace, under a tree that isn't booting or torn down
+    private def check_reconfigurable!
+      raise LockedComponentError, "can't reconfigure: a reconfiguration is already running" if root.reconfiguring?
+      raise TornDownError, "can't reconfigure: the component is torn down" if root.boot_status == :torn_down
+      raise LockedComponentError, "can't reconfigure while the root is booting" if root.starting?
+    end
+
     private def reconfigurable_branch(ckey)
       branch = node(ckey)
-      raise LockedComponentError, "can't reconfigure #{branch.path}: a reconfiguration is already running" if root.reconfiguring?
-      raise TornDownError, "can't reconfigure #{branch.path}: the component is torn down" if root.boot_status == :torn_down
-      if root.starting?
-        raise LockedComponentError, "can't reconfigure #{branch.path} while the root is booting"
-      end
       unless branch.namespace?
         raise UndeclaredComponentError, "#{branch.path} is a component, not a namespace: reconfigure the branch above it"
       end
