@@ -553,6 +553,15 @@ end
 - **Branches can't overlap:** each `#from_dir` reconfigures its whole branch, so two whose branches nest raise `ArgumentError`, wherever in the tree they were registered. One rooted at the directory it scans overlaps any other. The branch must be a namespace with no mounted components, like any reconfigured branch.
 - **`#from_dir` is for open trees**, and raises `LockedComponentError` once the tree is prepared, including inside a `#reconfigure` block.
 - **The loader keeps each tree's reload hook**, since Zeitwerk can't remove `on_setup` callbacks. After teardown it does nothing, but a long-lived loader shared by many trees, ex. in tests, keeps them all in memory: give each tree its own loader.
+- **`#on_dir_load` hears of every constant a directory's files define**, whether it installs components or not, so code that keeps its own record of some kind of class, ex. a registry of handlers, can follow the same scan and the same reloads:
+
+  ```ruby
+  App.on_dir_load do |source, constants|
+    handlers.replace(constants.select { |c| c.is_a?(Class) && c < Handler })
+  end
+  ```
+
+  It's called with the source and the constants, in file order, each time a source installs or reloads its files and the tree is reconfigured, so not for a reload that left the tree as it was. Listeners are set on the root, before the sources install (after, it raises `ArgumentError`, as the listener would miss what they loaded), and run in the order they were added. What one raises propagates from `#install_dirs!` or `#prepare!`, or goes to `on_error` on a reload. The tree is reconfigured either way.
 - **Classes outside the directory aren't re-declared.** A component elsewhere that captured a reloaded class in a provider keeps the old one: see [recycling](#recycling-components).
 
 ### Signal handlers

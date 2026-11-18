@@ -15,7 +15,7 @@ module Sourced
       INSTALL = :__install_component
       GLOB_CHARS = /[*?\[{]/
       DEFAULT_ON_ERROR = lambda do |error|
-        Kernel.warn("[Sourced::Component] reloading components failed: #{error.class}: #{error.message}")
+        Kernel.warn("[Sourced::Component] reloading a from_dir directory failed: #{error.class}: #{error.message}")
       end
 
       # branch: the key every file is declared under, relative to the owner. Reconfigured on reload.
@@ -90,9 +90,14 @@ module Sourced
       # created by declaring into them.
       # Files can inject components that other files declare, whichever loads first: those are
       # resolved once every file is installed, and a missing one rolls the reconfiguration back.
+      # Once the tree is reconfigured, the root's #on_dir_load listeners get every file's constant.
       private def reconfigure!
+        loaded = nil
         installs = nil
-        deferred = @owner.root.deferring_injections { installs = installables }
+        deferred = @owner.root.deferring_injections do
+          loaded = constants
+          installs = installables(loaded)
+        end
         keys = if branch.empty?
                  claimed = installs.map { |key, _| key.split('.').first }.uniq
                  (@claimed | claimed).select { |k| @owner.declared?(k) }
@@ -105,15 +110,20 @@ module Sourced
           deferred.each(&:resolve!)
         end
         @claimed = claimed if branch.empty?
+        @owner.root.dir_loaded!(self, loaded.map(&:last))
       end
 
-      # [[key, constant]] for each file whose constant responds to .__install_component
-      private def installables
+      # [[path, constant]] for each file the loader expects a constant in, loading it
+      private def constants
         files.filter_map do |path|
           cpath = @loader.cpath_expected_at(path)
-          next unless cpath
+          [path, Object.const_get(cpath)] if cpath
+        end
+      end
 
-          mod = Object.const_get(cpath)
+      # [[key, constant]] for each of +loaded+ that responds to .__install_component
+      private def installables(loaded)
+        loaded.filter_map do |path, mod|
           next unless mod.respond_to?(INSTALL)
 
           key = key_for(path.delete_suffix('.rb'))

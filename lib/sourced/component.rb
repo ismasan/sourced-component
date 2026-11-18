@@ -79,6 +79,7 @@ module Sourced
       @order = nil
       @lock = Monitor.new
       @dir_sources = [] # see #from_dir
+      @dir_load_listeners = [] # see #on_dir_load
       @deferred_injections = nil # see #deferring_injections, on the root only
     end
 
@@ -421,6 +422,40 @@ module Sourced
       # Outside the tree's lock: Zeitwerk calls back under its own lock, and the callback takes the tree's
       loader.on_setup { source.reload! }
       self
+    end
+
+    # Call +block+ with a #from_dir source and the constants its files define, every one in file
+    # order, whether it installs components or not, each time the source installs or reloads them and
+    # the tree is reconfigured. For code that keeps its own record of the classes in a directory, ex.
+    # a registry of the ones of some kind, which a reload must keep up to date:
+    #   app.on_dir_load do |source, constants|
+    #     registry.replace(source, constants.select { |c| c.is_a?(Class) && c < Handler })
+    #   end
+    # Set on the root, for the whole tree, before the sources install: once one has, it raises
+    # ArgumentError, since the listener would miss what it loaded. Listeners run in the order
+    # they were added. What one raises propagates from #install_dirs! or #prepare!, or goes to the
+    # source's +on_error+ on a reload, the tree reconfigured either way.
+    # @return [self]
+    def on_dir_load(&block)
+      raise ArgumentError, 'on_dir_load needs a block' unless block
+
+      synchronize do
+        raise SubcomponentError, "#{path} is mounted in another component: call on_dir_load on the root" unless root?
+        if (installed = all_dir_sources.find(&:installed?))
+          raise ArgumentError, "on_dir_load: #{installed.inspect} has already installed, so the listener " \
+                               'would miss what it loaded. Add it before #install_dirs! or #prepare!'
+        end
+
+        @dir_load_listeners << block
+      end
+      self
+    end
+
+    # Called by a DirSource on the root, once its files are loaded and the tree reconfigured. Not for
+    # apps: see #on_dir_load
+    # @api private
+    def dir_loaded!(source, constants)
+      synchronize { @dir_load_listeners.dup }.each { |listener| listener.call(source, constants) }
     end
 
     # Load the files of every #from_dir in the tree now, on an open tree, rather than on #prepare!,
