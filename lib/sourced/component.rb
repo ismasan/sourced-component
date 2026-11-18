@@ -94,7 +94,7 @@ module Sourced
       synchronize do
         raise SubcomponentError, "#{path} is mounted in another component: set the loader on the root" unless root?
         raise LockedComponentError, "can't set the loader of a locked component" if locked?
-        if [self, *index.values].any? { |n| n.dir_sources.any? }
+        if all_dir_sources.any?
           raise ArgumentError, "can't replace the loader: #from_dir already registered with #{@loader.inspect}"
         end
 
@@ -126,6 +126,7 @@ module Sourced
     # The Reconfiguration in progress, which records what its block declares
     protected def reconfiguration = @reconfiguration
     protected def dir_sources = @dir_sources
+    protected def all_dir_sources = [self, *index.values].flat_map { |n| n.dir_sources }
 
     # Load the files of each #from_dir. The branch is created even if no file declares anything,
     # and outlives its files, so a reload can always reconfigure it
@@ -348,6 +349,9 @@ module Sourced
         raise SubcomponentError, "#{sub.inspect} is already mounted in another component" unless sub.root?
         raise SubcomponentError, "can't mount a component into its own tree" if sub.equal?(root)
         raise LockedComponentError, "can't mount a #{sub.boot_status} component: it must be open" if sub.locked?
+        if sub.loader
+          raise SubcomponentError, "can't mount #{ckey}: it has its own loader. Set the loader on the root of the tree instead"
+        end
 
         branch, leaf = walk(ckey)
         if (existing = branch.children[leaf])
@@ -373,8 +377,9 @@ module Sourced
     # When the loader reloads, the branch above the glob's first wildcard is reconfigured from the new
     # constants (see #reconfigure). A failed reload leaves the tree as it was and calls +on_error+.
     def from_dir(glob, root: Dir.pwd, namespace: nil, on_error: DirSource::DEFAULT_ON_ERROR)
-      synchronize do
-        raise LockedComponentError, "can't add #{glob} to a locked component" if declarations_locked?
+      source = synchronize do
+        # Not even while reconfiguring: sources are only installed on #prepare!
+        raise LockedComponentError, "can't add #{glob} to a locked component" if locked?
 
         loader = self.loader
         unless loader
@@ -384,14 +389,13 @@ module Sourced
         end
 
         source = DirSource.new(self, glob, loader:, root:, namespace:, on_error:)
-        if (other = @dir_sources.find { |s| s.overlaps?(source) })
-          raise ArgumentError, "#{source.inspect} overlaps #{other.inspect}: each reconfigures its whole branch"
-        end
-
+        DirSource.check_overlaps!([*self.root.all_dir_sources, source]) # self.root: root is the keyword here
         @dir_sources << source
-        loader.on_setup { source.reload! }
-        self
+        source
       end
+      # Outside the tree's lock: Zeitwerk calls back under its own lock, and the callback takes the tree's
+      loader.on_setup { source.reload! }
+      self
     end
 
     # A node under this component, by relative key

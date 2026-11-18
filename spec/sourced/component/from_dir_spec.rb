@@ -98,6 +98,43 @@ RSpec.describe Sourced::Component, '#from_dir' do
     expect(app['lib.queries.users.custom']).to eq('custom')
   end
 
+  it "doesn't install abstract components, but installs their subclasses" do
+    write('lib/queries/base.rb', <<~RUBY)
+      class #{ns}::Queries::Base
+        include Sourced::Component::Installable
+        include #{ns}::App.inject('db')
+        __abstract_component!
+      end
+    RUBY
+    write('lib/queries/search.rb', "class #{ns}::Queries::Search < #{ns}::Queries::Base; end")
+    from_dir
+    loader.setup
+    app.start!
+
+    expect(app.declared?('lib.queries.base')).to be(false)
+    expect(app['lib.queries.search'].db).to eq('the-db')
+  end
+
+  it 'leaves nothing behind when a file fails on boot, so booting again works' do
+    write('lib/a.rb', <<~RUBY)
+      class #{ns}::A
+        include Sourced::Component::Installable
+      end
+    RUBY
+    write('lib/b.rb', "class #{ns}::B\n  def self.__install_component(c) = raise('boom')\nend")
+    from_dir
+    loader.setup
+
+    expect { app.prepare! }.to raise_error(RuntimeError, 'boom')
+    expect(app.declared?('lib.a')).to be(false)
+
+    write('lib/b.rb', "class #{ns}::B; end")
+    loader.reload
+    app.start!
+
+    expect(app.declared?('lib.a')).to be(true)
+  end
+
   it 'declares several components under a file' do
     write('lib/integrations/sourced.rb', <<~RUBY)
       module #{ns}::Integrations::Sourced
@@ -225,6 +262,31 @@ RSpec.describe Sourced::Component, '#from_dir' do
     expect { from_dir('lib/other/*.rb') }.not_to raise_error
   end
 
+  it 'raises for overlapping branches registered through other components in the tree' do
+    app.declare('lib.other', String) { 'other' } # so the 'lib' node exists to call #from_dir on
+    from_dir('lib/**/*.rb')
+    expect { app.node('lib').from_dir(File.join(@dir, 'lib/q/**/*.rb'), root: File.join(@dir, 'lib')) }
+      .to raise_error(ArgumentError, /overlaps/)
+  end
+
+  it "registers with the loader outside the tree's lock" do
+    owned = nil
+    allow(loader).to receive(:on_setup).and_wrap_original do |original, &block|
+      owned = app.instance_variable_get(:@lock).mon_owned?
+      original.call(&block)
+    end
+    from_dir
+
+    expect(owned).to be(false)
+  end
+
+  it "can't be called while reconfiguring" do
+    app.declare('other.x', String) { 'x' }
+    app.start!
+    expect { app.reconfigure('other') { |b| b.declare('x'); from_dir } }
+      .to raise_error(Sourced::Component::LockedComponentError)
+  end
+
   it 'raises if files would be declared at the root' do
     expect { app.from_dir(File.join(@dir, 'lib/*.rb'), root: File.join(@dir, 'lib')) }
       .to raise_error(ArgumentError, /under a key/)
@@ -245,6 +307,11 @@ RSpec.describe Sourced::Component, '#from_dir' do
       bare.loader = loader
       expect(lib.loader).to be(loader)
       expect { lib.from_dir(File.join(@dir, 'lib/**/*.rb'), root: @dir) }.not_to raise_error
+    end
+
+    it "can't be mounted with a loader of its own" do
+      lib = Sourced::Component.new(loader:)
+      expect { app.mount('lib', lib) }.to raise_error(Sourced::Component::SubcomponentError, /own loader/)
     end
 
     it 'must be a loader' do

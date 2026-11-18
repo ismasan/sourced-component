@@ -37,16 +37,26 @@ module Sourced
 
       def installed? = @installed
 
-      # Whether both would declare in the same branch: one reconfiguring would drop the other's components
+      # Raise if two sources would declare in the same branch: one reloading would drop the other's components
+      def self.check_overlaps!(sources)
+        sources.combination(2) do |a, b|
+          raise ArgumentError, "#{a.inspect} overlaps #{b.inspect}: each reconfigures its whole branch" if a.overlaps?(b)
+        end
+      end
+
+      # The branch's full path from the root
+      def full_branch = [@owner.path, branch].compact.join('.')
+
       def overlaps?(other)
-        mine = "#{branch}."
-        theirs = "#{other.branch}."
+        mine = "#{full_branch}."
+        theirs = "#{other.full_branch}."
         mine.start_with?(theirs) || theirs.start_with?(mine)
       end
 
-      # The first time, on the root's #prepare!: plain declarations into the open tree
+      # The first time, on the root's #prepare!. Through #reconfigure, which on an open tree is plain
+      # declaration, but rolls back if a file raises: a retried #prepare! starts from a clean branch
       def install!
-        declare_all
+        @owner.reconfigure(branch) { declare_all }
         @installed = true
         self
       end
@@ -54,8 +64,8 @@ module Sourced
       # After Zeitwerk sets up again (a reload): re-declare the branch from the new constants.
       # Every file re-implements its components, so they're recycled, and the ones whose file or
       # method is gone are removed. Runs inside Zeitwerk's on_setup, where raising would leave the
-      # loader half set up, so errors go to +on_error+ instead. The tree is left as it was (see
-      # Component#reconfigure), and the error is also published as root.failed.
+      # loader half set up, so errors go to +on_error+ instead, which mustn't raise either. The tree is
+      # left as it was (see Component#reconfigure), and the error is also published as root.failed.
       def reload!
         return self unless @installed
         return self if @owner.root.boot_status == :torn_down
@@ -69,7 +79,7 @@ module Sourced
         self
       end
 
-      def inspect = "#<#{self.class} #{@glob} => #{branch}>"
+      def inspect = "#<#{self.class} #{@glob} => #{full_branch}>"
 
       private def declare_all
         files.each do |path|

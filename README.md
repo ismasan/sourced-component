@@ -469,7 +469,7 @@ App.from_dir('lib/**/*.rb')
 ```
 
 - **It's optional**, and only `#from_dir` needs it: calling it on a tree without a loader raises `MissingLoaderError`. Zeitwerk isn't a dependency of this gem: bring your own loader (2.6.13+), or anything with `#cpath_expected_at(path)` and `#on_setup(&block)`.
-- **Mounted components use their root's loader**, so a library's component can call `#from_dir` once it's mounted. Setting it on a mounted component raises `SubcomponentError`.
+- **Mounted components use their root's loader**, so a library's component can call `#from_dir` once it's mounted. Setting it on a mounted component, or mounting a component that has its own, raises `SubcomponentError`.
 - **It can't be replaced** once `#from_dir` registered with it (`ArgumentError`), or once the tree is prepared (`LockedComponentError`).
 
 Each file's key is its path relative to `root`, prefixed with `namespace`. The constant Zeitwerk expects in the file declares its components with `.__install_component`, which gets the component DSL scoped to that key:
@@ -492,7 +492,17 @@ class Queries::Users::Search
 end
 ```
 
-A class defining its own `.__install_component` keeps it, and subclasses install as themselves.
+A class defining its own `.__install_component` keeps it, and subclasses install as themselves. A base class that's only there to be subclassed opts out with `__abstract_component!`, which its subclasses don't inherit:
+
+```ruby
+class Queries::Base
+  include Sourced::Component::Installable
+  include App.inject('db')
+  __abstract_component!
+end
+
+class Queries::Users::Search < Queries::Base; end # 'lib.queries.users.search'
+```
 
 `c['name']` scopes it to a key under the file's, so a file can declare several components:
 
@@ -509,11 +519,13 @@ end
 - **The declarer** has `declare(type = Any, &default)`, `component!`, `component`, `config!`, `config`, `alias`, `factory` and `defer`, which take the same arguments as the component's, without the key, and return the declarer. `#key` is its key.
 - **Dependencies are relative to the component `#from_dir` was called on**, like the keys of `#inject`, so siblings are referenced by their full key (`c['logger'].key`).
 - **Constants that don't respond to `.__install_component` are skipped**, and so are files the loader ignores.
-- **Files are loaded on the root's `#prepare!`**, not by `#from_dir`, so the components they inject are declared by then. The loader must be set up before that.
+- **Files are loaded on the root's `#prepare!`**, not by `#from_dir`, so the components they inject are declared by then. The loader must be set up before that. If a file raises, none of the directory's components are left declared, so booting again after fixing it works.
 - **Keys:** `App.from_dir('app/queries/**/*.rb', root: 'app/queries', namespace: 'queries')` keys `app/queries/users/search.rb` as `queries.users.search`. A glob without wildcards is a directory's own `.rb` files.
 - **On reload**, the branch above the glob's first wildcard (`lib` above) is [reconfigured](#re-configuring-a-booted-tree) from the reloaded constants: every component the files declare is recycled with its new class, along with its dependents, components whose file is gone are removed, and new ones are added. A wildcard dependency on the branch (`'lib.queries.users.*'`) picks the changes up.
-- **A failed reload leaves the tree as it was**, still running, and is published as `root.failed`. It's not raised: it happens inside Zeitwerk's `on_setup`, and raising there would leave the loader unable to reload again. It's passed to `on_error` instead (by default, a warning), and the next reload retries.
-- **Branches can't overlap:** each `#from_dir` reconfigures its whole branch, so two whose branches nest raise `ArgumentError`, and so does one whose files would be declared at the component's root. The branch must be a namespace with no mounted components, like any reconfigured branch.
+- **A failed reload leaves the tree as it was**, still running, and is published as `root.failed`. It's not raised: it happens inside Zeitwerk's `on_setup`, and raising there would leave the loader unable to reload again. It's passed to `on_error` instead (by default, a warning), which mustn't raise either, and the next reload retries.
+- **Branches can't overlap:** each `#from_dir` reconfigures its whole branch, so two whose branches nest raise `ArgumentError`, wherever in the tree they were registered, and so does one whose files would be declared at the component's root. The branch must be a namespace with no mounted components, like any reconfigured branch.
+- **`#from_dir` is for open trees**, and raises `LockedComponentError` once the tree is prepared, including inside a `#reconfigure` block.
+- **The loader keeps each tree's reload hook**, since Zeitwerk can't remove `on_setup` callbacks. After teardown it does nothing, but a long-lived loader shared by many trees, ex. in tests, keeps them all in memory: give each tree its own loader.
 - **Classes outside the directory aren't re-declared.** A component elsewhere that captured a reloaded class in a provider keeps the old one: see [recycling](#recycling-components).
 
 ### Signal handlers
