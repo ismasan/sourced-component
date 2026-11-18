@@ -529,6 +529,14 @@ end
 - **Dependencies are relative to the component `#from_dir` was called on**, like the keys of `#inject`, so siblings are referenced by their full key (`c['logger'].key`).
 - **Constants that don't respond to `.__install_component` are skipped**, and so are files the loader ignores.
 - **Files are loaded on the root's `#prepare!`**, not by `#from_dir`, so the components they inject are declared by then. The loader must be set up before that. If a file raises, none of the directory's components are left declared, so booting again after fixing it works.
+- **`#install_dirs!` loads them earlier**, on the open tree, for an app that loads classes injecting them before it prepares the tree, ex. with Zeitwerk's `#eager_load`. The tree stays open, and `#prepare!` skips the sources already installed. It's for the root, and raises `LockedComponentError` once the tree is prepared:
+
+  ```ruby
+  App.from_dir('system/**/*.rb', root: 'system')
+  loader.setup
+  App.install_dirs!   # declares 'users.create', from system/users/create.rb
+  loader.eager_load   # so a class elsewhere can inject 'users.create' as it loads
+  ```
 - **Files can inject each other's components**, whichever loads first. While `#from_dir` loads files, injecting a key that isn't declared yet is resolved once every file has declared its components, and one that's still missing raises `UndeclaredComponentError` (on a reload, rolling it back). Everywhere else, injecting an undeclared key raises straight away.
 - **Keys:** `App.from_dir('app/queries/**/*.rb', root: 'app/queries', namespace: 'queries')` keys `app/queries/users/search.rb` as `queries.users.search`. A glob without wildcards is a directory's own `.rb` files.
 - **A whole directory, without its name:** with `root:` set to the directory scanned and no `namespace:`, each top-level directory is a branch of its own:

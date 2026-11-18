@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- `#install_dirs!`: load the files of every `#from_dir` and declare their components on an open tree, before `#prepare!`, so classes loaded earlier (ex. by Zeitwerk's `#eager_load`) can inject them
 - `#from_dir(glob)`: declare components from the files in a directory, with `.__install_component`, and reconfigure them when the tree's Zeitwerk loader reloads
 - `Sourced::Component::Installable`: the default `.__install_component`, `c.declare(self).factory(self)`, and `.__abstract_component!` for base classes
 - `#from_dir(glob, root: dir)`, rooted at the directory it scans: each top-level directory is a branch, reloaded together

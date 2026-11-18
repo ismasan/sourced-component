@@ -371,6 +371,94 @@ RSpec.describe Sourced::Component, '#from_dir' do
     end
   end
 
+  describe '#install_dirs!' do
+    it 'declares the components on an open tree, so classes loaded before #prepare! can inject them' do
+      search_class
+      # Outside the glob, so only eager_load loads it
+      write('web/page.rb', <<~RUBY)
+        class #{ns}::Page
+          include #{ns}::App.inject('lib.queries.users.search')
+        end
+      RUBY
+      loader.push_dir(File.join(@dir, 'web'), namespace: Object.const_get(ns))
+      from_dir
+      loader.setup
+
+      expect(app.install_dirs!).to be(app)
+      expect(app.declared?('lib.queries.users.search')).to be(true)
+      expect(app.locked?).to be(false)
+
+      loader.eager_load # loads Page, which injects it
+      app.declare('extra', String) { 'extra' } # still open
+      app.start!
+
+      expect(Object.const_get("#{ns}::Page").new.search.db).to eq('the-db')
+      expect(app['extra']).to eq('extra')
+    end
+
+    it 'installs each source once, and the ones added later on #prepare!' do
+      search_class
+      write('other/thing.rb', <<~RUBY)
+        class #{ns}::Thing
+          include Sourced::Component::Installable
+        end
+      RUBY
+      loader.push_dir(File.join(@dir, 'other'), namespace: Object.const_get(ns))
+      from_dir
+      loader.setup
+      app.install_dirs!
+      app.install_dirs!
+      from_dir('other/*.rb')
+      app.start!
+
+      expect(app.declared?('lib.queries.users.search')).to be(true)
+      expect(app.declared?('other.thing')).to be(true)
+    end
+
+    it 'reconfigures the branch on reload, before the tree is prepared' do
+      search_class
+      from_dir
+      loader.setup
+      app.install_dirs!
+
+      search_class(version: 2)
+      loader.reload
+      app.start!
+
+      expect(app['lib.queries.users.search'].version).to eq(2)
+    end
+
+    it 'leaves nothing behind when a file fails, so calling it again works' do
+      write('lib/a.rb', <<~RUBY)
+        class #{ns}::A
+          include Sourced::Component::Installable
+        end
+      RUBY
+      write('lib/b.rb', "class #{ns}::B\n  def self.__install_component(c) = raise('boom')\nend")
+      from_dir
+      loader.setup
+
+      expect { app.install_dirs! }.to raise_error(RuntimeError, 'boom')
+      expect(app.declared?('lib.a')).to be(false)
+
+      write('lib/b.rb', "class #{ns}::B; end")
+      loader.reload
+      app.install_dirs!
+
+      expect(app.declared?('lib.a')).to be(true)
+    end
+
+    it 'is for open trees, on the root' do
+      lib = Sourced::Component.new
+      app.mount('lib_mount', lib)
+      expect { lib.install_dirs! }.to raise_error(Sourced::Component::SubcomponentError)
+
+      loader.setup
+      app.prepare!
+      expect { app.install_dirs! }.to raise_error(Sourced::Component::LockedComponentError)
+    end
+  end
+
   describe 'the loader' do
     it 'is required' do
       expect { Sourced::Component.new.from_dir(File.join(@dir, 'lib/**/*.rb')) }

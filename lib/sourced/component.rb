@@ -397,7 +397,8 @@ module Sourced
     #   app.loader = loader                         # once, on the root: see #loader=
     #   app.from_dir('lib/**/*.rb')                 # lib/queries/users/search.rb => 'lib.queries.users.search'
     #   app.from_dir('app/queries/**/*.rb', root: 'app/queries', namespace: 'queries')
-    # Files are loaded on the root's #prepare!, so the components they inject are declared by then.
+    # Files are loaded on the root's #prepare!, so the components they inject are declared by then,
+    # or earlier with #install_dirs!.
     # When the loader reloads, the branch above the glob's first wildcard is reconfigured from the new
     # constants (see #reconfigure). A failed reload leaves the tree as it was and calls +on_error+.
     def from_dir(glob, root: Dir.pwd, namespace: nil, on_error: DirSource::DEFAULT_ON_ERROR)
@@ -419,6 +420,26 @@ module Sourced
       end
       # Outside the tree's lock: Zeitwerk calls back under its own lock, and the callback takes the tree's
       loader.on_setup { source.reload! }
+      self
+    end
+
+    # Load the files of every #from_dir in the tree now, on an open tree, rather than on #prepare!,
+    # and declare their components. The tree stays open, so more can still be declared and
+    # implemented, and #prepare! skips the sources already installed. For an app that loads classes
+    # injecting those components before it prepares the tree, ex. with Zeitwerk's #eager_load:
+    #   app.from_dir('system/**/*.rb', root: 'system')
+    #   loader.setup
+    #   app.install_dirs!   # declares 'users.create', from system/users/create.rb
+    #   loader.eager_load   # so web/ classes can inject it
+    # The loader must be set up. If a file raises, none of the directory's components are left
+    # declared, and calling it again (or #prepare!) retries.
+    def install_dirs!
+      raise_mounted!
+      synchronize do
+        raise LockedComponentError, "can't install directories into a locked component" if locked?
+
+        [self, *index.values].each { |n| n.install_dir_sources! }
+      end
       self
     end
 
