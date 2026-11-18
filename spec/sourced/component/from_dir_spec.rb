@@ -48,7 +48,7 @@ RSpec.describe Sourced::Component, '#from_dir' do
     write('lib/queries/users/search.rb', <<~RUBY)
       class #{ns}::Queries::Users::Search
         include #{ns}::App.inject('db')
-        def self.install_sourced_component(c) = c.declare(self).factory(self)
+        def self.__install_component(c) = c.declare(self).factory(self)
         def version = #{version}
       end
     RUBY
@@ -72,10 +72,36 @@ RSpec.describe Sourced::Component, '#from_dir' do
     expect(app.node('lib.queries.users.search').dep_nodes.map(&:path)).to eq(['db'])
   end
 
+  it 'installs Installable classes with #factory, unless they define their own' do
+    write('lib/queries/users/search.rb', <<~RUBY)
+      class #{ns}::Queries::Users::Search
+        include Sourced::Component::Installable
+        include #{ns}::App.inject('db')
+      end
+    RUBY
+    write('lib/queries/users/admin_search.rb', <<~RUBY)
+      class #{ns}::Queries::Users::AdminSearch < #{ns}::Queries::Users::Search; end
+    RUBY
+    write('lib/queries/users/custom.rb', <<~RUBY)
+      class #{ns}::Queries::Users::Custom
+        include Sourced::Component::Installable
+        def self.__install_component(c) = c.declare(String).config { 'custom' }
+      end
+    RUBY
+    from_dir
+    loader.setup
+    app.start!
+
+    expect(app['lib.queries.users.search'].db).to eq('the-db')
+    expect(app['lib.queries.users.admin_search']).to be_a(Object.const_get("#{ns}::Queries::Users::AdminSearch"))
+    expect(app.node('lib.queries.users.search').dep_nodes.map(&:path)).to eq(['db'])
+    expect(app['lib.queries.users.custom']).to eq('custom')
+  end
+
   it 'declares several components under a file' do
     write('lib/integrations/sourced.rb', <<~RUBY)
       module #{ns}::Integrations::Sourced
-        def self.install_sourced_component(c)
+        def self.__install_component(c)
           c['logger'].declare(String) { 'logger' }
           c['store'].declare(String).config!([c['logger'].key, 'db']) { |l, db| [l, db].join('+') }
         end
@@ -101,7 +127,7 @@ RSpec.describe Sourced::Component, '#from_dir' do
   it 'takes a plain directory as its own Ruby files' do
     write('lib/queries/top.rb', <<~RUBY)
       class #{ns}::Queries::Top
-        def self.install_sourced_component(c) = c.declare.config { 1 }
+        def self.__install_component(c) = c.declare.config { 1 }
       end
     RUBY
     search_class
@@ -129,7 +155,7 @@ RSpec.describe Sourced::Component, '#from_dir' do
       search_class(version: 2)
       write('lib/queries/users/find.rb', <<~RUBY)
         class #{ns}::Queries::Users::Find
-          def self.install_sourced_component(c) = c.declare(self).factory(self)
+          def self.__install_component(c) = c.declare(self).factory(self)
           def version = :find
         end
       RUBY

@@ -472,23 +472,34 @@ App.from_dir('lib/**/*.rb')
 - **Mounted components use their root's loader**, so a library's component can call `#from_dir` once it's mounted. Setting it on a mounted component raises `SubcomponentError`.
 - **It can't be replaced** once `#from_dir` registered with it (`ArgumentError`), or once the tree is prepared (`LockedComponentError`).
 
-Each file's key is its path relative to `root`, prefixed with `namespace`. The constant Zeitwerk expects in the file declares its components with `.install_sourced_component`, which gets the component DSL scoped to that key:
+Each file's key is its path relative to `root`, prefixed with `namespace`. The constant Zeitwerk expects in the file declares its components with `.__install_component`, which gets the component DSL scoped to that key:
 
 ```ruby
 # lib/queries/users/search.rb => 'lib.queries.users.search'
 class Queries::Users::Search
   include App.inject('db', 'logger')
 
-  def self.install_sourced_component(c) = c.declare(self).factory(self)
+  def self.__install_component(c) = c.declare(self).factory(self)
 end
 ```
+
+That's the usual case, a class declared as its own type and built with [`#factory`](#factory), so the components it injects are its dependencies. `Sourced::Component::Installable` defines it:
+
+```ruby
+class Queries::Users::Search
+  include Sourced::Component::Installable
+  include App.inject('db', 'logger')
+end
+```
+
+A class defining its own `.__install_component` keeps it, and subclasses install as themselves.
 
 `c['name']` scopes it to a key under the file's, so a file can declare several components:
 
 ```ruby
 # lib/integrations/sourced.rb => 'lib.integrations.sourced.logger', 'lib.integrations.sourced.store'
 module Integrations::Sourced
-  def self.install_sourced_component(c)
+  def self.__install_component(c)
     c['logger'].declare(Logger) { Logger.new($stdout) }
     c['store'].declare(Store).config!([c['logger'].key, 'db']) { |logger, db| Store.new(logger, db) }
   end
@@ -497,7 +508,7 @@ end
 
 - **The declarer** has `declare(type = Any, &default)`, `component!`, `component`, `config!`, `config`, `alias`, `factory` and `defer`, which take the same arguments as the component's, without the key, and return the declarer. `#key` is its key.
 - **Dependencies are relative to the component `#from_dir` was called on**, like the keys of `#inject`, so siblings are referenced by their full key (`c['logger'].key`).
-- **Constants that don't respond to `.install_sourced_component` are skipped**, and so are files the loader ignores.
+- **Constants that don't respond to `.__install_component` are skipped**, and so are files the loader ignores.
 - **Files are loaded on the root's `#prepare!`**, not by `#from_dir`, so the components they inject are declared by then. The loader must be set up before that.
 - **Keys:** `App.from_dir('app/queries/**/*.rb', root: 'app/queries', namespace: 'queries')` keys `app/queries/users/search.rb` as `queries.users.search`. A glob without wildcards is a directory's own `.rb` files.
 - **On reload**, the branch above the glob's first wildcard (`lib` above) is [reconfigured](#re-configuring-a-booted-tree) from the reloaded constants: every component the files declare is recycled with its new class, along with its dependents, components whose file is gone are removed, and new ones are added. A wildcard dependency on the branch (`'lib.queries.users.*'`) picks the changes up.

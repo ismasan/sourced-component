@@ -17,6 +17,7 @@ require_relative 'component/notifier'
 require_relative 'component/tree'
 require_relative 'component/reconfiguration'
 require_relative 'component/dir_source'
+require_relative 'component/installable'
 
 module Sourced
   # A tree of components. Every node is a Component: it can declare a type, be implemented with
@@ -363,7 +364,7 @@ module Sourced
 
     # Declare components from the Ruby files matching +glob+, autoloaded by the root's #loader.
     # Each file's key is its path relative to +root+, prefixed with +namespace+, and the constant
-    # Zeitwerk expects in it declares its components with .install_sourced_component(declarer).
+    # Zeitwerk expects in it declares its components with .__install_component(declarer).
     # See DirSource::Declarer.
     #   app.loader = loader                         # once, on the root: see #loader=
     #   app.from_dir('lib/**/*.rb')                 # lib/queries/users/search.rb => 'lib.queries.users.search'

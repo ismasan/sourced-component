@@ -7,7 +7,7 @@ module Integrations::Mailer
     def deliver(to, template) = logger.info("mail #{to}: #{templates.fetch(template)}")
   end
 
-  def self.install_sourced_component(c)
+  def self.__install_component(c)
     c['templates'].declare(Sourced::Component::T::Hash) { { welcome: 'Welcome aboard!' } }
     c['client'].declare(Client).config!([c['templates'].key, 'logger']) do |templates, logger|
       Client.new(templates:, logger:)

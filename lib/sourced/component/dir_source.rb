@@ -6,10 +6,10 @@ module Sourced
     # Each file's key is its path relative to +root+, prefixed with +namespace+:
     #   lib/queries/users/search.rb => 'lib.queries.users.search'
     # The file's constant (as Zeitwerk expects it) declares its components with
-    # .install_sourced_component(declarer), where the declarer is scoped to that key. Constants that
+    # .__install_component(declarer), where the declarer is scoped to that key. Constants that
     # don't respond to it are skipped.
     class DirSource
-      INSTALL = :install_sourced_component
+      INSTALL = :__install_component
       GLOB_CHARS = /[*?\[{]/
       DEFAULT_ON_ERROR = lambda do |error|
         Kernel.warn("[Sourced::Component] reloading components failed: #{error.class}: #{error.message}")
@@ -109,10 +109,10 @@ module Sourced
         [@namespace, *relative.split('/')].compact.reject(&:empty?).join('.')
       end
 
-      # What .install_sourced_component gets: the component's DSL, scoped to the file's key.
+      # What .__install_component gets: the component's DSL, scoped to the file's key.
       # Deps are relative to the component #from_dir was called on, like the keys of #inject.
-      #   def self.install_sourced_component(c) = c.declare(self).factory(self)
-      #   def self.install_sourced_component(c)       # several, under the file's key
+      #   def self.__install_component(c) = c.declare(self).factory(self)
+      #   def self.__install_component(c)       # several, under the file's key
       #     c['logger'].declare(Logger) { Logger.new($stdout) }
       #     c['store'].declare(Store).config!([c['logger'].key]) { |logger| Store.new(logger) }
       #   end

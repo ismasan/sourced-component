@@ -64,8 +64,8 @@ puts
 puts 'Adding lib/queries/users/count.rb, removing find.rb, and reloading...'
 File.write(File.join(lib, 'queries/users/count.rb'), <<~RUBY)
   class Queries::Users::Count
+    include Sourced::Component::Installable
     include App.inject('db')
-    def self.install_sourced_component(c) = c.declare(self).factory(self)
     def call = db.size
   end
 RUBY
